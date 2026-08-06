@@ -744,44 +744,47 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
     if (onProgress) onProgress('Records loaded into local active workspace.');
 
-    try {
-      const existingMap = new Map(punches.map(p => [p.id, p]));
-      const recordsToWrite = data.filter(newP => {
-        const existing = existingMap.get(newP.id);
-        if (!existing) return true;
-        return JSON.stringify(existing) !== JSON.stringify(newP);
-      });
+    // Background non-blocking persistence to Firestore
+    (async () => {
+      try {
+        const existingMap = new Map(punches.map(p => [p.id, p]));
+        const recordsToWrite = data.filter(newP => {
+          const existing = existingMap.get(newP.id);
+          if (!existing) return true;
+          return JSON.stringify(existing) !== JSON.stringify(newP);
+        });
 
-      if (recordsToWrite.length === 0) return;
+        if (recordsToWrite.length === 0) return;
 
-      const total = recordsToWrite.length;
-      const batchSize = 300;
-      const chunks: typeof recordsToWrite[] = [];
-      for (let i = 0; i < total; i += batchSize) {
-        chunks.push(recordsToWrite.slice(i, i + batchSize));
-      }
-
-      const CONCURRENCY = 5;
-      let completed = 0;
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const group = chunks.slice(i, i + CONCURRENCY);
-        await Promise.allSettled(
-          group.map(async chunk => {
-            const batch = writeBatch(db);
-            chunk.forEach(p => {
-              batch.set(doc(db, 'punches', p.id), p);
-            });
-            await batch.commit();
-          })
-        );
-        completed += group.reduce((acc, c) => acc + c.length, 0);
-        if (onProgress) {
-          onProgress(`Syncing ${Math.min(completed, total)} of ${total} records to cloud...`);
+        const total = recordsToWrite.length;
+        const batchSize = 300;
+        const chunks: typeof recordsToWrite[] = [];
+        for (let i = 0; i < total; i += batchSize) {
+          chunks.push(recordsToWrite.slice(i, i + batchSize));
         }
+
+        const CONCURRENCY = 5;
+        let completed = 0;
+        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+          const group = chunks.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            group.map(async chunk => {
+              const batch = writeBatch(db);
+              chunk.forEach(p => {
+                batch.set(doc(db, 'punches', p.id), p);
+              });
+              await batch.commit();
+            })
+          );
+          completed += group.reduce((acc, c) => acc + c.length, 0);
+          if (onProgress) {
+            onProgress(`Syncing ${Math.min(completed, total)} of ${total} records to cloud...`);
+          }
+        }
+      } catch (e) {
+        console.warn('setPunches background sync note:', e);
       }
-    } catch (e) {
-      console.warn('setPunches note:', e);
-    }
+    })();
   }, [punches]);
 
   const setSettings = useCallback(async (data: Settings) => {

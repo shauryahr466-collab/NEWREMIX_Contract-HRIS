@@ -357,39 +357,17 @@ export function Import() {
             return;
           }
 
-          // Auto-create any missing employees in directory
-          if (failedMatches.size > 0) {
-            const missingEmps: Employee[] = [];
-            failedMatches.forEach(missingId => {
-              if (missingId && !employees.some(e => e.id === missingId)) {
-                missingEmps.push({
-                  id: missingId,
-                  name: `Employee ${missingId}`,
-                  department: 'General',
-                  designation: 'Staff',
-                  joiningDate: new Date().toISOString().split('T')[0],
-                  status: 'Active'
-                });
-              }
-            });
-            if (missingEmps.length > 0) {
-              await setEmployees(missingEmps);
-            }
-          }
-
           // Deduplicate new punches based on ID
           const uniqueNewPunchesMap = new Map();
           finalNewPunchesRaw.forEach(p => uniqueNewPunchesMap.set(p.id, p));
           const finalNewPunches = Array.from(uniqueNewPunchesMap.values());
 
-          setMessage(`Saving ${finalNewPunches.length} punches to database...`);
-          await setPunches(finalNewPunches, (msg) => setMessage(msg));
+          setMessage(`Saving ${finalNewPunches.length} punches to workspace...`);
+          setPunches(finalNewPunches, (msg) => setMessage(msg));
           
-          setMessage('Finalizing import...');
           setCalculationSource('all');
-          // Removed manual recalculate() as onSnapshot handles it more efficiently
           setStatus('success');
-          setMessage(`Successfully imported ${finalNewPunches.length} records for matching employees.`);
+          setMessage(`Successfully imported ${finalNewPunches.length} records.`);
           toast.success(`Successfully imported ${finalNewPunches.length} records.`);
         } else {
           // Roster Import

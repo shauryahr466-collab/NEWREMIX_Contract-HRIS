@@ -130,11 +130,6 @@ export function Import() {
   }, [punches, searchTerm, showOnlyRegistered, employees]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (quotaExceeded) {
-      setStatus('error');
-      setMessage('Cannot upload: Database write quota reached.');
-      return;
-    }
     if (e.target.files && e.target.files[0]) {
       setFile(e.target.files[0]);
       setStatus('idle');
@@ -142,7 +137,6 @@ export function Import() {
   };
 
   const processFile = async () => {
-    if (quotaExceeded) return;
     if (!file) return;
     setStatus('processing');
     setMessage('Reading file...');
@@ -156,7 +150,56 @@ export function Import() {
         const worksheet = workbook.Sheets[firstSheetName];
 
         if (importType === 'punch') {
-          const json = XLSX.utils.sheet_to_json(worksheet) as any[];
+          let json = XLSX.utils.sheet_to_json(worksheet) as any[];
+
+          const isEmpIdKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l === 'employee no.' || l === 'emp id' || l === 'emp_id' || l === 'empid' ||
+                   l.includes('ac-no') || l.includes('ac_no') || l.includes('ac no') ||
+                   l.includes('employee no') || l.includes('employee_no') || l.includes('employee') ||
+                   l.includes('userid') || l.includes('user id') || l.includes('user_id') ||
+                   l.includes('cardno') || l.includes('card_no') || l.includes('card no') ||
+                   l.includes('enroll') || l.includes('badge') || l.includes('pin') ||
+                   l === 'id' || l === 'no' || l === 'no.' || l === 'code';
+          };
+
+          const isDateTimeKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l.includes('date/time') || l.includes('datetime') || l.includes('date_time') ||
+                   l.includes('logtime') || l.includes('log_time') || l.includes('punchtime') ||
+                   l.includes('punch_time') || l.includes('checktime') || l.includes('clock');
+          };
+
+          const isDateKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l === 'date' || l.includes('punch date') || l.includes('log date') || l.includes('att. date') || l.includes('att date') || l.includes('work date');
+          };
+
+          const isTimeKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l.startsWith('time') || l.includes('punch') || l.includes('clock') || l.includes('in') || l.includes('out') || l.startsWith('c1') || l.startsWith('c2') || l.startsWith('c3') || l.startsWith('c4') || l.startsWith('t1') || l.startsWith('t2');
+          };
+
+          // Check if top row is title text and search for real header row if needed
+          let firstRowKeys = json.length > 0 ? Object.keys(json[0]) : [];
+          const hasEmpKey = (keys: string[]) => keys.some(isEmpIdKey);
+          const hasDateOrTimeKey = (keys: string[]) => keys.some(isDateTimeKey) || keys.some(isDateKey) || keys.some(isTimeKey);
+
+          if (json.length > 0 && (!hasEmpKey(firstRowKeys) || !hasDateOrTimeKey(firstRowKeys))) {
+            const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
+            let headerRowIndex = -1;
+            for (let r = 0; r < Math.min(rawRows.length, 15); r++) {
+              const rowCells = (rawRows[r] || []).map(c => String(c));
+              if (hasEmpKey(rowCells) && hasDateOrTimeKey(rowCells)) {
+                headerRowIndex = r;
+                break;
+              }
+            }
+            if (headerRowIndex >= 0) {
+              json = XLSX.utils.sheet_to_json(worksheet, { range: headerRowIndex }) as any[];
+              firstRowKeys = json.length > 0 ? Object.keys(json[0]) : [];
+            }
+          }
 
           setMessage(`Parsing ${json.length} records...`);
 
@@ -183,7 +226,6 @@ export function Import() {
             employeeIdMap.set(norm.original, e.id);
             employeeIdMap.set(norm.lowercase, e.id);
             if (norm.numeric) {
-              // Only map numeric if it's unique enough or we prioritize it
               if (!employeeIdMap.has(norm.numeric)) {
                 employeeIdMap.set(norm.numeric, e.id);
               }
@@ -192,37 +234,6 @@ export function Import() {
 
           // Helper for deterministic IDs to prevent duplicates on re-import
           const makePunchId = (empId: string, dt: string) => `p_${empId}_${dt}`.replace(/[^a-zA-Z0-9]/g, '_');
-
-          // Extract column keys ONCE for the entire dataset to prevent O(N*K) repeated key searches
-          const firstRowKeys = json.length > 0 ? Object.keys(json[0]) : [];
-          
-          const isEmpIdKey = (k: string) => {
-            const l = k.toLowerCase().trim();
-            return l === 'employee no.' || l === 'emp id' || l === 'emp_id' || l === 'empid' ||
-                   l.includes('ac-no') || l.includes('ac_no') || l.includes('ac no') ||
-                   l.includes('employee no') || l.includes('employee_no') || l.includes('employee') ||
-                   l.includes('userid') || l.includes('user id') || l.includes('user_id') ||
-                   l.includes('cardno') || l.includes('card_no') || l.includes('card no') ||
-                   l.includes('enroll') || l.includes('badge') || l.includes('pin') ||
-                   l === 'id' || l === 'no' || l === 'no.' || l === 'code';
-          };
-
-          const isDateTimeKey = (k: string) => {
-            const l = k.toLowerCase().trim();
-            return l.includes('date/time') || l.includes('datetime') || l.includes('date_time') ||
-                   l.includes('logtime') || l.includes('log_time') || l.includes('punchtime') ||
-                   l.includes('punch_time') || l.includes('checktime') || l.includes('clock');
-          };
-
-          const isDateKey = (k: string) => {
-            const l = k.toLowerCase().trim();
-            return l === 'date' || l.includes('punch date') || l.includes('log date');
-          };
-
-          const isTimeKey = (k: string) => {
-            const l = k.toLowerCase().trim();
-            return l.startsWith('time') || l.includes('punch') || l.includes('clock') || l.includes('in') || l.includes('out');
-          };
 
           const rawIdKey = firstRowKeys.find(isEmpIdKey);
           const dateTimeKey = firstRowKeys.find(isDateTimeKey);
@@ -742,7 +753,7 @@ export function Import() {
                  variant="danger" 
                  className="w-full gap-2"
                  onClick={() => setIsConfirmingPurge(true)}
-                 disabled={quotaExceeded || punches.length === 0}
+                 disabled={punches.length === 0}
                >
                  <Trash2 size={14} /> Purge Database
                </Button>

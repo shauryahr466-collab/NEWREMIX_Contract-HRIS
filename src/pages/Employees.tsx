@@ -148,11 +148,6 @@ export function Employees() {
   };
 
   const handlePurgeAll = async () => {
-    if (quotaExceeded) {
-      toast.error('Cannot purge: Database write limit reached.');
-      return;
-    }
-    
     const count = employees.length;
     if (count === 0) return;
 
@@ -457,10 +452,9 @@ export function Employees() {
               </Button>
             )}
             <Button onClick={() => {
-                 if (quotaExceeded) return;
                  resetForm();
                  setIsModalOpen(true);
-              }} disabled={quotaExceeded}>
+              }}>
               <Plus size={14} /> New Identity
             </Button>
           </div>

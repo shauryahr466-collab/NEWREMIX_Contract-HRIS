@@ -499,26 +499,27 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteEmployeesBatch = useCallback(async (ids: string[]) => {
     setEmployeesState(prev => prev.filter(emp => !ids.includes(emp.id)));
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        for (let i = 0; i < ids.length; i += batchSize) {
-          const chunk = ids.slice(i, i + batchSize);
-          try {
-            const batch = writeBatch(db);
-            chunk.forEach(id => {
-              batch.delete(doc(db, 'employees', id));
-            });
-            await batch.commit();
-          } catch (batchErr) {
-            console.warn(`Employee delete batch ${i} note:`, batchErr);
-          }
-        }
-      } catch (e) {
-        console.warn('deleteEmployeesBatch note:', e);
+    try {
+      const batchSize = 300;
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += batchSize) {
+        chunks.push(ids.slice(i, i + batchSize));
       }
+      const CONCURRENCY = 5;
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const group = chunks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          group.map(async (chunk) => {
+            const batch = writeBatch(db);
+            chunk.forEach(id => batch.delete(doc(db, 'employees', id)));
+            await batch.commit();
+          })
+        );
+      }
+    } catch (e) {
+      console.warn('deleteEmployeesBatch note:', e);
     }
-  }, [checkQuota]);
+  }, []);
 
   const addPunch = useCallback(async (data: Omit<RawPunch, 'id'>) => {
     const id = `${data.employeeId}_${data.punchDatetime.replace(/[:.-]/g, '')}`;
@@ -561,79 +562,88 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deletePunchBatch = useCallback(async (importId: string) => {
     setPunchesState(prev => prev.filter(p => p.importId !== importId));
-    if (checkQuota()) {
-      try {
-        const q = query(collection(db, 'punches'), where('importId', '==', importId));
-        const snapshot = await getDocs(q);
-        const docs = snapshot.docs;
-        
-        const batchSize = 300;
-        for (let i = 0; i < docs.length; i += batchSize) {
-          const chunk = docs.slice(i, i + batchSize);
-          try {
-            const writeBatchObj = writeBatch(db);
-            chunk.forEach(d => writeBatchObj.delete(d.ref));
-            await writeBatchObj.commit();
-          } catch (batchErr) {
-            console.warn(`Punch importId batch ${importId} delete note:`, batchErr);
-          }
-        }
-      } catch (e) {
-        console.warn('deletePunchBatch note:', e);
+    try {
+      const q = query(collection(db, 'punches'), where('importId', '==', importId));
+      const snapshot = await getDocs(q);
+      const docs = snapshot.docs;
+      
+      const batchSize = 300;
+      const chunks = [];
+      for (let i = 0; i < docs.length; i += batchSize) {
+        chunks.push(docs.slice(i, i + batchSize));
       }
-    }
-  }, [checkQuota]);
-
-  const deletePunchesBatch = useCallback(async (ids: string[]) => {
-    setPunchesState(prev => prev.filter(p => !ids.includes(p.id)));
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        for (let i = 0; i < ids.length; i += batchSize) {
-          const chunk = ids.slice(i, i + batchSize);
-          try {
-            const batch = writeBatch(db);
-            chunk.forEach(id => {
-              batch.delete(doc(db, 'punches', id));
-            });
-            await batch.commit();
-          } catch (batchErr) {
-            console.warn(`Punches batch delete note:`, batchErr);
-          }
-        }
-      } catch (e) {
-        console.warn('deletePunchesBatch note:', e);
-      }
-    }
-  }, [checkQuota]);
-
-  const clearPunches = useCallback(async (onProgress?: (msg: string) => void) => {
-    setPunchesState([]);
-    if (checkQuota()) {
-      try {
-        const q = collection(db, 'punches');
-        const snapshot = await getDocs(q);
-        const docs = snapshot.docs;
-        const total = docs.length;
-        if (total === 0) return;
-        const batchSize = 300;
-        for (let i = 0; i < total; i += batchSize) {
-          const count = Math.min(i + batchSize, total);
-          if (onProgress) onProgress(`Purging records ${count} of ${total}...`);
-          const chunk = docs.slice(i, i + batchSize);
-          try {
+      const CONCURRENCY = 5;
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const group = chunks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          group.map(async (chunk) => {
             const batch = writeBatch(db);
             chunk.forEach(d => batch.delete(d.ref));
             await batch.commit();
-          } catch (batchErr) {
-            console.warn(`Clear punches batch note:`, batchErr);
-          }
-        }
-      } catch (e) {
-        console.warn('clearPunches note:', e);
+          })
+        );
       }
+    } catch (e) {
+      console.warn('deletePunchBatch note:', e);
     }
-  }, [checkQuota]);
+  }, []);
+
+  const deletePunchesBatch = useCallback(async (ids: string[]) => {
+    setPunchesState(prev => prev.filter(p => !ids.includes(p.id)));
+    try {
+      const batchSize = 300;
+      const chunks = [];
+      for (let i = 0; i < ids.length; i += batchSize) {
+        chunks.push(ids.slice(i, i + batchSize));
+      }
+      const CONCURRENCY = 5;
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const group = chunks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          group.map(async (chunk) => {
+            const batch = writeBatch(db);
+            chunk.forEach(id => batch.delete(doc(db, 'punches', id)));
+            await batch.commit();
+          })
+        );
+      }
+    } catch (e) {
+      console.warn('deletePunchesBatch note:', e);
+    }
+  }, []);
+
+  const clearPunches = useCallback(async (onProgress?: (msg: string) => void) => {
+    setPunchesState([]);
+    try {
+      const q = collection(db, 'punches');
+      const snapshot = await getDocs(q);
+      const docs = snapshot.docs;
+      const total = docs.length;
+      if (total === 0) return;
+      
+      const batchSize = 300;
+      const chunks = [];
+      for (let i = 0; i < total; i += batchSize) {
+        chunks.push(docs.slice(i, i + batchSize));
+      }
+      const CONCURRENCY = 5;
+      let completed = 0;
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const group = chunks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          group.map(async (chunk) => {
+            const batch = writeBatch(db);
+            chunk.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+          })
+        );
+        completed += group.reduce((acc, c) => acc + c.length, 0);
+        if (onProgress) onProgress(`Purging records ${Math.min(completed, total)} of ${total}...`);
+      }
+    } catch (e) {
+      console.warn('clearPunches note:', e);
+    }
+  }, []);
 
   const clearAllData = useCallback(async (onProgress?: (msg: string) => void) => {
     setEmployeesState([]);
@@ -646,41 +656,43 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setPayrollRunsState([]);
     window.localStorage.clear();
 
-    if (checkQuota()) {
-      const collectionsList = ['employees', 'punches', 'shiftAssignments', 'assignmentLogs', 'exceptions', 'overtime', 'sbl', 'forceAttendance', 'payrollRuns', 'zkDevices', 'zkUserMappings'];
+    const collectionsList = ['employees', 'punches', 'shiftAssignments', 'assignmentLogs', 'exceptions', 'overtime', 'sbl', 'forceAttendance', 'payrollRuns', 'zkDevices', 'zkUserMappings'];
+    for (const coll of collectionsList) {
+      if (onProgress) onProgress(`Purging ${coll}...`);
       try {
-        for (const coll of collectionsList) {
-          if (onProgress) onProgress(`Purging ${coll}...`);
-          try {
-            const q = collection(db, coll);
-            const snapshot = await getDocs(q);
-            const docs = snapshot.docs;
-            const batchSize = 300;
-            for (let i = 0; i < docs.length; i += batchSize) {
-              const chunk = docs.slice(i, i + batchSize);
-              try {
+        const q = collection(db, coll);
+        const snapshot = await getDocs(q);
+        const docs = snapshot.docs;
+        const total = docs.length;
+        if (total > 0) {
+          const batchSize = 300;
+          const chunks = [];
+          for (let i = 0; i < total; i += batchSize) {
+            chunks.push(docs.slice(i, i + batchSize));
+          }
+          const CONCURRENCY = 5;
+          for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+            const group = chunks.slice(i, i + CONCURRENCY);
+            await Promise.allSettled(
+              group.map(async (chunk) => {
                 const batch = writeBatch(db);
                 chunk.forEach(d => batch.delete(d.ref));
                 await batch.commit();
-              } catch (bErr) {
-                console.warn(`Purge coll ${coll} batch note:`, bErr);
-              }
-            }
-          } catch (collErr) {
-            console.warn(`Purge coll ${coll} note:`, collErr);
+              })
+            );
           }
         }
-        try {
-          await deleteDoc(doc(db, 'settings', 'config'));
-        } catch (e) {
-          console.warn('Config delete note:', e);
-        }
-      } catch (error) {
-        console.warn('clearAllData note:', error);
+      } catch (collErr) {
+        console.warn(`Purge coll ${coll} note:`, collErr);
       }
     }
+    try {
+      await deleteDoc(doc(db, 'settings', 'config'));
+    } catch (e) {
+      console.warn('Config delete note:', e);
+    }
     window.location.reload();
-  }, [checkQuota]);
+  }, []);
 
   const setEmployees = useCallback(async (data: Employee[]) => {
     setEmployeesState(prev => {
@@ -689,41 +701,39 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return Array.from(eMap.values());
     });
 
-    if (checkQuota()) {
-      try {
-        const existingMap = new Map(employees.map(e => [e.id, e]));
-        const recordsToWrite = data.filter(newE => {
-          const existing = existingMap.get(newE.id);
-          return !existing || JSON.stringify(existing) !== JSON.stringify(newE);
-        });
+    try {
+      const existingMap = new Map(employees.map(e => [e.id, e]));
+      const recordsToWrite = data.filter(newE => {
+        const existing = existingMap.get(newE.id);
+        return !existing || JSON.stringify(existing) !== JSON.stringify(newE);
+      });
 
-        if (recordsToWrite.length === 0) return;
+      if (recordsToWrite.length === 0) return;
 
-        const total = recordsToWrite.length;
-        const batchSize = 500;
-        const chunks: typeof recordsToWrite[] = [];
-        for (let i = 0; i < total; i += batchSize) {
-          chunks.push(recordsToWrite.slice(i, i + batchSize));
-        }
-
-        const CONCURRENCY = 4;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.all(
-            group.map(chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(emp => {
-                batch.set(doc(db, 'employees', emp.id), emp);
-              });
-              return batch.commit();
-            })
-          );
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'employees');
+      const total = recordsToWrite.length;
+      const batchSize = 300;
+      const chunks: typeof recordsToWrite[] = [];
+      for (let i = 0; i < total; i += batchSize) {
+        chunks.push(recordsToWrite.slice(i, i + batchSize));
       }
+
+      const CONCURRENCY = 5;
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const group = chunks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          group.map(async chunk => {
+            const batch = writeBatch(db);
+            chunk.forEach(emp => {
+              batch.set(doc(db, 'employees', emp.id), emp);
+            });
+            await batch.commit();
+          })
+        );
+      }
+    } catch (e) {
+      console.warn('setEmployees note:', e);
     }
-  }, [employees, handleFirestoreError, checkQuota]);
+  }, [employees]);
 
   const setPunches = useCallback(async (data: RawPunch[], onProgress?: (msg: string) => void) => {
     setPunchesState(prev => {
@@ -734,45 +744,45 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
     if (onProgress) onProgress('Records loaded into local active workspace.');
 
-    if (checkQuota()) {
-      try {
-        const existingMap = new Map(punches.map(p => [p.id, p]));
-        const recordsToWrite = data.filter(newP => {
-          const existing = existingMap.get(newP.id);
-          if (!existing) return true;
-          return JSON.stringify(existing) !== JSON.stringify(newP);
-        });
+    try {
+      const existingMap = new Map(punches.map(p => [p.id, p]));
+      const recordsToWrite = data.filter(newP => {
+        const existing = existingMap.get(newP.id);
+        if (!existing) return true;
+        return JSON.stringify(existing) !== JSON.stringify(newP);
+      });
 
-        if (recordsToWrite.length === 0) return;
+      if (recordsToWrite.length === 0) return;
 
-        const total = recordsToWrite.length;
-        const batchSize = 300;
-        const chunks: typeof recordsToWrite[] = [];
-        for (let i = 0; i < total; i += batchSize) {
-          chunks.push(recordsToWrite.slice(i, i + batchSize));
-        }
+      const total = recordsToWrite.length;
+      const batchSize = 300;
+      const chunks: typeof recordsToWrite[] = [];
+      for (let i = 0; i < total; i += batchSize) {
+        chunks.push(recordsToWrite.slice(i, i + batchSize));
+      }
 
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i];
-          try {
+      const CONCURRENCY = 5;
+      let completed = 0;
+      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+        const group = chunks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          group.map(async chunk => {
             const batch = writeBatch(db);
             chunk.forEach(p => {
               batch.set(doc(db, 'punches', p.id), p);
             });
             await batch.commit();
-          } catch (batchErr) {
-            console.warn(`Sync batch ${i + 1}/${chunks.length} note:`, batchErr);
-          }
-          if (onProgress) {
-            const processed = Math.min((i + 1) * batchSize, total);
-            onProgress(`Syncing ${processed} of ${total} records to cloud...`);
-          }
+          })
+        );
+        completed += group.reduce((acc, c) => acc + c.length, 0);
+        if (onProgress) {
+          onProgress(`Syncing ${Math.min(completed, total)} of ${total} records to cloud...`);
         }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'punches');
       }
+    } catch (e) {
+      console.warn('setPunches note:', e);
     }
-  }, [punches, handleFirestoreError, checkQuota]);
+  }, [punches]);
 
   const setSettings = useCallback(async (data: Settings) => {
     setSettingsState(data);

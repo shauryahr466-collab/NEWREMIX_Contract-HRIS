@@ -1,0 +1,181 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Application user with role",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "username": { "type": "string" },
+        "role": { "type": "string", "enum": ["Admin", "Editor", "HR", "Supervisor"] }
+      },
+      "required": ["id", "username", "role"]
+    },
+    "ShiftMaster": {
+      "title": "ShiftMaster",
+      "description": "Defined work shift configurations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "isNightShift": { "type": "boolean" },
+        "graceTime": { "type": "number" },
+        "lateThreshold": { "type": "number" }
+      },
+      "required": ["id", "name", "startTime", "endTime", "isNightShift"]
+    },
+    "Employee": {
+      "title": "Employee",
+      "description": "Employee profile data",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "department": { "type": "string" },
+        "designation": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "joiningDate": { "type": "string" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] },
+        "contractorName": { "type": "string" },
+        "contactNumber": { "type": "string" },
+        "weeklyOff": { "type": "string" },
+        "otEligible": { "type": "boolean" },
+        "targetWorkingHours": { "type": "number" }
+      },
+      "required": ["id", "name", "department", "designation", "status"]
+    },
+    "RawPunch": {
+      "title": "RawPunch",
+      "description": "Raw attendance punch from device or manual entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "punchDatetime": { "type": "string" },
+        "deviceId": { "type": "string" },
+        "location": { "type": "string" },
+        "importFormat": { "type": "string", "enum": ["standard", "multi-time"] }
+      },
+      "required": ["id", "employeeId", "punchDatetime"]
+    },
+    "ProcessedAttendance": {
+      "title": "ProcessedAttendance",
+      "description": "Aggregated daily attendance record for an employee",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "date": { "type": "string" },
+        "firstPunch": { "type": "string" },
+        "lastPunch": { "type": "string" },
+        "workingHours": { "type": "number" },
+        "overtime": { "type": "number" },
+        "status": { "type": "string" },
+        "logs": { "type": "array", "items": { "type": "string" } },
+        "rawLogs": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "employeeId", "date", "status"]
+    },
+    "ShiftAssignment": {
+      "title": "ShiftAssignment",
+      "description": "Manual override of shift for an employee on a specific date",
+      "type": "object",
+      "properties": {
+        "employeeId": { "type": "string" },
+        "date": { "type": "string" },
+        "shiftId": { "type": "string" }
+      },
+      "required": ["employeeId", "date", "shiftId"]
+    },
+    "AssignmentLog": {
+      "title": "AssignmentLog",
+      "description": "Audit log for shift assignments",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "date": { "type": "string" },
+        "shiftId": { "type": "string" },
+        "shiftName": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "action": { "type": "string", "enum": ["Assigned", "Updated", "Removed"] }
+      },
+      "required": ["id", "employeeId", "date", "shiftId", "shiftName", "timestamp", "action"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Global application configuration",
+      "type": "object",
+      "properties": {
+        "duplicateMergeTime": { "type": "number" },
+        "shiftStartTime": { "type": "string" },
+        "shiftEndTime": { "type": "string" },
+        "graceTime": { "type": "number" },
+        "lateThreshold": { "type": "number" },
+        "overtimeThreshold": { "type": "number" },
+        "companyName": { "type": "string" },
+        "reportTitle": { "type": "string" },
+        "shifts": { "type": "array", "items": { "$ref": "#/entities/ShiftMaster" } }
+      },
+      "required": ["duplicateMergeTime", "graceTime", "lateThreshold", "companyName"]
+    }
+  },
+  "auth": {
+    "providers": [
+      { "providerId": "google.com" },
+      { "providerId": "password" }
+    ]
+  },
+  "firestore": {
+    "users": {
+        "schema": "#/entities/User",
+        "description": "User profiles and roles"
+    },
+    "employees": {
+      "schema": "#/entities/Employee",
+      "description": "Employee database"
+    },
+    "punches": {
+      "schema": "#/entities/RawPunch",
+      "description": "Raw punch logs"
+    },
+    "attendance": {
+      "schema": "#/entities/ProcessedAttendance",
+      "description": "Processed daily attendance records"
+    },
+    "shiftAssignments": {
+      "schema": "#/entities/ShiftAssignment",
+      "description": "Individual shift overrides"
+    },
+    "assignmentLogs": {
+      "schema": "#/entities/AssignmentLog",
+      "description": "Shift change audit logs"
+    },
+    "settings": {
+      "schema": "#/entities/Settings",
+      "description": "Global system configuration"
+    },
+    "sbl": {
+      "schema": { "type": "object", "properties": { "id": { "type": "string" } } },
+      "description": "Special Business Leave records"
+    },
+    "overtime": {
+      "schema": { "type": "object", "properties": { "id": { "type": "string" } } },
+      "description": "Overtime calculation records"
+    },
+    "forceAttendance": {
+      "schema": { "type": "object", "properties": { "id": { "type": "string" } } },
+      "description": "Manual attendance overrides"
+    },
+    "auditLogs": {
+      "schema": { "type": "object", "properties": { "id": { "type": "string" } } },
+      "description": "System audit logs"
+    },
+    "exceptions": {
+      "schema": { "type": "object", "properties": { "id": { "type": "string" } } },
+      "description": "Attendance exception records"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Attendance Manager2",
+  "description": "Biometric raw punch data processing and attendance reporting system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

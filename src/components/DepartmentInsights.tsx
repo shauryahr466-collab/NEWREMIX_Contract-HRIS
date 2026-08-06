@@ -1,0 +1,759 @@
+import React, { useMemo, useState } from 'react';
+import { useAppStore } from '../store';
+import { 
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, 
+  ResponsiveContainer, Cell, PieChart, Pie, Legend
+} from 'recharts';
+import { 
+  Building2, Users, UserCheck, Clock, TrendingUp, 
+  Filter, Calendar, ChevronRight, Search, Download,
+  BarChart as BarChartIcon
+} from 'lucide-react';
+import { format, parseISO, isWithinInterval, startOfDay, endOfDay } from 'date-fns';
+import { cn } from '../lib/utils';
+import { useNavigate } from 'react-router-dom';
+import { motion } from 'motion/react';
+import { EmployeeListPopup } from './EmployeeListPopup';
+import { Input } from './ui';
+import { toast } from 'sonner';
+import * as XLSX from 'xlsx';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import NepaliDate from 'nepali-date-converter';
+
+export function DepartmentInsights() {
+  const { employees, processedData, settings, openEmployeeProfile } = useAppStore();
+  const navigate = useNavigate();
+
+  const [dateRange, setDateRange] = useState({
+    start: format(startOfDay(new Date()), 'yyyy-MM-dd'),
+    end: format(endOfDay(new Date()), 'yyyy-MM-dd')
+  });
+  const [selectedDept, setSelectedDept] = useState('All');
+  const [selectedContractor, setSelectedContractor] = useState('All');
+  const [selectedShift, setSelectedShift] = useState('All');
+  const [selectedStatus, setSelectedStatus] = useState('All');
+
+  // Popup state
+  const [isPopupOpen, setIsPopupOpen] = useState(false);
+  const [popupTitle, setPopupTitle] = useState('');
+  const [popupEmployees, setPopupEmployees] = useState<any[]>([]);
+  const [popupStatus, setPopupStatus] = useState('');
+
+  const departments = useMemo(() => ['All', ...new Set(employees.map(e => e.department).filter(Boolean))], [employees]);
+  const contractors = useMemo(() => ['All', ...new Set(employees.map(e => e.contractorName).filter(Boolean))], [employees]);
+  const shifts = useMemo(() => ['All', ...(settings.shifts?.map(s => s.name) || [])], [settings.shifts]);
+  const statuses = ['All', 'Present', 'Absent', 'Late', 'PWO', 'SPF', 'Early', 'On Time'];
+
+  const filteredData = useMemo(() => {
+    let data = processedData.filter(d => {
+      const date = parseISO(d.date);
+      const isDateInRange = isWithinInterval(date, {
+        start: startOfDay(parseISO(dateRange.start)),
+        end: endOfDay(parseISO(dateRange.end))
+      });
+      return isDateInRange;
+    });
+
+    return data.filter(d => {
+      const emp = employees.find(e => e.id === d.employeeId);
+      if (!emp) return false;
+
+      const matchesDept = selectedDept === 'All' || emp.department === selectedDept;
+      const matchesContractor = selectedContractor === 'All' || emp.contractorName === selectedContractor;
+      const matchesShift = selectedShift === 'All' || settings.shifts?.find(s => s.id === d.shiftId)?.name === selectedShift;
+      const matchesStatus = selectedStatus === 'All' || d.status === selectedStatus;
+
+      return matchesDept && matchesContractor && matchesShift && matchesStatus;
+    });
+  }, [processedData, employees, dateRange, selectedDept, selectedContractor, selectedShift, selectedStatus, settings.shifts]);
+
+  const distributionData = useMemo(() => {
+    let data = processedData.filter(d => {
+      const date = parseISO(d.date);
+      const isDateInRange = isWithinInterval(date, {
+        start: startOfDay(parseISO(dateRange.start)),
+        end: endOfDay(parseISO(dateRange.end))
+      });
+      return isDateInRange;
+    });
+
+    return data.filter(d => {
+      const emp = employees.find(e => e.id === d.employeeId);
+      if (!emp) return false;
+
+      const matchesDept = selectedDept === 'All' || emp.department === selectedDept;
+      const matchesContractor = selectedContractor === 'All' || emp.contractorName === selectedContractor;
+      const matchesShift = selectedShift === 'All' || settings.shifts?.find(s => s.id === d.shiftId)?.name === selectedShift;
+      // Note: We ignore matchesStatus here for the distribution stats to keep them relative
+      return matchesDept && matchesContractor && matchesShift;
+    });
+  }, [processedData, employees, dateRange, selectedDept, selectedContractor, selectedShift, settings.shifts]);
+
+  const activeCounts = useMemo(() => {
+    const counts = new Map();
+    employees.forEach(e => {
+      if (e.status !== 'Active') return;
+      const d = e.department || 'Unknown';
+      const s = settings.shifts?.find(sh => sh.id === e.shiftId)?.name || 'Day Shift';
+      const k = `${d}|${s}`;
+      counts.set(k, (counts.get(k) || 0) + 1);
+    });
+    return counts;
+  }, [employees, settings.shifts]);
+
+  const shiftColumns = useMemo(() => ['Day', 'Night', 'A Shift', 'B Shift', 'C Shift'], []);
+
+  const deptStats = useMemo(() => {
+    const statsMap = new Map();
+    
+    const targetDepts = selectedDept === 'All' ? departments.filter(d => d !== 'All') : [selectedDept];
+
+    targetDepts.forEach(dept => {
+      const deptActiveEmployees = employees.filter(e => e.department === dept && e.status === 'Active');
+      
+      const shiftCounts: Record<string, number> = {};
+      shiftColumns.forEach(s => shiftCounts[s] = 0);
+
+      statsMap.set(dept, {
+        name: dept,
+        active: deptActiveEmployees.length,
+        total: 0,
+        present: 0,
+        absent: 0,
+        wo: 0,
+        pwo: 0,
+        late: 0,
+        spf: 0,
+        otHours: 0,
+        totalManHours: 0,
+        shiftCounts
+      });
+    });
+
+    distributionData.forEach(d => {
+      const emp = employees.find(e => e.id === d.employeeId);
+      if (!emp) return;
+      
+      const deptName = emp.department || 'Unknown';
+      if (!statsMap.has(deptName)) return;
+
+      const stat = statsMap.get(deptName);
+      
+      const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status);
+      const isAbsent = d.status === 'Absent';
+      const isWO = d.status === 'Weekly Off';
+      const isPWO = d.status === 'PWO';
+
+      const shift = settings.shifts?.find(s => s.id === d.shiftId);
+      const shiftName = shift?.name || 'Day Shift';
+
+      if (isPresent) {
+        stat.present += 1;
+        stat.total += 1;
+        if (isPWO) stat.pwo += 1;
+        // Count in shift columns if it matches one of our defined columns
+        if (shiftName.toLowerCase().includes('day') || shiftName.toLowerCase().includes('general')) stat.shiftCounts['Day'] += 1;
+        else if (shiftName.toLowerCase().includes('night')) stat.shiftCounts['Night'] += 1;
+        else if (shiftName.toLowerCase().includes('a shift') || shiftName.toUpperCase() === 'A') stat.shiftCounts['A Shift'] += 1;
+        else if (shiftName.toLowerCase().includes('b shift') || shiftName.toUpperCase() === 'B') stat.shiftCounts['B Shift'] += 1;
+        else if (shiftName.toLowerCase().includes('c shift') || shiftName.toUpperCase() === 'C') stat.shiftCounts['C Shift'] += 1;
+      } else if (isAbsent) {
+        stat.absent += 1;
+        stat.total += 1;
+      } else if (isWO) {
+        stat.wo += 1;
+        stat.total += 1;
+      }
+      
+      if (d.lateMinutes > 0) stat.late += 1;
+      if (d.status === 'SPF') stat.spf += 1;
+      
+      stat.otHours += d.overtime || 0;
+      stat.totalManHours += d.workingHours || 0;
+    });
+
+    return Array.from(statsMap.values()).sort((a, b) => b.active - a.active);
+  }, [distributionData, employees, departments, selectedDept, shiftColumns, settings.shifts]);
+
+  const COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
+
+  const totalPresenceRate = useMemo(() => {
+    const total = deptStats.reduce((acc, curr) => acc + curr.total, 0);
+    const present = deptStats.reduce((acc, curr) => acc + curr.present, 0);
+    return total > 0 ? ((present / total) * 100).toFixed(1) : 0;
+  }, [deptStats]);
+
+  const handleDrillDown = (dept?: string, status?: string) => {
+    let url = '/attendance?';
+    if (dept) url += `dept=${encodeURIComponent(dept)}&`;
+    if (status) url += `status=${status}&`;
+    if (dateRange.start) url += `startDate=${dateRange.start}&`;
+    if (dateRange.end) url += `endDate=${dateRange.end}`;
+    navigate(url);
+  };
+
+  const handleShowPopup = (deptName: string, status: 'Present' | 'Absent' | 'Total' | 'WO' | string) => {
+    const isShift = shiftColumns.includes(status);
+    
+    const deptEmployees = employees.filter(e => 
+      e.department === deptName && 
+      e.status === 'Active' &&
+      (!isShift || (settings.shifts?.find(s => s.id === e.shiftId)?.name || 'Day Shift').includes(status.split(' ')[0]))
+    );
+    
+    const deptPData = distributionData.filter(d => {
+      const emp = employees.find(e => e.id === d.employeeId);
+      const s = settings.shifts?.find(sh => sh.id === d.shiftId)?.name || 'Day Shift';
+      const matchesShift = !isShift || s.includes(status.split(' ')[0]);
+      return emp?.department === deptName && matchesShift;
+    });
+
+    let filtered: typeof employees = [];
+    if (status === 'Total') {
+      filtered = deptEmployees;
+    } else if (isShift) {
+      const presentIds = new Set(deptPData.filter(d => ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status)).map(d => d.employeeId));
+      filtered = deptEmployees.filter(e => presentIds.has(e.id));
+    } else {
+      const statusLower = status.toLowerCase();
+      if (statusLower === 'present') {
+        const presentIds = new Set(deptPData.filter(d => ['present', 'late', 'spf', 'on time', 'early', 'pwo'].includes(d.status.toLowerCase())).map(d => d.employeeId));
+        filtered = deptEmployees.filter(e => presentIds.has(e.id));
+      } else if (statusLower === 'absent') {
+        const absentIds = new Set(deptPData.filter(d => d.status.toLowerCase() === 'absent').map(d => d.employeeId));
+        filtered = deptEmployees.filter(e => absentIds.has(e.id));
+      } else if (statusLower === 'wo') {
+        const woIds = new Set(deptPData.filter(d => d.status.toLowerCase() === 'weekly off').map(d => d.employeeId));
+        filtered = deptEmployees.filter(e => woIds.has(e.id));
+      } else if (statusLower === 'pwo') {
+        const pwoIds = new Set(deptPData.filter(d => d.status.toLowerCase() === 'pwo').map(d => d.employeeId));
+        filtered = deptEmployees.filter(e => pwoIds.has(e.id));
+      } else if (statusLower === 'late') {
+        const lateIds = new Set(deptPData.filter(d => d.lateMinutes > 0).map(d => d.employeeId));
+        filtered = deptEmployees.filter(e => lateIds.has(e.id));
+      }
+    }
+
+    setPopupTitle(`${status} Employees - ${deptName}`);
+    setPopupStatus(status);
+    setPopupEmployees(filtered);
+    setIsPopupOpen(true);
+  };
+
+  const handleExport = (type: 'pdf' | 'excel') => {
+    const tId = toast.loading(`Generating ${type.toUpperCase()} report...`);
+    try {
+      if (type === 'excel') {
+        const data = deptStats.map(d => ({
+          'Department': d.name,
+          'Active (Directory)': d.active,
+          'Present': d.present,
+          'Absent': d.absent,
+          'Weekly Off (WO)': d.wo,
+          'Present on WO (PWO)': d.pwo,
+          ...d.shiftCounts,
+          'Late': d.late,
+          'SPF (Missing)': d.spf,
+          'OT Hours': d.otHours.toFixed(1),
+          'Man-Hours': d.totalManHours.toFixed(1),
+          'Engagement %': `${Math.round((d.present / (d.total || 1)) * 100) || 0}%`
+        }));
+
+        const totals = {
+          active: deptStats.reduce((acc, d) => acc + d.active, 0),
+          present: deptStats.reduce((acc, d) => acc + d.present, 0),
+          absent: deptStats.reduce((acc, d) => acc + d.absent, 0),
+          wo: deptStats.reduce((acc, d) => acc + d.wo, 0),
+          pwo: deptStats.reduce((acc, d) => acc + d.pwo, 0),
+          late: deptStats.reduce((acc, d) => acc + d.late, 0),
+          spf: deptStats.reduce((acc, d) => acc + d.spf, 0),
+          otHours: deptStats.reduce((acc, d) => acc + d.otHours, 0),
+          totalManHours: deptStats.reduce((acc, d) => acc + d.totalManHours, 0),
+          total: deptStats.reduce((acc, d) => acc + d.total, 0),
+          shiftCounts: shiftColumns.reduce((acc, s) => ({ ...acc, [s]: deptStats.reduce((a, d) => a + (d.shiftCounts[s] || 0), 0) }), {})
+        };
+
+        const totalEngagement = totals.total > 0 ? Math.round((totals.present / totals.total) * 100) : 0;
+
+        const footer = {
+          'Department': 'Subtotal',
+          'Active (Directory)': totals.active,
+          'Present': totals.present,
+          'Absent': totals.absent,
+          'Weekly Off (WO)': totals.wo,
+          'Present on WO (PWO)': totals.pwo,
+          ...totals.shiftCounts,
+          'Late': totals.late,
+          'SPF (Missing)': totals.spf,
+          'OT Hours': totals.otHours.toFixed(1),
+          'Man-Hours': totals.totalManHours.toFixed(1),
+          'Engagement %': `${totalEngagement}%`
+        };
+
+        const ws = XLSX.utils.json_to_sheet([...data, footer]);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Department Insights");
+        XLSX.writeFile(wb, `Department_Insights_${dateRange.start}_to_${dateRange.end}.xlsx`);
+      } else {
+        const doc = new jsPDF('l', 'mm', 'a4');
+        const titleDate = format(parseISO(dateRange.start), 'M/d/yyyy');
+        const bsDate = new NepaliDate(parseISO(dateRange.start)).format('YYYY/MM/DD');
+        
+        doc.setFontSize(18);
+        doc.setTextColor(0, 0, 0);
+        doc.text(`Bio Report on the Date of ${titleDate} (${bsDate} BS)`, 148.5, 15, { align: 'center' });
+        
+        const tableData = deptStats.map(d => [
+          d.name,
+          d.active,
+          d.present,
+          d.absent,
+          d.wo,
+          d.pwo,
+          ...shiftColumns.map(s => d.shiftCounts[s]),
+          d.late,
+          d.spf,
+          d.otHours.toFixed(1),
+          d.totalManHours.toFixed(1),
+          `${Math.round((d.present / (d.total || 1)) * 100) || 0}%`
+        ]);
+
+        const totals = {
+          active: deptStats.reduce((acc, d) => acc + d.active, 0),
+          present: deptStats.reduce((acc, d) => acc + d.present, 0),
+          absent: deptStats.reduce((acc, d) => acc + d.absent, 0),
+          wo: deptStats.reduce((acc, d) => acc + d.wo, 0),
+          pwo: deptStats.reduce((acc, d) => acc + d.pwo, 0),
+          late: deptStats.reduce((acc, d) => acc + d.late, 0),
+          spf: deptStats.reduce((acc, d) => acc + d.spf, 0),
+          otHours: deptStats.reduce((acc, d) => acc + d.otHours, 0),
+          totalManHours: deptStats.reduce((acc, d) => acc + d.totalManHours, 0),
+          total: deptStats.reduce((acc, d) => acc + d.total, 0),
+          shiftCounts: shiftColumns.map(s => deptStats.reduce((acc, d) => acc + (d.shiftCounts[s] || 0), 0))
+        };
+
+        const totalEngagement = totals.total > 0 ? Math.round((totals.present / totals.total) * 100) : 0;
+
+        const footer = [
+          'Subtotal',
+          totals.active,
+          totals.present,
+          totals.absent,
+          totals.wo,
+          totals.pwo,
+          ...totals.shiftCounts,
+          totals.late,
+          totals.spf,
+          totals.otHours.toFixed(1),
+          totals.totalManHours.toFixed(1),
+          `${totalEngagement}%`
+        ];
+
+        autoTable(doc, {
+          startY: 22,
+          head: [['Department', 'Active', 'Present', 'Absent', 'WO', 'PWO', ...shiftColumns, 'Late', 'SPF', 'OT Hrs', 'Man-Hrs', 'Eng %']],
+          body: tableData,
+          foot: [footer],
+          theme: 'grid',
+          headStyles: { 
+            fillColor: [51, 122, 183], 
+            textColor: [255, 255, 255], 
+            fontSize: 7,
+            fontStyle: 'bold',
+            halign: 'center'
+          },
+          footStyles: {
+            fillColor: [51, 122, 183],
+            textColor: [255, 255, 255],
+            fontSize: 7,
+            fontStyle: 'bold',
+            halign: 'center'
+          },
+          columnStyles: {
+            0: { fontStyle: 'bold', halign: 'left' }
+          },
+          styles: { fontSize: 6, cellPadding: 1, halign: 'center' }
+        });
+
+        doc.save(`Bio_Report_${dateRange.start}.pdf`);
+      }
+      toast.success(`${type.toUpperCase()} exported successfully`, { id: tId });
+    } catch (error) {
+      console.error(error);
+      toast.error(`Failed to export ${type.toUpperCase()}`, { id: tId });
+    }
+  };
+
+  return (
+    <div className="space-y-8 animate-in fade-in duration-500">
+      {/* Employee List Popup */}
+      <EmployeeListPopup
+        isOpen={isPopupOpen}
+        onClose={() => setIsPopupOpen(false)}
+        title={popupTitle}
+        employees={popupEmployees}
+        status={popupStatus}
+        onEmployeeClick={(id) => {
+          openEmployeeProfile(id);
+          setIsPopupOpen(false);
+        }}
+      />
+      {/* Filters Section */}
+      <div className="bg-white rounded-[2rem] border border-slate-100 shadow-xl shadow-slate-200/30 p-8">
+        <div className="flex items-center justify-between mb-8">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-indigo-50 rounded-2xl text-indigo-600">
+              <Filter size={20} />
+            </div>
+            <div>
+              <h3 className="text-xl font-black text-slate-900">Advanced Filters</h3>
+              <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1">Refine your manpower intelligence</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => handleExport('excel')}
+              className="px-6 py-3 bg-emerald-50 text-emerald-600 border border-emerald-100 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-100 transition-all flex items-center gap-2"
+            >
+              <Download size={14} />
+              Excel
+            </button>
+            <button 
+              onClick={() => handleExport('pdf')}
+              className="px-6 py-3 bg-indigo-50 text-indigo-600 border border-indigo-100 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-indigo-100 transition-all flex items-center gap-2"
+            >
+              <Download size={14} />
+              PDF
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-12 gap-6 relative z-30">
+          <div className="xl:col-span-3">
+            <FilterItem label="Date Range" icon={Calendar}>
+               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <Input 
+                    type="date" 
+                    value={dateRange.start}
+                    onChange={(e) => setDateRange(prev => ({ ...prev, start: e.target.value }))}
+                    className="h-10 text-[12px] pl-9 px-2 w-full"
+                  />
+                  <Input 
+                    type="date" 
+                    value={dateRange.end}
+                    onChange={(e) => setDateRange(prev => ({ ...prev, end: e.target.value }))}
+                    className="h-10 text-[12px] pl-9 px-2 w-full"
+                  />
+               </div>
+            </FilterItem>
+          </div>
+
+          <div className="xl:col-span-2">
+            <FilterItem label="Department" icon={Building2}>
+              <select 
+                value={selectedDept}
+                onChange={(e) => setSelectedDept(e.target.value)}
+                className="w-full h-10 px-3 bg-slate-50 border-none rounded-xl text-xs font-bold focus:ring-2 focus:ring-indigo-500/20 appearance-none cursor-pointer"
+              >
+                {departments.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </FilterItem>
+          </div>
+
+          <div className="xl:col-span-2">
+            <FilterItem label="Contractor" icon={Users}>
+              <select 
+                value={selectedContractor}
+                onChange={(e) => setSelectedContractor(e.target.value)}
+                className="w-full h-10 px-3 bg-slate-50 border-none rounded-xl text-xs font-bold focus:ring-2 focus:ring-indigo-500/20 appearance-none cursor-pointer"
+              >
+                {contractors.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </FilterItem>
+          </div>
+
+          <div className="xl:col-span-2">
+            <FilterItem label="Shift" icon={Clock}>
+              <select 
+                value={selectedShift}
+                onChange={(e) => setSelectedShift(e.target.value)}
+                className="w-full h-10 px-3 bg-slate-50 border-none rounded-xl text-xs font-bold focus:ring-2 focus:ring-indigo-500/20 appearance-none cursor-pointer"
+              >
+                {shifts.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </FilterItem>
+          </div>
+
+          <div className="xl:col-span-3">
+            <FilterItem label="Status" icon={UserCheck}>
+              <select 
+                value={selectedStatus}
+                onChange={(e) => setSelectedStatus(e.target.value)}
+                className="w-full h-10 px-3 bg-slate-50 border-none rounded-xl text-xs font-bold focus:ring-2 focus:ring-indigo-500/20 appearance-none cursor-pointer"
+              >
+                {statuses.map(s => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </FilterItem>
+          </div>
+        </div>
+      </div>
+
+      {/* Summary Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <InsightCard 
+          title="Avg. Presence Rate" 
+          value={`${totalPresenceRate}%`} 
+          icon={TrendingUp} 
+          color="emerald"
+          onClick={() => handleDrillDown(selectedDept !== 'All' ? selectedDept : undefined, 'Present')}
+        />
+        <InsightCard 
+          title="Total OT Hours" 
+          value={deptStats.reduce((acc, curr) => acc + curr.otHours, 0).toFixed(1)} 
+          icon={Clock} 
+          color="indigo"
+          onClick={() => navigate('/overtime')}
+        />
+        <InsightCard 
+          title="Total Man-Hours" 
+          value={Math.round(deptStats.reduce((acc, curr) => acc + curr.totalManHours, 0))} 
+          icon={Users} 
+          color="amber"
+          onClick={() => navigate('/reports')}
+        />
+        <InsightCard 
+          title="Departments Tracked" 
+          value={deptStats.length} 
+          icon={Building2} 
+          color="slate"
+        />
+      </div>
+
+      {/* Visual Analytics Grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* Department Presence Chart */}
+        <div className="bg-white rounded-[2rem] border border-slate-100 shadow-xl shadow-slate-200/30 p-8">
+          <h3 className="text-lg font-black text-slate-900 mb-8 flex items-center gap-2">
+            <BarChartIcon size={20} className="text-indigo-500" />
+            Manpower per Department
+          </h3>
+          <div className="h-[400px]">
+             <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={deptStats} layout="vertical">
+                   <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
+                   <XAxis type="number" hide />
+                   <YAxis 
+                    dataKey="name" 
+                    type="category" 
+                    width={100} 
+                    axisLine={false} 
+                    tickLine={false} 
+                    tick={{ fill: '#94a3b8', fontSize: 10, fontWeight: 'bold' }} 
+                   />
+                   <Tooltip 
+                    cursor={{ fill: 'rgba(99, 102, 241, 0.05)' }}
+                    contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.15)' }}
+                   />
+                   <Bar dataKey="total" radius={[0, 8, 8, 0]} barSize={20}>
+                      {deptStats.map((entry, index) => (
+                        <Cell 
+                          key={`cell-${index}`} 
+                          fill={COLORS[index % COLORS.length]} 
+                          onClick={() => handleDrillDown(entry.name)}
+                          style={{ cursor: 'pointer' }}
+                        />
+                      ))}
+                   </Bar>
+                </BarChart>
+             </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* Detailed Stats Table */}
+        <div className="bg-white rounded-[2rem] border border-slate-100 shadow-xl shadow-slate-200/30 overflow-hidden flex flex-col">
+           <div className="p-8 border-b border-slate-50 flex items-center justify-between">
+              <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
+                <Users size={20} className="text-emerald-500" />
+                Manpower Distribution
+              </h3>
+           </div>
+           <div className="flex-1 overflow-y-auto custom-scrollbar">
+               <table className="w-full text-left">
+                  <thead className="bg-slate-50/50 sticky top-0 z-10">
+                    <tr>
+                       <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Department</th>
+                       <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">Active</th>
+                       <th className="px-4 py-4 text-[10px] font-black text-emerald-500 uppercase tracking-widest text-center">Present</th>
+                       <th className="px-4 py-4 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-center">Late</th>
+                       <th className="px-4 py-4 text-[10px] font-black text-rose-500 uppercase tracking-widest text-center">Absent</th>
+                       <th className="px-4 py-4 text-[10px] font-black text-amber-500 uppercase tracking-widest text-center">WO</th>
+                       <th className="px-4 py-4 text-[10px] font-black text-indigo-600 uppercase tracking-widest text-center">PWO</th>
+                       {shiftColumns.map(s => (
+                         <th key={s} className="px-4 py-4 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-center">{s}</th>
+                       ))}
+                       <th className="px-4 py-4"></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {deptStats.map(dept => (
+                      <tr 
+                        key={dept.name} 
+                        onClick={() => handleDrillDown(dept.name)}
+                        className="hover:bg-slate-50/50 transition-colors group cursor-pointer"
+                      >
+                        <td className="px-4 py-5">
+                          <p className="text-sm font-black text-slate-900 group-hover:text-indigo-600 transition-colors uppercase leading-none">{dept.name}</p>
+                          <p className="text-[10px] font-bold text-slate-400 mt-1 uppercase tracking-widest">{Math.round((dept.present / (dept.total || 1)) * 100) || 0}% Engagement</p>
+                        </td>
+                        <td 
+                          className="px-4 py-5 text-center font-black text-slate-900 hover:text-indigo-600 transition-colors cursor-pointer"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleShowPopup(dept.name, 'Total');
+                          }}
+                        >
+                          {dept.active}
+                        </td>
+                        <td 
+                          className="px-4 py-5 text-center cursor-pointer group"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleShowPopup(dept.name, 'Present');
+                          }}
+                        >
+                          <span className="px-3 py-1 bg-emerald-50 text-emerald-600 rounded-full text-xs font-black group-hover:bg-emerald-100 transition-all">
+                            {dept.present}
+                          </span>
+                        </td>
+                        <td 
+                          className="px-4 py-5 text-center cursor-pointer group"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleShowPopup(dept.name, 'Late');
+                          }}
+                        >
+                          <span className="px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-black group-hover:bg-indigo-100 transition-all">
+                            {dept.late}
+                          </span>
+                        </td>
+                        <td 
+                          className="px-4 py-5 text-center cursor-pointer group"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleShowPopup(dept.name, 'Absent');
+                          }}
+                        >
+                          <span className="px-3 py-1 bg-rose-50 text-rose-600 rounded-full text-xs font-black group-hover:bg-rose-100 transition-all">
+                            {dept.absent}
+                          </span>
+                        </td>
+                        <td 
+                          className="px-4 py-5 text-center cursor-pointer group"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleShowPopup(dept.name, 'WO');
+                          }}
+                        >
+                          <span className="px-3 py-1 bg-amber-50 text-amber-600 rounded-full text-xs font-black group-hover:bg-amber-100 transition-all">
+                            {dept.wo}
+                          </span>
+                        </td>
+                        <td 
+                          className="px-4 py-5 text-center cursor-pointer group"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleShowPopup(dept.name, 'PWO');
+                          }}
+                        >
+                          <span className="px-3 py-1 bg-indigo-600 text-white rounded-full text-xs font-black group-hover:bg-indigo-700 transition-all">
+                            {dept.pwo}
+                          </span>
+                        </td>
+                        {shiftColumns.map(s => (
+                          <td 
+                            key={s}
+                            className="px-4 py-5 text-center font-bold text-slate-600 cursor-pointer hover:text-indigo-600"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleShowPopup(dept.name, s);
+                            }}
+                          >
+                            {dept.shiftCounts[s] || 0}
+                          </td>
+                        ))}
+                        <td className="px-4 py-5 text-right">
+                          <div
+                            className="p-2 text-slate-300 group-hover:text-indigo-600 group-hover:bg-indigo-50 rounded-xl transition-all inline-block"
+                          >
+                             <ChevronRight size={18} strokeWidth={3} />
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot className="bg-slate-50 font-black">
+                    <tr>
+                      <td className="px-4 py-4 text-sm text-slate-900 uppercase">Subtotal</td>
+                      <td className="px-4 py-4 text-center text-slate-900">{deptStats.reduce((acc, d) => acc + d.active, 0)}</td>
+                      <td className="px-4 py-4 text-center text-emerald-600">{deptStats.reduce((acc, d) => acc + d.present, 0)}</td>
+                      <td className="px-4 py-4 text-center text-indigo-600">{deptStats.reduce((acc, d) => acc + d.late, 0)}</td>
+                      <td className="px-4 py-4 text-center text-rose-600">{deptStats.reduce((acc, d) => acc + d.absent, 0)}</td>
+                      <td className="px-4 py-4 text-center text-amber-600">{deptStats.reduce((acc, d) => acc + d.wo, 0)}</td>
+                      <td className="px-4 py-4 text-center text-indigo-600">{deptStats.reduce((acc, d) => acc + d.pwo, 0)}</td>
+                      {shiftColumns.map(s => (
+                        <td key={s} className="px-4 py-4 text-center text-indigo-600">
+                          {deptStats.reduce((acc, d) => acc + (d.shiftCounts[s] || 0), 0)}
+                        </td>
+                      ))}
+                      <td></td>
+                    </tr>
+                  </tfoot>
+              </table>
+           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FilterItem({ label, icon: Icon, children }: any) {
+  return (
+    <div className="space-y-2">
+      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5 ml-1">
+        <Icon size={12} />
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function InsightCard({ title, value, icon: Icon, color, onClick }: any) {
+  return (
+    <motion.div 
+      whileHover={onClick ? { y: -5 } : {}}
+      onClick={onClick}
+      className={cn(
+        "p-6 rounded-3xl bg-white border border-slate-100 shadow-xl shadow-slate-200/30 flex items-center gap-6 group relative overflow-hidden",
+        onClick && "cursor-pointer"
+      )}
+    >
+      <div className={cn(
+        "w-16 h-16 rounded-2xl flex items-center justify-center shrink-0 shadow-lg shadow-slate-100 group-hover:scale-110 transition-transform",
+        `bg-${color}-50 text-${color}-600`
+      )}>
+        <Icon size={24} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest truncate">{title}</p>
+        <p className="text-3xl font-black text-slate-900 mt-1 tracking-tighter">{value}</p>
+      </div>
+      {onClick && (
+        <div className="absolute top-4 right-4 text-slate-300 opacity-0 group-hover:opacity-100 transition-opacity">
+           <ChevronRight size={16} strokeWidth={3} />
+        </div>
+      )}
+    </motion.div>
+  );
+}

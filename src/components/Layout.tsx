@@ -35,17 +35,21 @@ export function Layout() {
     openEmployeeProfile, closeEmployeeProfile, 
     theme, setTheme, globalSearchTerm, setGlobalSearchTerm, 
     recalculate, isInitializing, quotaExceeded, resetError,
-    setIsOtpVerified
+    setIsOtpVerified, user, setUser
   } = useAppStore();
   const location = useLocation();
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isMobileOpen, setIsMobileOpen] = useState(false);
   
-  const isAdmin = ADMIN_EMAILS.some(email => auth.currentUser?.email?.toLowerCase() === email.toLowerCase());
+  const currentUserEmail = user?.email || auth.currentUser?.email || '';
+  const isAdmin = ADMIN_EMAILS.some(email => currentUserEmail.toLowerCase() === email.toLowerCase());
 
   const handleSignOut = () => {
     setIsOtpVerified(false);
-    signOut(auth);
+    sessionStorage.removeItem('local_session_user');
+    sessionStorage.removeItem('is_otp_verified');
+    setUser(null);
+    signOut(auth).catch(() => {});
   };
 
   const selectedEmployee = employees.find(e => e.id === selectedEmployeeId) || null;

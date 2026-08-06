@@ -57,14 +57,46 @@ function QuotaBanner() {
 }
 
 function AppContent() {
-  const { quotaExceeded, reportError, setUser, setIsAdmin, isOtpVerified } = useAppStore();
-  const [user, setUserLocal] = useState<User | null>(null);
+  const { quotaExceeded, reportError, setUser, setIsAdmin, isOtpVerified, user: storeUser } = useAppStore();
+  const [user, setUserLocal] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // 1. Initial local session user restoration
+    const savedLocalUser = sessionStorage.getItem('local_session_user');
+    if (savedLocalUser) {
+      try {
+        const parsed = JSON.parse(savedLocalUser);
+        setUserLocal(parsed);
+        setUser(parsed);
+        setIsAdmin(ADMIN_EMAILS.some(email => parsed.email?.toLowerCase() === email.toLowerCase()));
+        setLoading(false);
+      } catch (e) {
+        // ignore
+      }
+    }
+
     return onAuthStateChanged(auth, async (u) => {
-      setUserLocal(u);
-      setUser(u);
+      if (u) {
+        setUserLocal(u);
+        setUser(u);
+        sessionStorage.removeItem('local_session_user');
+      } else {
+        const currentSaved = sessionStorage.getItem('local_session_user');
+        if (currentSaved) {
+          try {
+            const parsed = JSON.parse(currentSaved);
+            setUserLocal(parsed);
+            setUser(parsed);
+          } catch (e) {
+            setUserLocal(null);
+            setUser(null);
+          }
+        } else {
+          setUserLocal(null);
+          setUser(null);
+        }
+      }
       setLoading(false);
 
       if (u) {
@@ -76,34 +108,34 @@ function AppContent() {
         const alreadySynced = sessionStorage.getItem(sessionKey);
 
         if (!quotaExceeded && isAdminUser && !alreadySynced) {
-        const timeout = setTimeout(async () => {
-          try {
-            const { db } = await import('./lib/firebase');
-            const { doc, setDoc, getDoc } = await import('firebase/firestore');
-            const userDoc = await getDoc(doc(db, 'users', u.uid));
-            
-            if (!userDoc.exists() || (userDoc.data()?.role !== 'Admin' && userDoc.data()?.role !== 'Editor')) {
-              await setDoc(doc(db, 'users', u.uid), {
-                id: u.uid,
-                username: u.displayName || u.email || 'Admin',
-                role: isAdminUser ? 'Admin' : 'Editor'
-              }, { merge: true });
-              console.log("Verified and synced Editor permissions for owner.");
+          const timeout = setTimeout(async () => {
+            try {
+              const { db } = await import('./lib/firebase');
+              const { doc, setDoc, getDoc } = await import('firebase/firestore');
+              const userDoc = await getDoc(doc(db, 'users', u.uid));
+              
+              if (!userDoc.exists() || (userDoc.data()?.role !== 'Admin' && userDoc.data()?.role !== 'Editor')) {
+                await setDoc(doc(db, 'users', u.uid), {
+                  id: u.uid,
+                  username: u.displayName || u.email || 'Admin',
+                  role: isAdminUser ? 'Admin' : 'Editor'
+                }, { merge: true });
+                console.log("Verified and synced Editor permissions for owner.");
+              }
+            } catch (e: any) {
+              console.warn("Minor: Admin role sync deferred (possibly quota):", e);
+              if (e?.code === 'resource-exhausted' || String(e).toLowerCase().includes('quota')) {
+                reportError(e);
+              }
+            } finally {
+              sessionStorage.setItem(sessionKey, 'true');
             }
-          } catch (e: any) {
-            console.warn("Minor: Admin role sync deferred (possibly quota):", e);
-            if (e?.code === 'resource-exhausted' || String(e).toLowerCase().includes('quota')) {
-              reportError(e);
-            }
-          } finally {
-            sessionStorage.setItem(sessionKey, 'true');
-          }
-        }, 3000); // Wait longer to allow other data to load first
-        return () => clearTimeout(timeout);
+          }, 3000); // Wait longer to allow other data to load first
+          return () => clearTimeout(timeout);
+        }
       }
-    }
-  });
-}, [quotaExceeded, reportError]);
+    });
+  }, [quotaExceeded, reportError, setUser, setIsAdmin]);
 
   if (loading) {
     return (

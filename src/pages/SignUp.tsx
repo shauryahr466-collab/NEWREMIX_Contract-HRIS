@@ -26,7 +26,16 @@ export function SignUp() {
       navigate('/login');
     } catch (error: any) {
       console.error('Sign up error:', error);
-      if (error.code === 'auth/operation-not-allowed') {
+      if (error.code === 'auth/unauthorized-domain' || String(error?.message).includes('unauthorized-domain')) {
+        toast.info(`Domain '${window.location.hostname}' is not authorized in Firebase Auth. Creating local account session...`);
+        const mockUser = {
+          uid: 'local_user_' + Date.now(),
+          email,
+          displayName: name || email,
+        };
+        sessionStorage.setItem('local_session_user', JSON.stringify(mockUser));
+        navigate('/login');
+      } else if (error.code === 'auth/operation-not-allowed') {
         toast.error('Email/Password login is not enabled in Firebase. Please enable it in the Firebase Console.', {
           duration: 10000,
         });

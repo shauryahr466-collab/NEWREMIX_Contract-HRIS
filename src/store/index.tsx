@@ -653,7 +653,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (recordsToWrite.length === 0) return;
 
         const total = recordsToWrite.length;
-        const batchSize = 250;
+        const batchSize = 500;
         
         for (let i = 0; i < total; i += batchSize) {
           const chunk = recordsToWrite.slice(i, i + batchSize);
@@ -690,7 +690,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (recordsToWrite.length === 0) return;
 
         const total = recordsToWrite.length;
-        const batchSize = 250;
+        const batchSize = 500;
         
         for (let i = 0; i < total; i += batchSize) {
           const chunk = recordsToWrite.slice(i, i + batchSize);
@@ -736,7 +736,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (recordsToWrite.length === 0) return;
 
         const total = recordsToWrite.length;
-        const batchSize = 250;
+        const batchSize = 500;
         
         for (let i = 0; i < total; i += batchSize) {
           const chunk = recordsToWrite.slice(i, i + batchSize);
@@ -1337,7 +1337,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const runAutoResolve = async () => {
       if (!checkQuota()) return;
       try {
-        const BATCH_SIZE = 250;
+        const BATCH_SIZE = 500;
         for (let i = 0; i < itemsToResolve.length; i += BATCH_SIZE) {
           const chunk = itemsToResolve.slice(i, i + BATCH_SIZE);
           const batch = writeBatch(db);

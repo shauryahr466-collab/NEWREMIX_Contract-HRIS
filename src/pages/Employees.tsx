@@ -376,10 +376,16 @@ export function Employees() {
           } as Employee;
         });
 
+        // Build quick lookup map for raw JSON rows by employee ID
+        const jsonMap = new Map(json.map(r => [
+          String(r['Employee ID'] || r['Emp ID'] || r['ID'] || r['Employee No'] || r['AC-No.'] || r['Employee No.'] || '').trim(),
+          r
+        ]));
+
         // Try to handle shift name mapping more robustly if initial mapping failed
         importedEmps.forEach(emp => {
           if (!emp.shiftId || emp.shiftId === settings.shifts?.[0]?.id) {
-            const rawRow = json.find(r => String(r['Employee ID'] || r['Emp ID'] || r['ID'] || '').trim() === emp.id);
+            const rawRow = jsonMap.get(emp.id);
             if (rawRow) {
               const sName = String(rawRow['Shift'] || rawRow['Shift Name'] || '').trim().toLowerCase();
               if (sName) {

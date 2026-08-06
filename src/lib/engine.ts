@@ -133,7 +133,7 @@ export function processPunches(
   const sortedPunches = Array.from(new Map(punches.map(p => [p.employeeId + p.punchDatetime, p])).values())
     .map(p => {
       const cleanIso = p.punchDatetime ? String(p.punchDatetime).replace(' ', 'T') : '';
-      let t = parseISO(cleanIso).getTime();
+      let t = Date.parse(cleanIso);
       if (isNaN(t)) t = new Date(cleanIso).getTime();
       return { ...p, _time: isNaN(t) ? 0 : t };
     })
@@ -162,8 +162,6 @@ export function processPunches(
   // Determine date range for reporting
   let startMs = Date.now();
   let endMs = Date.now();
-  if (finalStartDate) startMs = finalStartDate.getTime();
-  else if (sortedPunches.length > 0) startMs = sortedPunches[0]._time;
 
   const todayEnd = endOfDay(new Date()).getTime();
   const lastPunchTime = sortedPunches.length > 0 ? sortedPunches[sortedPunches.length - 1]._time : 0;
@@ -172,6 +170,15 @@ export function processPunches(
     endMs = Math.max(finalEndDate.getTime(), todayEnd, lastPunchTime);
   } else {
     endMs = Math.max(todayEnd, lastPunchTime);
+  }
+
+  const maxLookbackMs = 180 * 86400 * 1000; // Default max lookback of 180 days unless configured
+  if (finalStartDate) {
+    startMs = finalStartDate.getTime();
+  } else if (sortedPunches.length > 0) {
+    startMs = Math.max(sortedPunches[0]._time, endMs - maxLookbackMs);
+  } else {
+    startMs = Date.now() - (30 * 86400 * 1000);
   }
 
   const current = new Date(startMs);
@@ -183,6 +190,25 @@ export function processPunches(
     d.setDate(d.getDate() + 1);
   }
 
+  // Pre-calculate date metadata to avoid repeated Date parsing inside loop
+  const dateInfoMap = new Map<string, {
+    y: number;
+    m: number;
+    day: number;
+    dayName: string;
+    prevDate: string;
+    nextDate: string;
+  }>();
+
+  allDatesList.forEach(dateStr => {
+    const [y, m, day] = dateStr.split('-').map(Number);
+    const dObj = new Date(y, m - 1, day);
+    const dayName = format(dObj, 'EEEE').toLowerCase();
+    const prevDate = format(subMinutes(dObj, 1440), 'yyyy-MM-dd');
+    const nextDate = format(addMinutes(dObj, 1440), 'yyyy-MM-dd');
+    dateInfoMap.set(dateStr, { y, m, day, dayName, prevDate, nextDate });
+  });
+
   const processed: ProcessedAttendance[] = [];
   const mergeTime = settings.duplicateMergeTime || 5;
 
@@ -191,8 +217,12 @@ export function processPunches(
     
     const normId = normalizeEmployeeId(emp.id);
     const empData = punchesByEmpAndDate.get(normId);
+    const empWO = (emp.weeklyOff || 'Sunday').trim().toLowerCase();
     
     allDatesList.forEach(dateStr => {
+      const dateInfo = dateInfoMap.get(dateStr)!;
+      const isWeeklyOff = empWO.includes(dateInfo.dayName);
+
       const assignment = assignmentMap.get(`${normId}_${dateStr}`);
       const targetShiftId = assignment?.shiftId || emp.shiftId;
       let shift = shiftMap.get(targetShiftId || '');
@@ -220,9 +250,8 @@ export function processPunches(
       const [hStart, mStart] = startTimeStr.split(':').map(Number);
       const [hEnd, mEnd] = endTimeStr.split(':').map(Number);
       
-      const [y, m, day] = dateStr.split('-').map(Number);
-      const expectedStart = new Date(y, m - 1, day, hStart, mStart, 0);
-      let expectedEnd = new Date(y, m - 1, day, hEnd, mEnd, 0);
+      const expectedStart = new Date(dateInfo.y, dateInfo.m - 1, dateInfo.day, hStart, mStart, 0);
+      let expectedEnd = new Date(dateInfo.y, dateInfo.m - 1, dateInfo.day, hEnd, mEnd, 0);
       
       if (shift?.isNightShift || isBefore(expectedEnd, expectedStart)) {
         expectedEnd = addHours(expectedEnd, 24);
@@ -234,18 +263,11 @@ export function processPunches(
       const windowStart = subHours(expectedStart, 6).getTime();
       const windowEnd = addHours(expectedEnd, 6).getTime();
 
-      const dayName = format(parseISO(dateStr), 'EEEE');
-      const empWO = (emp.weeklyOff || 'Sunday').trim().toLowerCase();
-      const isWeeklyOff = empWO.includes(dayName.toLowerCase());
-
       // Group punches by shift window - OPTIMIZED: only check punches from current and adjacent dates
-      const prevDate = format(subMinutes(expectedStart, 1440), 'yyyy-MM-dd');
-      const nextDate = format(addMinutes(expectedStart, 1440), 'yyyy-MM-dd');
-      
       const candidatePunches = [
-        ...(empData?.get(prevDate) || []),
+        ...(empData?.get(dateInfo.prevDate) || []),
         ...(empData?.get(dateStr) || []),
-        ...(empData?.get(nextDate) || [])
+        ...(empData?.get(dateInfo.nextDate) || [])
       ];
 
       const dayPunches = candidatePunches.filter(p => p._time >= windowStart && p._time < windowEnd);

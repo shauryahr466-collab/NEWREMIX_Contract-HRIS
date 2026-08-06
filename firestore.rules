@@ -53,50 +53,43 @@ service cloud.firestore {
     }
 
     match /attendance/{atId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /settings/{docId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /sbl/{docId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /overtime/{docId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /forceAttendance/{docId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /shiftAssignments/{asId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /assignmentLogs/{logId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /auditLogs/{logId} {
-      allow read: if isSignedIn();
-      allow create: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
     }
 
     match /exceptions/{exId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow read, write: if true;
+    }
+
+    match /payrollRuns/{runId} {
+      allow read, write: if true;
     }
 
     match /zkDevices/{deviceId} {

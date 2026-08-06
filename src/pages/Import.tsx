@@ -2,7 +2,7 @@ import React, { useState, useMemo } from 'react';
 import * as XLSX from 'xlsx';
 import { UploadCloud, CheckCircle2, AlertCircle, Trash2, History, Database, Download, Filter, CalendarDays, ClipboardList, Loader2, Info } from 'lucide-react';
 import { useAppStore } from '../store';
-import { RawPunch, ShiftAssignment } from '../types';
+import { RawPunch, ShiftAssignment, Employee } from '../types';
 import { generateId, cn, normalizeEmployeeId } from '../lib/utils';
 import { processPunches } from '../lib/engine';
 import { useNavigate } from 'react-router-dom';
@@ -193,18 +193,51 @@ export function Import() {
           // Helper for deterministic IDs to prevent duplicates on re-import
           const makePunchId = (empId: string, dt: string) => `p_${empId}_${dt}`.replace(/[^a-zA-Z0-9]/g, '_');
 
-          json.forEach((row) => {
-            const keys = Object.keys(row);
-            
-            const rawIdKey = keys.find(k => k === 'Employee No.' || k === 'Emp ID' || k === 'EMP ID' || k.toLowerCase().includes('ac-no') || k.toLowerCase().includes('employee no'));
-            const dateTimeKey = keys.find(k => k === 'Date/Time' || k === 'DateTime' || k.toLowerCase().includes('date/time'));
-            const dateKey = keys.find(k => k === 'Date');
-            
-            // Find all Time columns (Time.1, Time.2, etc. or just "Time")
-            const timeKeys = keys.filter(k => k.toLowerCase().startsWith('time') || k.toLowerCase().includes('punch'));
+          // Extract column keys ONCE for the entire dataset to prevent O(N*K) repeated key searches
+          const firstRowKeys = json.length > 0 ? Object.keys(json[0]) : [];
+          
+          const isEmpIdKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l === 'employee no.' || l === 'emp id' || l === 'emp_id' || l === 'empid' ||
+                   l.includes('ac-no') || l.includes('ac_no') || l.includes('ac no') ||
+                   l.includes('employee no') || l.includes('employee_no') || l.includes('employee') ||
+                   l.includes('userid') || l.includes('user id') || l.includes('user_id') ||
+                   l.includes('cardno') || l.includes('card_no') || l.includes('card no') ||
+                   l.includes('enroll') || l.includes('badge') || l.includes('pin') ||
+                   l === 'id' || l === 'no' || l === 'no.' || l === 'code';
+          };
 
-            if (rawIdKey && (dateTimeKey || (dateKey && timeKeys.length > 0))) {
-              const rawEmpIdInput = String(row[rawIdKey]).trim();
+          const isDateTimeKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l.includes('date/time') || l.includes('datetime') || l.includes('date_time') ||
+                   l.includes('logtime') || l.includes('log_time') || l.includes('punchtime') ||
+                   l.includes('punch_time') || l.includes('checktime') || l.includes('clock');
+          };
+
+          const isDateKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l === 'date' || l.includes('punch date') || l.includes('log date');
+          };
+
+          const isTimeKey = (k: string) => {
+            const l = k.toLowerCase().trim();
+            return l.startsWith('time') || l.includes('punch') || l.includes('clock') || l.includes('in') || l.includes('out');
+          };
+
+          const rawIdKey = firstRowKeys.find(isEmpIdKey);
+          const dateTimeKey = firstRowKeys.find(isDateTimeKey);
+          const dateKey = firstRowKeys.find(isDateKey);
+          const timeKeys = firstRowKeys.filter(isTimeKey);
+
+          json.forEach((row) => {
+            const rowRawIdKey = rawIdKey || Object.keys(row).find(isEmpIdKey);
+            const rowDateTimeKey = dateTimeKey || Object.keys(row).find(isDateTimeKey);
+            const rowDateKey = dateKey || Object.keys(row).find(isDateKey);
+            const rowTimeKeys = timeKeys.length > 0 ? timeKeys : Object.keys(row).filter(isTimeKey);
+
+            if (rowRawIdKey && (rowDateTimeKey || (rowDateKey && rowTimeKeys.length > 0))) {
+              const rawEmpIdInput = String(row[rowRawIdKey]).trim();
+              if (!rawEmpIdInput || rawEmpIdInput === 'undefined' || rawEmpIdInput === 'null') return;
               const normInput = getNormalized(rawEmpIdInput);
               
               // FLEXIBLE MATCHING: Exact -> Lowercase -> Numeric part (handles 1257 vs EMP1257)
@@ -212,16 +245,16 @@ export function Import() {
                               employeeIdMap.get(normInput.lowercase) || 
                               (normInput.numeric ? employeeIdMap.get(normInput.numeric) : undefined);
 
-              // ONLY process if employee exists in directory
+              // Fallback to rawEmpIdInput so punches are never dropped even if employee not pre-created
               if (!matchedId) {
+                matchedId = rawEmpIdInput;
                 failedMatches.add(rawEmpIdInput);
-                return;
               }
 
               const rawEmpId = matchedId;
 
-              if (dateTimeKey) {
-                const rawDT = row[dateTimeKey];
+              if (rowDateTimeKey) {
+                const rawDT = row[rowDateTimeKey];
                 let punchIso = '';
                 if (typeof rawDT === 'number') {
                   const dateObj = new Date(Math.round((rawDT - 25569) * 864e5));
@@ -244,9 +277,9 @@ export function Import() {
                     fileName: file.name
                   });
                 }
-              } else if (dateKey) {
+              } else if (rowDateKey) {
                 let datePart = '';
-                const rawDate = row[dateKey];
+                const rawDate = row[rowDateKey];
                 if (typeof rawDate === 'number') {
                   const dateObj = new Date(Math.round((rawDate - 25569) * 864e5));
                   datePart = format(dateObj, 'yyyy-MM-dd');
@@ -261,7 +294,7 @@ export function Import() {
 
                 if (datePart) {
                   // Process all time columns for this row
-                  timeKeys.forEach(tKey => {
+                  rowTimeKeys.forEach(tKey => {
                     const rawTime = row[tKey];
                     if (!rawTime) return;
 
@@ -307,10 +340,30 @@ export function Import() {
           });
 
           if (finalNewPunchesRaw.length === 0) {
-            toast.error("No punches found for existing employees in directory. Ensure Employee No. matches the Directory.");
+            toast.error("No valid punch date/times found in file. Check column formatting.");
             setStatus('error');
-            setMessage("Import failed: No matching employees found.");
+            setMessage("Import failed: No valid punch timestamps found.");
             return;
+          }
+
+          // Auto-create any missing employees in directory
+          if (failedMatches.size > 0) {
+            const missingEmps: Employee[] = [];
+            failedMatches.forEach(missingId => {
+              if (missingId && !employees.some(e => e.id === missingId)) {
+                missingEmps.push({
+                  id: missingId,
+                  name: `Employee ${missingId}`,
+                  department: 'General',
+                  designation: 'Staff',
+                  joiningDate: new Date().toISOString().split('T')[0],
+                  status: 'Active'
+                });
+              }
+            });
+            if (missingEmps.length > 0) {
+              await setEmployees(missingEmps);
+            }
           }
 
           // Deduplicate new punches based on ID

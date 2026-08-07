@@ -3,12 +3,13 @@ import { motion, AnimatePresence } from 'motion/react';
 import { 
   X, User, Mail, Phone, MapPin, Briefcase, 
   Calendar, Clock, Shield, Award, Fingerprint,
-  TrendingUp, AlertCircle, FileText
+  TrendingUp, AlertCircle, FileText, Folder
 } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import { useAppStore } from '../store';
 import { cn } from '../lib/utils';
 import { Employee, ProcessedAttendance, OvertimeRecord, SBLRecord } from '../types';
+import { EmployeeDocuments } from './EmployeeDocuments';
 
 interface EmployeeDrawerProps {
   employee: Employee | null;
@@ -125,6 +126,11 @@ export function EmployeeDrawer({ employee, isOpen, onClose }: EmployeeDrawerProp
                   <InfoItem icon={Fingerprint} label="Aadhar/ID" value={employee.aadharNumber || 'N/A'} />
                   <InfoItem icon={FileText} label="Account Type" value="Contractual" />
                 </div>
+              </section>
+
+              {/* Local HR Documents Section */}
+              <section className="p-5 bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm">
+                <EmployeeDocuments employeeId={employee.id} employeeName={employee.name} />
               </section>
 
               {/* Recent Activity Mini-Grids */}

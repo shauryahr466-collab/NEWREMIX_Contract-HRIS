@@ -8,6 +8,7 @@ import { auth } from '../lib/firebase';
 import { signOut } from 'firebase/auth';
 import { motion, AnimatePresence } from 'motion/react';
 import { EmployeeDrawer } from './EmployeeDrawer';
+import { LocalModeIndicator } from './LocalModeIndicator';
 
 const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
 
@@ -208,6 +209,7 @@ export function Layout() {
           </div>
 
           <div className="flex items-center gap-4 flex-wrap justify-end">
+            <LocalModeIndicator />
             <div className="relative hidden md:block">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input 

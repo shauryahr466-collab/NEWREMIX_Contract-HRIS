@@ -512,13 +512,40 @@ export function SettingsPage() {
                    <span className="text-slate-900 dark:text-white font-mono">v1.4.2-enterprise</span>
                  </div>
                  <div className="flex justify-between items-center text-[10px]">
-                   <span className="text-slate-400 font-bold uppercase">Last Backup</span>
-                   <span className="text-slate-900 dark:text-white font-mono">{format(new Date(), 'dd MMM yyyy')}</span>
+                   <span className="text-slate-400 font-bold uppercase">Database Engine</span>
+                   <Badge variant="success" className="text-[8px] h-4">SQLite Local First</Badge>
                  </div>
                  <div className="flex justify-between items-center text-[10px]">
-                   <span className="text-slate-400 font-bold uppercase">Environment</span>
-                   <Badge variant="success" className="text-[8px] h-4">Production</Badge>
+                   <span className="text-slate-400 font-bold uppercase">Storage Mode</span>
+                   <span className="text-emerald-600 dark:text-emerald-400 font-mono font-bold">Offline Local Disk</span>
                  </div>
+              </div>
+           </Card>
+
+           <Card className="p-6 bg-slate-900 text-white">
+              <div className="flex items-center gap-3 mb-3">
+                 <div className="p-2 bg-emerald-500/20 text-emerald-400 rounded-lg">
+                   <Database size={18} />
+                 </div>
+                 <div>
+                   <h3 className="text-sm font-bold">Local-First Storage Engine</h3>
+                   <p className="text-[11px] text-slate-400">SQLite + Local Disk Architecture</p>
+                 </div>
+              </div>
+              <p className="text-xs text-slate-300 leading-relaxed mb-4">
+                Your system reads and writes directly to local SQLite database and local disk files (`D:\SHRM-HRIS\`). No Firebase Storage required for daily operations.
+              </p>
+              <div className="space-y-2">
+                <Button 
+                  onClick={async () => {
+                    const res = await fetch('/api/local/backup', { method: 'POST' }).then(r => r.json());
+                    toast.success(res.message || 'Local backup saved to D:\\SHRM-HRIS\\backups\\');
+                  }}
+                  variant="outline"
+                  className="w-full text-xs border-slate-700 text-slate-200 hover:bg-slate-800 justify-center gap-2"
+                >
+                  <Download size={14} /> Backup Local Database & Documents
+                </Button>
               </div>
            </Card>
         </div>

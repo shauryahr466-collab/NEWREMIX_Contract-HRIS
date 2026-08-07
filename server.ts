@@ -7,6 +7,7 @@ import { initializeApp } from 'firebase/app';
 import { getFirestore, doc, setDoc, writeBatch, getDocs, collection } from 'firebase/firestore';
 
 import firebaseConfig from './firebase-applet-config.json';
+import { localRouter } from './src/server/localApi.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +35,9 @@ async function startServer() {
     }
     next();
   });
+
+  // Mount Local SQLite & Local Disk Storage API Routes
+  app.use('/api/local', localRouter);
 
   // Middleware to verify Admin token
   const verifyAdmin = async (req: express.Request, res: express.Response, next: express.NextFunction) => {

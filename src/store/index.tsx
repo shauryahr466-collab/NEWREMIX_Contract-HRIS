@@ -6,6 +6,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../lib/firebase';
 import { logAdminOverride } from '../lib/audit';
 import { normalizeEmployeeId } from '../lib/utils';
+import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords } from '../lib/localClient';
 import { toast } from 'sonner';
 import { 
   collection, 
@@ -278,8 +279,36 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
     const startSync = async () => {
       try {
-        console.log("Initializing shared Firestore sync for user:", user.email);
+        console.log("Initializing local SQLite + shared Firestore sync for user:", user.email);
         setIsInitializing(true);
+
+        // 1. First, load local SQLite records immediately for instant offline reactivity
+        try {
+          const localEmps = await fetchLocalTable<Employee>('employees');
+          if (localEmps && localEmps.length > 0) {
+            setEmployeesState(prev => {
+              const eMap = new Map(prev.map(e => [e.id, e]));
+              localEmps.forEach(e => eMap.set(e.id, e));
+              return Array.from(eMap.values());
+            });
+          }
+
+          const localPunches = await fetchLocalTable<RawPunch>('punches');
+          if (localPunches && localPunches.length > 0) {
+            setPunchesState(prev => {
+              const pMap = new Map(prev.map(p => [p.id, p]));
+              localPunches.forEach(p => pMap.set(p.id, p));
+              return Array.from(pMap.values());
+            });
+          }
+
+          const localSettings = await fetchLocalTable<Settings>('settings');
+          if (localSettings && localSettings.length > 0) {
+            setSettingsState(localSettings[0]);
+          }
+        } catch (localErr) {
+          console.warn('Initial local SQLite load note:', localErr);
+        }
         
         if (!active) return;
 
@@ -473,7 +502,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [user?.uid]); // Only re-run if user ID changes, not on every error/quota state change
 
   const updateEmployee = useCallback(async (id: string, data: Partial<Employee>) => {
-    setEmployeesState(prev => prev.map(e => e.id === id ? { ...e, ...data } : e));
+    setEmployeesState(prev => {
+      const updatedList = prev.map(e => e.id === id ? { ...e, ...data } : e);
+      const updatedDoc = updatedList.find(e => e.id === id);
+      if (updatedDoc) saveLocalTable('employees', updatedDoc);
+      return updatedList;
+    });
     if (checkQuota()) {
       try {
         const existing = employees.find(e => e.id === id);
@@ -488,6 +522,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const addEmployee = useCallback(async (data: Employee) => {
     setEmployeesState(prev => [...prev.filter(e => e.id !== data.id), data]);
+    saveLocalTable('employees', data);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'employees', data.id), data);
@@ -499,6 +534,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteEmployeesBatch = useCallback(async (ids: string[]) => {
     setEmployeesState(prev => prev.filter(emp => !ids.includes(emp.id)));
+    deleteLocalTableRecords('employees', ids);
     try {
       const batchSize = 300;
       const chunks = [];
@@ -525,6 +561,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const id = `${data.employeeId}_${data.punchDatetime.replace(/[:.-]/g, '')}`;
     const newPunch = { ...data, id };
     setPunchesState(prev => [newPunch, ...prev.filter(p => p.id !== id)]);
+    saveLocalTable('punches', newPunch);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'punches', id), newPunch);
@@ -535,7 +572,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const updatePunch = useCallback(async (id: string, data: Partial<RawPunch>) => {
-    setPunchesState(prev => prev.map(p => p.id === id ? { ...p, ...data } : p));
+    setPunchesState(prev => {
+      const updatedList = prev.map(p => p.id === id ? { ...p, ...data } : p);
+      const updatedDoc = updatedList.find(p => p.id === id);
+      if (updatedDoc) saveLocalTable('punches', updatedDoc);
+      return updatedList;
+    });
     if (checkQuota()) {
       try {
         const existing = punches.find(p => p.id === id);
@@ -551,6 +593,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deletePunch = useCallback(async (id: string) => {
     setPunchesState(prev => prev.filter(p => p.id !== id));
+    deleteLocalTableRecords('punches', [id]);
     if (checkQuota()) {
       try {
         await deleteDoc(doc(db, 'punches', id));
@@ -701,6 +744,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return Array.from(eMap.values());
     });
 
+    // Save to local SQLite database asynchronously
+    saveLocalTable('employees', data).catch(err => console.warn('SQLite employee save note:', err));
+
     try {
       const existingMap = new Map(employees.map(e => [e.id, e]));
       const recordsToWrite = data.filter(newE => {
@@ -741,6 +787,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       data.forEach(p => pMap.set(p.id, p));
       return Array.from(pMap.values());
     });
+
+    // Immediate non-blocking local SQLite persistence
+    saveLocalTable('punches', data).catch(err => console.warn('SQLite punches save note:', err));
 
     if (onProgress) onProgress('Records loaded into local active workspace.');
 

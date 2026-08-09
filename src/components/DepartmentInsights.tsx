@@ -22,7 +22,7 @@ import autoTable from 'jspdf-autotable';
 import NepaliDate from 'nepali-date-converter';
 
 export function DepartmentInsights() {
-  const { employees, processedData, settings, openEmployeeProfile } = useAppStore();
+  const { employees, processedData, settings, shiftAssignments, openEmployeeProfile } = useAppStore();
   const navigate = useNavigate();
 
   const [dateRange, setDateRange] = useState({
@@ -45,6 +45,17 @@ export function DepartmentInsights() {
   const shifts = useMemo(() => ['All', ...(settings.shifts?.map(s => s.name) || [])], [settings.shifts]);
   const statuses = ['All', 'Present', 'Absent', 'Late', 'PWO', 'SPF', 'Early', 'On Time'];
 
+  const getRecordShift = (d: any, emp: any) => {
+    const assignment = shiftAssignments.find(a => a.employeeId === d.employeeId && a.date === d.date);
+    const shiftId = assignment?.shiftId || d.shiftId || emp?.shiftId;
+    const shiftObj = settings.shifts?.find(s => s.id === shiftId);
+    return {
+      id: shiftId,
+      name: shiftObj?.name || 'Day Shift',
+      shiftObj
+    };
+  };
+
   const filteredData = useMemo(() => {
     let data = processedData.filter(d => {
       const date = parseISO(d.date);
@@ -61,12 +72,13 @@ export function DepartmentInsights() {
 
       const matchesDept = selectedDept === 'All' || emp.department === selectedDept;
       const matchesContractor = selectedContractor === 'All' || emp.contractorName === selectedContractor;
-      const matchesShift = selectedShift === 'All' || settings.shifts?.find(s => s.id === d.shiftId)?.name === selectedShift;
+      const recordShift = getRecordShift(d, emp);
+      const matchesShift = selectedShift === 'All' || recordShift.name === selectedShift;
       const matchesStatus = selectedStatus === 'All' || d.status === selectedStatus;
 
       return matchesDept && matchesContractor && matchesShift && matchesStatus;
     });
-  }, [processedData, employees, dateRange, selectedDept, selectedContractor, selectedShift, selectedStatus, settings.shifts]);
+  }, [processedData, employees, dateRange, selectedDept, selectedContractor, selectedShift, selectedStatus, settings.shifts, shiftAssignments]);
 
   const distributionData = useMemo(() => {
     let data = processedData.filter(d => {
@@ -84,11 +96,12 @@ export function DepartmentInsights() {
 
       const matchesDept = selectedDept === 'All' || emp.department === selectedDept;
       const matchesContractor = selectedContractor === 'All' || emp.contractorName === selectedContractor;
-      const matchesShift = selectedShift === 'All' || settings.shifts?.find(s => s.id === d.shiftId)?.name === selectedShift;
+      const recordShift = getRecordShift(d, emp);
+      const matchesShift = selectedShift === 'All' || recordShift.name === selectedShift;
       // Note: We ignore matchesStatus here for the distribution stats to keep them relative
       return matchesDept && matchesContractor && matchesShift;
     });
-  }, [processedData, employees, dateRange, selectedDept, selectedContractor, selectedShift, settings.shifts]);
+  }, [processedData, employees, dateRange, selectedDept, selectedContractor, selectedShift, settings.shifts, shiftAssignments]);
 
   const activeCounts = useMemo(() => {
     const counts = new Map();
@@ -102,7 +115,12 @@ export function DepartmentInsights() {
     return counts;
   }, [employees, settings.shifts]);
 
-  const shiftColumns = useMemo(() => ['Day', 'Night', 'A Shift', 'B Shift', 'C Shift'], []);
+  const shiftColumns = useMemo(() => {
+    if (settings.shifts && settings.shifts.length > 0) {
+      return settings.shifts.map(s => s.name);
+    }
+    return ['Day Shift', 'Night Shift', 'General Shift', 'A Shift', 'B Shift', 'C Shift'];
+  }, [settings.shifts]);
 
   const deptStats = useMemo(() => {
     const statsMap = new Map();
@@ -145,19 +163,28 @@ export function DepartmentInsights() {
       const isWO = d.status === 'Weekly Off';
       const isPWO = d.status === 'PWO';
 
-      const shift = settings.shifts?.find(s => s.id === d.shiftId);
-      const shiftName = shift?.name || 'Day Shift';
+      const recordShift = getRecordShift(d, emp);
+      const shiftName = recordShift.name;
 
       if (isPresent) {
         stat.present += 1;
         stat.total += 1;
         if (isPWO) stat.pwo += 1;
-        // Count in shift columns if it matches one of our defined columns
-        if (shiftName.toLowerCase().includes('day') || shiftName.toLowerCase().includes('general')) stat.shiftCounts['Day'] += 1;
-        else if (shiftName.toLowerCase().includes('night')) stat.shiftCounts['Night'] += 1;
-        else if (shiftName.toLowerCase().includes('a shift') || shiftName.toUpperCase() === 'A') stat.shiftCounts['A Shift'] += 1;
-        else if (shiftName.toLowerCase().includes('b shift') || shiftName.toUpperCase() === 'B') stat.shiftCounts['B Shift'] += 1;
-        else if (shiftName.toLowerCase().includes('c shift') || shiftName.toUpperCase() === 'C') stat.shiftCounts['C Shift'] += 1;
+        
+        // Count in shift columns interconnected with attendance log
+        if (stat.shiftCounts[shiftName] !== undefined) {
+          stat.shiftCounts[shiftName] += 1;
+        } else {
+          const matchedCol = shiftColumns.find(col => 
+            shiftName.toLowerCase().includes(col.toLowerCase()) || 
+            col.toLowerCase().includes(shiftName.toLowerCase())
+          );
+          if (matchedCol && stat.shiftCounts[matchedCol] !== undefined) {
+            stat.shiftCounts[matchedCol] += 1;
+          } else if (shiftColumns.length > 0 && stat.shiftCounts[shiftColumns[0]] !== undefined) {
+            stat.shiftCounts[shiftColumns[0]] += 1;
+          }
+        }
       } else if (isAbsent) {
         stat.absent += 1;
         stat.total += 1;
@@ -174,7 +201,7 @@ export function DepartmentInsights() {
     });
 
     return Array.from(statsMap.values()).sort((a, b) => b.active - a.active);
-  }, [distributionData, employees, departments, selectedDept, shiftColumns, settings.shifts]);
+  }, [distributionData, employees, departments, selectedDept, shiftColumns, settings.shifts, shiftAssignments]);
 
   const COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
 
@@ -196,25 +223,43 @@ export function DepartmentInsights() {
   const handleShowPopup = (deptName: string, status: 'Present' | 'Absent' | 'Total' | 'WO' | string) => {
     const isShift = shiftColumns.includes(status);
     
-    const deptEmployees = employees.filter(e => 
-      e.department === deptName && 
-      e.status === 'Active' &&
-      (!isShift || (settings.shifts?.find(s => s.id === e.shiftId)?.name || 'Day Shift').includes(status.split(' ')[0]))
-    );
-    
+    const deptEmployees = employees.filter(e => e.department === deptName && e.status === 'Active');
     const deptPData = distributionData.filter(d => {
       const emp = employees.find(e => e.id === d.employeeId);
-      const s = settings.shifts?.find(sh => sh.id === d.shiftId)?.name || 'Day Shift';
-      const matchesShift = !isShift || s.includes(status.split(' ')[0]);
-      return emp?.department === deptName && matchesShift;
+      return emp?.department === deptName;
     });
 
     let filtered: typeof employees = [];
     if (status === 'Total') {
       filtered = deptEmployees;
     } else if (isShift) {
-      const presentIds = new Set(deptPData.filter(d => ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status)).map(d => d.employeeId));
+      const presentIds = new Set<string>();
+      deptPData.forEach(d => {
+        const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status);
+        if (!isPresent) return;
+
+        const emp = employees.find(e => e.id === d.employeeId);
+        const recordShift = getRecordShift(d, emp);
+        const sName = recordShift.name;
+
+        const matches = sName === status || 
+          sName.toLowerCase().includes(status.toLowerCase()) || 
+          status.toLowerCase().includes(sName.toLowerCase());
+
+        if (matches) {
+          presentIds.add(d.employeeId);
+        }
+      });
+
       filtered = deptEmployees.filter(e => presentIds.has(e.id));
+
+      if (filtered.length === 0) {
+        filtered = deptEmployees.filter(e => {
+          const sObj = settings.shifts?.find(s => s.id === e.shiftId);
+          const sName = sObj?.name || 'Day Shift';
+          return sName === status || sName.toLowerCase().includes(status.toLowerCase()) || status.toLowerCase().includes(sName.toLowerCase());
+        });
+      }
     } else {
       const statusLower = status.toLowerCase();
       if (statusLower === 'present') {
@@ -531,31 +576,36 @@ export function DepartmentInsights() {
       </div>
 
       {/* Visual Analytics Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* Department Presence Chart */}
-        <div className="bg-white rounded-[2rem] border border-slate-100 shadow-xl shadow-slate-200/30 p-8">
-          <h3 className="text-lg font-black text-slate-900 mb-8 flex items-center gap-2">
-            <BarChartIcon size={20} className="text-indigo-500" />
-            Manpower per Department
-          </h3>
-          <div className="h-[400px]">
+      <div className="space-y-8">
+        {/* Department Presence Chart - Small Compact Layout */}
+        <div className="bg-white rounded-3xl border border-slate-100 shadow-xl shadow-slate-200/30 p-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-black text-slate-900 flex items-center gap-2">
+              <BarChartIcon size={16} className="text-indigo-500" />
+              Manpower per Department (Compact View)
+            </h3>
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+              {deptStats.length} Departments
+            </span>
+          </div>
+          <div className="h-[180px] w-full">
              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={deptStats} layout="vertical">
+                <BarChart data={deptStats} layout="vertical" margin={{ top: 0, right: 10, left: 10, bottom: 0 }}>
                    <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f1f5f9" />
                    <XAxis type="number" hide />
                    <YAxis 
                     dataKey="name" 
                     type="category" 
-                    width={100} 
+                    width={90} 
                     axisLine={false} 
                     tickLine={false} 
-                    tick={{ fill: '#94a3b8', fontSize: 10, fontWeight: 'bold' }} 
+                    tick={{ fill: '#64748b', fontSize: 9, fontWeight: 'bold' }} 
                    />
                    <Tooltip 
                     cursor={{ fill: 'rgba(99, 102, 241, 0.05)' }}
-                    contentStyle={{ borderRadius: '16px', border: 'none', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.15)' }}
+                    contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 10px 25px -5px rgba(0,0,0,0.1)', fontSize: '11px' }}
                    />
-                   <Bar dataKey="total" radius={[0, 8, 8, 0]} barSize={20}>
+                   <Bar dataKey="total" radius={[0, 6, 6, 0]} barSize={12}>
                       {deptStats.map((entry, index) => (
                         <Cell 
                           key={`cell-${index}`} 
@@ -570,44 +620,56 @@ export function DepartmentInsights() {
           </div>
         </div>
 
-        {/* Detailed Stats Table */}
-        <div className="bg-white rounded-[2rem] border border-slate-100 shadow-xl shadow-slate-200/30 overflow-hidden flex flex-col">
-           <div className="p-8 border-b border-slate-50 flex items-center justify-between">
-              <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
-                <Users size={20} className="text-emerald-500" />
-                Manpower Distribution
-              </h3>
+        {/* Detailed Stats Table - Full Width Manpower Distribution Log Layout (Visible All) */}
+        <div className="bg-white rounded-3xl border border-slate-100 shadow-xl shadow-slate-200/30 overflow-hidden flex flex-col w-full">
+           <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+              <div>
+                <h3 className="text-base font-black text-slate-900 flex items-center gap-2">
+                  <Users size={18} className="text-emerald-500" />
+                  Manpower Distribution Log
+                </h3>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-0.5">
+                  Complete breakdown across all active departments and shifts
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="px-3 py-1 bg-indigo-50 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300 rounded-full text-xs font-black">
+                  {deptStats.length} Depts Logged
+                </span>
+              </div>
            </div>
-           <div className="flex-1 overflow-y-auto custom-scrollbar">
-               <table className="w-full text-left">
-                  <thead className="bg-slate-50/50 sticky top-0 z-10">
+           
+           {/* Table wrapper with overflow-x-auto for horizontal scroll if needed, but no height clipping so ALL rows are visible */}
+           <div className="w-full overflow-x-auto custom-scrollbar">
+               <table className="w-full text-left min-w-[900px]">
+                  <thead className="bg-slate-100/70 border-b border-slate-200/60">
                     <tr>
-                       <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Department</th>
-                       <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">Active</th>
-                       <th className="px-4 py-4 text-[10px] font-black text-emerald-500 uppercase tracking-widest text-center">Present</th>
-                       <th className="px-4 py-4 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-center">Late</th>
-                       <th className="px-4 py-4 text-[10px] font-black text-rose-500 uppercase tracking-widest text-center">Absent</th>
-                       <th className="px-4 py-4 text-[10px] font-black text-amber-500 uppercase tracking-widest text-center">WO</th>
-                       <th className="px-4 py-4 text-[10px] font-black text-indigo-600 uppercase tracking-widest text-center">PWO</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-slate-600 uppercase tracking-widest">Department</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-slate-600 uppercase tracking-widest text-center">Active</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-emerald-600 uppercase tracking-widest text-center">Present</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-indigo-600 uppercase tracking-widest text-center">Late</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-rose-600 uppercase tracking-widest text-center">Absent</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-amber-600 uppercase tracking-widest text-center">WO</th>
+                       <th className="px-4 py-3.5 text-[10px] font-black text-indigo-600 uppercase tracking-widest text-center">PWO</th>
                        {shiftColumns.map(s => (
-                         <th key={s} className="px-4 py-4 text-[10px] font-black text-indigo-500 uppercase tracking-widest text-center">{s}</th>
+                         <th key={s} className="px-4 py-3.5 text-[10px] font-black text-indigo-600 uppercase tracking-widest text-center">{s}</th>
                        ))}
-                       <th className="px-4 py-4"></th>
+                       <th className="px-4 py-3.5 text-right text-[10px] font-black text-slate-600 uppercase tracking-widest">Action</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-50">
+                  <tbody className="divide-y divide-slate-100">
                     {deptStats.map(dept => (
                       <tr 
                         key={dept.name} 
                         onClick={() => handleDrillDown(dept.name)}
-                        className="hover:bg-slate-50/50 transition-colors group cursor-pointer"
+                        className="hover:bg-indigo-50/30 transition-colors group cursor-pointer"
                       >
-                        <td className="px-4 py-5">
-                          <p className="text-sm font-black text-slate-900 group-hover:text-indigo-600 transition-colors uppercase leading-none">{dept.name}</p>
-                          <p className="text-[10px] font-bold text-slate-400 mt-1 uppercase tracking-widest">{Math.round((dept.present / (dept.total || 1)) * 100) || 0}% Engagement</p>
+                        <td className="px-4 py-4">
+                          <p className="text-xs font-black text-slate-900 group-hover:text-indigo-600 transition-colors uppercase leading-tight">{dept.name}</p>
+                          <p className="text-[10px] font-bold text-slate-400 mt-0.5 uppercase tracking-wider">{Math.round((dept.present / (dept.total || 1)) * 100) || 0}% Engagement</p>
                         </td>
                         <td 
-                          className="px-4 py-5 text-center font-black text-slate-900 hover:text-indigo-600 transition-colors cursor-pointer"
+                          className="px-4 py-4 text-center font-black text-slate-900 hover:text-indigo-600 transition-colors cursor-pointer"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleShowPopup(dept.name, 'Total');
@@ -616,64 +678,64 @@ export function DepartmentInsights() {
                           {dept.active}
                         </td>
                         <td 
-                          className="px-4 py-5 text-center cursor-pointer group"
+                          className="px-4 py-4 text-center cursor-pointer group"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleShowPopup(dept.name, 'Present');
                           }}
                         >
-                          <span className="px-3 py-1 bg-emerald-50 text-emerald-600 rounded-full text-xs font-black group-hover:bg-emerald-100 transition-all">
+                          <span className="px-2.5 py-1 bg-emerald-50 text-emerald-600 rounded-full text-xs font-black group-hover:bg-emerald-100 transition-all">
                             {dept.present}
                           </span>
                         </td>
                         <td 
-                          className="px-4 py-5 text-center cursor-pointer group"
+                          className="px-4 py-4 text-center cursor-pointer group"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleShowPopup(dept.name, 'Late');
                           }}
                         >
-                          <span className="px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-black group-hover:bg-indigo-100 transition-all">
+                          <span className="px-2.5 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-black group-hover:bg-indigo-100 transition-all">
                             {dept.late}
                           </span>
                         </td>
                         <td 
-                          className="px-4 py-5 text-center cursor-pointer group"
+                          className="px-4 py-4 text-center cursor-pointer group"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleShowPopup(dept.name, 'Absent');
                           }}
                         >
-                          <span className="px-3 py-1 bg-rose-50 text-rose-600 rounded-full text-xs font-black group-hover:bg-rose-100 transition-all">
+                          <span className="px-2.5 py-1 bg-rose-50 text-rose-600 rounded-full text-xs font-black group-hover:bg-rose-100 transition-all">
                             {dept.absent}
                           </span>
                         </td>
                         <td 
-                          className="px-4 py-5 text-center cursor-pointer group"
+                          className="px-4 py-4 text-center cursor-pointer group"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleShowPopup(dept.name, 'WO');
                           }}
                         >
-                          <span className="px-3 py-1 bg-amber-50 text-amber-600 rounded-full text-xs font-black group-hover:bg-amber-100 transition-all">
+                          <span className="px-2.5 py-1 bg-amber-50 text-amber-600 rounded-full text-xs font-black group-hover:bg-amber-100 transition-all">
                             {dept.wo}
                           </span>
                         </td>
                         <td 
-                          className="px-4 py-5 text-center cursor-pointer group"
+                          className="px-4 py-4 text-center cursor-pointer group"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleShowPopup(dept.name, 'PWO');
                           }}
                         >
-                          <span className="px-3 py-1 bg-indigo-600 text-white rounded-full text-xs font-black group-hover:bg-indigo-700 transition-all">
+                          <span className="px-2.5 py-1 bg-indigo-600 text-white rounded-full text-xs font-black group-hover:bg-indigo-700 transition-all">
                             {dept.pwo}
                           </span>
                         </td>
                         {shiftColumns.map(s => (
                           <td 
                             key={s}
-                            className="px-4 py-5 text-center font-bold text-slate-600 cursor-pointer hover:text-indigo-600"
+                            className="px-4 py-4 text-center font-bold text-slate-600 cursor-pointer hover:text-indigo-600 text-xs"
                             onClick={(e) => {
                               e.stopPropagation();
                               handleShowPopup(dept.name, s);
@@ -682,27 +744,27 @@ export function DepartmentInsights() {
                             {dept.shiftCounts[s] || 0}
                           </td>
                         ))}
-                        <td className="px-4 py-5 text-right">
+                        <td className="px-4 py-4 text-right">
                           <div
-                            className="p-2 text-slate-300 group-hover:text-indigo-600 group-hover:bg-indigo-50 rounded-xl transition-all inline-block"
+                            className="p-1.5 text-slate-400 group-hover:text-indigo-600 group-hover:bg-indigo-50 rounded-lg transition-all inline-block"
                           >
-                             <ChevronRight size={18} strokeWidth={3} />
+                             <ChevronRight size={16} strokeWidth={2.5} />
                           </div>
                         </td>
                       </tr>
                     ))}
                   </tbody>
-                  <tfoot className="bg-slate-50 font-black">
+                  <tfoot className="bg-slate-100/80 font-black border-t-2 border-slate-200">
                     <tr>
-                      <td className="px-4 py-4 text-sm text-slate-900 uppercase">Subtotal</td>
-                      <td className="px-4 py-4 text-center text-slate-900">{deptStats.reduce((acc, d) => acc + d.active, 0)}</td>
-                      <td className="px-4 py-4 text-center text-emerald-600">{deptStats.reduce((acc, d) => acc + d.present, 0)}</td>
-                      <td className="px-4 py-4 text-center text-indigo-600">{deptStats.reduce((acc, d) => acc + d.late, 0)}</td>
-                      <td className="px-4 py-4 text-center text-rose-600">{deptStats.reduce((acc, d) => acc + d.absent, 0)}</td>
-                      <td className="px-4 py-4 text-center text-amber-600">{deptStats.reduce((acc, d) => acc + d.wo, 0)}</td>
-                      <td className="px-4 py-4 text-center text-indigo-600">{deptStats.reduce((acc, d) => acc + d.pwo, 0)}</td>
+                      <td className="px-4 py-3.5 text-xs text-slate-900 uppercase">Total Subtotal</td>
+                      <td className="px-4 py-3.5 text-center text-slate-900 text-xs">{deptStats.reduce((acc, d) => acc + d.active, 0)}</td>
+                      <td className="px-4 py-3.5 text-center text-emerald-600 text-xs">{deptStats.reduce((acc, d) => acc + d.present, 0)}</td>
+                      <td className="px-4 py-3.5 text-center text-indigo-600 text-xs">{deptStats.reduce((acc, d) => acc + d.late, 0)}</td>
+                      <td className="px-4 py-3.5 text-center text-rose-600 text-xs">{deptStats.reduce((acc, d) => acc + d.absent, 0)}</td>
+                      <td className="px-4 py-3.5 text-center text-amber-600 text-xs">{deptStats.reduce((acc, d) => acc + d.wo, 0)}</td>
+                      <td className="px-4 py-3.5 text-center text-indigo-600 text-xs">{deptStats.reduce((acc, d) => acc + d.pwo, 0)}</td>
                       {shiftColumns.map(s => (
-                        <td key={s} className="px-4 py-4 text-center text-indigo-600">
+                        <td key={s} className="px-4 py-3.5 text-center text-indigo-600 text-xs">
                           {deptStats.reduce((acc, d) => acc + (d.shiftCounts[s] || 0), 0)}
                         </td>
                       ))}

@@ -24,7 +24,7 @@ import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 
 export function FreshAttendanceAudit() {
-  const { employees, processedData, settings, addForceAttendance, addAuditLog } = useAppStore();
+  const { employees, processedData, settings, shiftAssignments, addForceAttendance, addAuditLog } = useAppStore();
 
   // Selected Month/Year for matrix parsing context
   const [calendarType, setCalendarType] = useState<'BS' | 'AD'>('BS');
@@ -86,15 +86,66 @@ export function FreshAttendanceAudit() {
     return map;
   }, [processedData]);
 
-  // Fast map for Employees
+  // Fast map for Employees with flexible numeric ID matching
   const employeeMap = useMemo(() => {
     const map = new Map<string, typeof employees[0]>();
     employees.forEach(e => {
       map.set(e.id, e);
       map.set(e.id.toLowerCase(), e);
+      const numOnly = e.id.replace(/\D/g, '');
+      if (numOnly) {
+        map.set(numOnly, e);
+      }
     });
     return map;
   }, [employees]);
+
+  // Helper function to format arbitrary date string/number to YYYY-MM-DD
+  const parseHeaderDateToISO = (dhStr: string, year: number, month: number, bsDays: ReturnType<typeof getNepaliMonthDays>): string => {
+    const trimmed = dhStr.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+    
+    // Check M/D/YYYY or M/D/YY or D/M/YYYY (e.g., 7/17/2026, 07/17/2026)
+    if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(trimmed)) {
+      const parts = trimmed.split('/');
+      let m = parseInt(parts[0], 10);
+      let d = parseInt(parts[1], 10);
+      let y = parseInt(parts[2], 10);
+      if (y < 100) y += 2000;
+      
+      // If month > 12, assume D/M/YYYY
+      if (m > 12 && d <= 12) {
+        const temp = m;
+        m = d;
+        d = temp;
+      }
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      }
+    }
+
+    // Check Day number (e.g. 1, 2, 17... 31)
+    const num = parseInt(trimmed, 10);
+    if (!isNaN(num) && num >= 1 && num <= 31 && String(num) === trimmed) {
+      if (calendarType === 'BS' && bsDays.length >= num) {
+        return bsDays[num - 1]?.adDateStr || '';
+      }
+      return `${year}-${String(month).padStart(2, '0')}-${String(num).padStart(2, '0')}`;
+    }
+
+    // Fallback parsing via JS Date
+    const parsedDate = new Date(trimmed);
+    if (!isNaN(parsedDate.getTime())) {
+      const y = parsedDate.getFullYear();
+      const m = String(parsedDate.getMonth() + 1).padStart(2, '0');
+      const d = String(parsedDate.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+
+    return '';
+  };
 
   // Handle File Upload (Excel / CSV) - Supports both Matrix Format and Flat List Format
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -119,11 +170,19 @@ export function FreshAttendanceAudit() {
 
         const headers = Object.keys(rawJson[0] || {});
 
-        // Check if headers contain day numbers (1..31) indicating Matrix Format
+        let bsDays: ReturnType<typeof getNepaliMonthDays> = [];
+        if (calendarType === 'BS') {
+          bsDays = getNepaliMonthDays(selectedBsYear, selectedBsMonth);
+        }
+        const [yearStr, monthStr] = selectedMonth.split('-');
+        const year = parseInt(yearStr, 10) || new Date().getFullYear();
+        const month = parseInt(monthStr, 10) || (new Date().getMonth() + 1);
+
+        // Check if headers contain date strings (7/17/2026) or day numbers (1..31) indicating Matrix Format
         const dateHeaders = headers.filter(h => {
           const trimmed = String(h).trim();
-          const num = parseInt(trimmed, 10);
-          return (!isNaN(num) && num >= 1 && num <= 31) || /^\d{4}-\d{2}-\d{2}$/.test(trimmed) || /^\d{2}\/\d{2}\/\d{4}$/.test(trimmed);
+          const parsedIso = parseHeaderDateToISO(trimmed, year, month, bsDays);
+          return parsedIso !== '';
         });
 
         const parsed: FieldAttendanceRecord[] = [];
@@ -131,24 +190,17 @@ export function FreshAttendanceAudit() {
         if (dateHeaders.length >= 3) {
           // --- MATRIX FORMAT PARSING ---
           setImportType('matrix');
-          let bsDays: ReturnType<typeof getNepaliMonthDays> = [];
-          if (calendarType === 'BS') {
-            bsDays = getNepaliMonthDays(selectedBsYear, selectedBsMonth);
-          }
-          const [yearStr, monthStr] = selectedMonth.split('-');
-          const year = parseInt(yearStr, 10) || new Date().getFullYear();
-          const month = parseInt(monthStr, 10) || (new Date().getMonth() + 1);
 
           rawJson.forEach((row, idx) => {
             const keys = Object.keys(row);
             const empIdKey = keys.find(k => {
-              const l = k.toLowerCase();
-              return l.includes('id') || l.includes('emp') || l.includes('code');
+              const l = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+              return l === 'empid' || l === 'id' || l === 'empcode' || l.includes('empid') || l.includes('staffid');
             });
             const empNameKey = keys.find(k => k.toLowerCase().includes('name'));
             const deptKey = keys.find(k => k.toLowerCase().includes('dept') || k.toLowerCase().includes('department'));
 
-            const rawId = row[empIdKey || ''] ? String(row[empIdKey || '']).trim() : `EMP_${idx + 1}`;
+            const rawId = row[empIdKey || ''] !== undefined && row[empIdKey || ''] !== '' ? String(row[empIdKey || '']).trim() : `EMP_${idx + 1}`;
             const empName = row[empNameKey || ''] ? String(row[empNameKey || '']).trim() : 'Unknown';
             const department = row[deptKey || ''] ? String(row[deptKey || '']).trim() : 'General';
 
@@ -156,21 +208,7 @@ export function FreshAttendanceAudit() {
               const cellVal = String(row[dh] || '').trim();
               if (!cellVal) return;
 
-              let formattedDate = '';
-              const trimmedDh = String(dh).trim();
-
-              if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedDh)) {
-                formattedDate = trimmedDh;
-              } else if (!isNaN(parseInt(trimmedDh, 10))) {
-                const dayNum = parseInt(trimmedDh, 10);
-                if (calendarType === 'BS' && bsDays.length >= dayNum) {
-                  formattedDate = bsDays[dayNum - 1]?.adDateStr || '';
-                } else {
-                  formattedDate = `${year}-${String(month).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
-                }
-              } else {
-                formattedDate = trimmedDh;
-              }
+              const formattedDate = parseHeaderDateToISO(dh, year, month, bsDays);
 
               if (formattedDate) {
                 parsed.push({
@@ -202,15 +240,17 @@ export function FreshAttendanceAudit() {
 
             const empId = row[empIdKey || ''] ? String(row[empIdKey || '']).trim() : `EMP_${idx + 1}`;
             const empName = row[empNameKey || ''] ? String(row[empNameKey || '']).trim() : 'Unknown';
-            const date = row[dateKey || ''] ? String(row[dateKey || '']).trim() : '';
+            const dateStr = row[dateKey || ''] ? String(row[dateKey || '']).trim() : '';
             const fieldStatus = row[statusKey || ''] ? String(row[statusKey || '']).trim() : 'P';
 
-            if (date) {
+            const parsedDate = dateStr ? parseHeaderDateToISO(dateStr, year, month, bsDays) : '';
+
+            if (parsedDate) {
               parsed.push({
-                id: `field_${empId}_${date}`,
+                id: `field_${empId}_${parsedDate}`,
                 employeeId: empId,
                 employeeName: empName,
-                date,
+                date: parsedDate,
                 fieldStatus,
                 inTime: row[inKey || ''] ? String(row[inKey || '']) : undefined,
                 outTime: row[outKey || ''] ? String(row[outKey || '']) : undefined,
@@ -234,14 +274,18 @@ export function FreshAttendanceAudit() {
 
   // Generate and Download Sample Matrix Excel File for Import
   const handleDownloadSampleMatrix = () => {
-    let sampleDays: { dayNum: number; dateStr: string }[] = [];
+    let sampleDays: { headerLabel: string; dateStr: string }[] = [];
 
     if (calendarType === 'BS') {
       const days = getNepaliMonthDays(selectedBsYear, selectedBsMonth);
-      sampleDays = days.map(d => ({
-        dayNum: d.dayNumber,
-        dateStr: d.adDateStr
-      }));
+      sampleDays = days.map(d => {
+        const dateObj = new Date(d.adDateStr);
+        const formattedDate = `${dateObj.getMonth() + 1}/${dateObj.getDate()}/${dateObj.getFullYear()}`;
+        return {
+          headerLabel: formattedDate,
+          dateStr: d.adDateStr
+        };
+      });
     } else {
       const [yStr, mStr] = selectedMonth.split('-');
       const year = parseInt(yStr, 10) || new Date().getFullYear();
@@ -249,36 +293,46 @@ export function FreshAttendanceAudit() {
       const daysInMonth = new Date(year, month, 0).getDate();
       for (let d = 1; d <= daysInMonth; d++) {
         const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-        sampleDays.push({ dayNum: d, dateStr });
+        const headerLabel = `${month}/${d}/${year}`;
+        sampleDays.push({ headerLabel, dateStr });
       }
     }
 
-    const headers = ['Emp ID', 'Employee Name', 'Department', ...sampleDays.map(d => `${d.dayNum}`)];
-
-    const sampleEmps = employees.length > 0 ? employees.slice(0, 15) : [
-      { id: 'EMP001', name: 'Ram Bahadur', department: 'Operations' },
-      { id: 'EMP002', name: 'Sita Sharma', department: 'HR & Admin' },
-      { id: 'EMP003', name: 'Hari Prasad', department: 'IT Support' },
-      { id: 'EMP004', name: 'Gita Adhikari', department: 'Finance' },
-      { id: 'EMP005', name: 'Shyam Thapa', department: 'Production' },
+    const templateSampleEmps = [
+      { id: '2058', name: 'Ram Dhanik Kapar', department: 'Operations' },
+      { id: '3', name: 'Chandreshwor Kapar', department: 'Production' },
+      { id: '4', name: 'Garosh Yadav', department: 'Maintenance' },
+      { id: '14', name: 'Gyan Kapar', department: 'Security' },
+      { id: '1518', name: 'Kumar Pokherel', department: 'HR & Admin' },
+      { id: '8019', name: 'Bikram Bahadur Mahat Kshetri', department: 'IT Support' },
+      { id: '25', name: 'Shyam Kapari Kewat', department: 'Logistics' },
+      { id: '20', name: 'Ram Sagar Kapari', department: 'Quality' },
+      { id: '6', name: 'Ram Gulam Kapar', department: 'Production' },
+      { id: '1548', name: 'Sanjay Malik', department: 'Finance' },
+      { id: '2045', name: 'Ajay Kumar Sah', department: 'Store' },
+      { id: '33', name: 'Dhanbir Kamati', department: 'Operations' },
+      { id: '21', name: 'Ram Autar Yadav', department: 'Electrical' },
+      { id: '1519', name: 'Jitendra Singh Danuwar', department: 'Civil' },
+      { id: '1552', name: 'Bindeshwor Malik', department: 'Utility' },
     ];
 
-    const statusOptions = ['P', 'P', 'P', 'PWO', 'P', 'A', 'WO', 'P', 'L'];
+    const sampleEmps = employees.length > 0 ? employees.slice(0, 15) : templateSampleEmps;
+
+    const statusPattern = ['P', 'WO', 'P', 'PWO', 'P', 'A', 'WO', 'P', 'WO', 'P', 'P', 'PWO', 'P', 'A', 'WO', 'WO', 'A', 'P', 'P', 'PWO', 'P', 'A', 'WO', 'WO', 'A', 'P', 'P', 'P', 'PWO', 'WO', 'PWO'];
 
     const rows = sampleEmps.map((emp, empIdx) => {
       const rowData: Record<string, any> = {
         'Emp ID': emp.id,
         'Employee Name': emp.name,
-        'Department': emp.department
       };
 
       sampleDays.forEach((dayInfo, dIdx) => {
         const dayOfWeek = new Date(dayInfo.dateStr).getDay();
-        let code = statusOptions[(empIdx + dIdx) % statusOptions.length];
+        let code = statusPattern[(empIdx * 3 + dIdx) % statusPattern.length];
         if (dayOfWeek === 6) { // Saturday
           code = (empIdx + dIdx) % 3 === 0 ? 'PWO' : 'WO';
         }
-        rowData[`${dayInfo.dayNum}`] = code;
+        rowData[dayInfo.headerLabel] = code;
       });
 
       return rowData;
@@ -290,12 +344,12 @@ export function FreshAttendanceAudit() {
 
     const worksheet = XLSX.utils.json_to_sheet(rows);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Sample_Matrix');
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Field_Muster');
 
-    const downloadFileName = `Sample_Muster_Matrix_${monthLabel}.xlsx`;
+    const downloadFileName = `Sample_Field_Muster_${monthLabel}.xlsx`;
     XLSX.writeFile(workbook, downloadFileName);
 
-    toast.success(`Downloaded Sample Muster Matrix Template: ${downloadFileName}`);
+    toast.success(`Downloaded Sample Field Muster Template: ${downloadFileName}`);
   };
 
   // Run Audit Engine & Compare Bio vs Field Attendance using precise rules
@@ -314,12 +368,21 @@ export function FreshAttendanceAudit() {
     allKeysSet.forEach(key => {
       const [empId, date] = key.split('_');
       const fieldRec = fieldRecords.find(f => f.employeeId === empId && f.date === date);
-      const bioRec = processedDataMap.get(key) || null;
       const emp = employeeMap.get(empId) || employeeMap.get(empId.toLowerCase());
+      const canonicalEmpId = emp ? emp.id : empId;
+      const bioRec = processedDataMap.get(key) || processedDataMap.get(`${canonicalEmpId}_${date}`) || null;
 
       const bsDate = formatADToBS(date) || date;
       const isHoliday = settings.holidays?.some(h => h.date === date) || false;
-      const isWeeklyOff = bioRec?.status === 'Weekly Off' || (!bioRec && new Date(date).getDay() === 6);
+      const dayName = new Date(date).toLocaleDateString('en-US', { weekday: 'long' });
+      const assignment = shiftAssignments?.find(a => a.employeeId === canonicalEmpId && a.date === date);
+      const assignedShift = settings.shifts?.find(s => s.id === (assignment?.shiftId || emp?.shiftId));
+      const effectiveWeeklyOff = (assignedShift as any)?.weeklyOff || emp?.weeklyOff;
+      const isWeeklyOff = bioRec?.status === 'Weekly Off' || bioRec?.status === 'PWO' || (
+        effectiveWeeklyOff
+          ? effectiveWeeklyOff.toLowerCase() === dayName.toLowerCase()
+          : new Date(date).getDay() === 6
+      );
 
       const fCode = fieldRec ? fieldRec.fieldStatus.trim().toUpperCase() : 'NO MUSTER';
 
@@ -427,7 +490,7 @@ export function FreshAttendanceAudit() {
         designation: emp?.designation || '-',
         date,
         bsDate,
-        shiftName: 'General Shift',
+        shiftName: assignedShift?.name || 'General Shift',
         fieldStatus: prevDecision?.overrideStatus || fieldRec?.fieldStatus || 'N/A',
         fieldInTime: fieldRec?.inTime,
         fieldOutTime: fieldRec?.outTime,

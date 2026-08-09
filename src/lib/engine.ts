@@ -452,17 +452,14 @@ export function processPunches(
           }
         }
 
-        const isAbsentBefore = prevWorkingDayRec ? (!validWorkedStatuses.has(prevWorkingDayRec.status) && prevWorkingDayRec.workingHours < 4) : false;
-        const isAbsentAfter = nextWorkingDayRec ? (!validWorkedStatuses.has(nextWorkingDayRec.status) && nextWorkingDayRec.workingHours < 4) : false;
+        // Sandwich rule applies ONLY if both preceding and succeeding working day records exist and employee was absent on both
+        if (prevWorkingDayRec && nextWorkingDayRec) {
+          const isAbsentBefore = !validWorkedStatuses.has(prevWorkingDayRec.status) && prevWorkingDayRec.workingHours < 4;
+          const isAbsentAfter = !validWorkedStatuses.has(nextWorkingDayRec.status) && nextWorkingDayRec.workingHours < 4;
 
-        // Sandwich rule applies if absent on working day before AND working day after
-        const isSandwichedAbsent = isAbsentBefore && isAbsentAfter;
-
-        // Minimum 5 working days rule: worked < 5 days in the week
-        const failsMinWorkingDays = workedDaysInWeek < 5;
-
-        if (isSandwichedAbsent || failsMinWorkingDays) {
-          rec.status = 'Absent';
+          if (isAbsentBefore && isAbsentAfter) {
+            rec.status = 'Absent';
+          }
         }
       }
     });

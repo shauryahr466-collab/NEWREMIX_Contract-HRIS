@@ -3,28 +3,43 @@ import path from 'path';
 import initSqlJs, { Database } from 'sql.js';
 
 let dbInstance: Database | null = null;
-let currentRootFolder: string = process.env.LOCAL_HRIS_ROOT || 'E:\\SHRM_HRIS';
+let activeDbPath: string | null = null;
 
 // Ensure root folder works across operating systems safely
 export function getSanitizedRootFolder(): string {
-  // If running in Linux/Container and D:\ or E:\ isn't physically writeable, fallback to ./local_hris_data
-  try {
-    if (process.platform !== 'win32' && (currentRootFolder.startsWith('D:') || currentRootFolder.startsWith('E:'))) {
-      const fallback = path.resolve(process.cwd(), 'local_hris_data');
-      if (!fs.existsSync(fallback)) {
-        fs.mkdirSync(fallback, { recursive: true });
-      }
-      return fallback;
-    }
-  } catch (e) {
-    // ignore
+  if (process.env.LOCAL_STORAGE_PATH) {
+    return process.env.LOCAL_STORAGE_PATH.trim();
   }
-  return currentRootFolder;
+
+  if (process.platform === 'win32') {
+    return 'E:\\SHRM_HRIS';
+  }
+
+  // Fallback for Linux / Cloud Run container / AI Studio Preview
+  const fallback = path.resolve(process.cwd(), 'local_hris_data');
+  if (!fs.existsSync(fallback)) {
+    try {
+      fs.mkdirSync(fallback, { recursive: true });
+    } catch (e) {
+      // ignore
+    }
+  }
+  return fallback;
+}
+
+export function getSqliteDbPath(): string {
+  if (process.env.LOCAL_DB_PATH) {
+    return process.env.LOCAL_DB_PATH.trim();
+  }
+
+  const root = getSanitizedRootFolder();
+  return path.join(root, 'Database.db');
 }
 
 export function setRootFolder(newPath: string) {
   if (newPath && typeof newPath === 'string') {
-    currentRootFolder = newPath.trim();
+    process.env.LOCAL_STORAGE_PATH = newPath.trim();
+    process.env.LOCAL_DB_PATH = path.join(newPath.trim(), 'Database.db');
     initLocalDirectories();
   }
 }
@@ -33,17 +48,12 @@ export function initLocalDirectories() {
   const root = getSanitizedRootFolder();
   const dirs = [
     root,
-    path.join(root, 'database'),
-    path.join(root, 'data'),
-    path.join(root, 'data', 'employees'),
-    path.join(root, 'data', 'attendance'),
-    path.join(root, 'data', 'leave'),
-    path.join(root, 'data', 'overtime'),
-    path.join(root, 'data', 'payroll'),
-    path.join(root, 'data', 'documents'),
-    path.join(root, 'imports'),
-    path.join(root, 'exports'),
-    path.join(root, 'backups'),
+    path.join(root, 'Documents'),
+    path.join(root, 'Documents', 'Employees'),
+    path.join(root, 'Backups'),
+    path.join(root, 'Imports'),
+    path.join(root, 'Exports'),
+    path.join(root, 'Logs'),
   ];
 
   dirs.forEach(dir => {
@@ -52,7 +62,7 @@ export function initLocalDirectories() {
         fs.mkdirSync(dir, { recursive: true });
       }
     } catch (err) {
-      console.warn(`[LocalDirs] Note for dir ${dir}:`, err);
+      console.warn(`[LocalDirs] Directory notice for ${dir}:`, err);
     }
   });
 }
@@ -62,33 +72,97 @@ export async function getSqliteDb(): Promise<Database> {
 
   initLocalDirectories();
   const SQL = await initSqlJs();
-  const root = getSanitizedRootFolder();
-  const candidatePaths = [
-    path.join(root, 'Database.db'),
-    path.join(root, 'database', 'hris.db'),
-    path.join(root, 'database', 'Database.db'),
-  ];
+  const dbPath = getSqliteDbPath();
+  activeDbPath = dbPath;
+
+  const dbDir = path.dirname(dbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
 
   let fileBuffer: Buffer | null = null;
-  for (const candidatePath of candidatePaths) {
-    if (fs.existsSync(candidatePath)) {
+  const dbExists = fs.existsSync(dbPath);
+
+  if (dbExists) {
+    try {
+      fileBuffer = fs.readFileSync(dbPath);
+    } catch (e) {
+      console.warn(`[SQLite] Failed to read existing database at ${dbPath}:`, e);
+    }
+  }
+
+  let loadedSuccessfully = false;
+
+  if (fileBuffer && fileBuffer.length > 0) {
+    try {
+      const candidate = new SQL.Database(fileBuffer);
+      // Quick health check on the loaded database instance
+      candidate.exec('SELECT count(*) FROM sqlite_master;');
+      candidate.exec('PRAGMA quick_check;');
+      dbInstance = candidate;
+      loadedSuccessfully = true;
+      console.log(`[SQLite] Loaded existing production database from: ${dbPath}`);
+
+      // Automatic Safety Backup after successful load verification
       try {
-        fileBuffer = fs.readFileSync(candidatePath);
-        if (fileBuffer && fileBuffer.length > 0) break;
-      } catch (e) {
-        console.warn(`[SQLite] Failed to read ${candidatePath}:`, e);
+        const backupDir = path.join(getSanitizedRootFolder(), 'Backups');
+        if (!fs.existsSync(backupDir)) {
+          fs.mkdirSync(backupDir, { recursive: true });
+        }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const backupPath = path.join(backupDir, `Database_backup_${timestamp}.db`);
+        fs.copyFileSync(dbPath, backupPath);
+        console.log(`[SQLite] Created safety backup at: ${backupPath}`);
+      } catch (bErr) {
+        console.warn('[SQLite] Automatic safety backup notice:', bErr);
+      }
+    } catch (e) {
+      console.error(`[SQLite] Database file at ${dbPath} is corrupted/malformed:`, e);
+      // Preserve corrupted file for reference
+      try {
+        const corruptPath = `${dbPath}.corrupted_${Date.now()}`;
+        fs.copyFileSync(dbPath, corruptPath);
+        console.warn(`[SQLite] Preserved corrupted file at ${corruptPath}`);
+      } catch (cErr) {
+        // ignore
+      }
+
+      // Try restoring from recent backup if available
+      try {
+        const backupDir = path.join(getSanitizedRootFolder(), 'Backups');
+        if (fs.existsSync(backupDir)) {
+          const backupFiles = fs.readdirSync(backupDir)
+            .filter(f => f.endsWith('.db'))
+            .map(f => path.join(backupDir, f))
+            .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+
+          for (const bFile of backupFiles) {
+            try {
+              const bBuf = fs.readFileSync(bFile);
+              const bCand = new SQL.Database(bBuf);
+              bCand.exec('SELECT count(*) FROM sqlite_master;');
+              dbInstance = bCand;
+              loadedSuccessfully = true;
+              fs.copyFileSync(bFile, dbPath);
+              console.log(`[SQLite] Restored healthy database from backup: ${bFile}`);
+              break;
+            } catch (rErr) {
+              // continue trying older backups
+            }
+          }
+        }
+      } catch (bRestErr) {
+        console.warn('[SQLite] Backup restore check notice:', bRestErr);
       }
     }
   }
 
-  if (fileBuffer && fileBuffer.length > 0) {
-    dbInstance = new SQL.Database(fileBuffer);
-  } else {
+  if (!loadedSuccessfully || !dbInstance) {
     dbInstance = new SQL.Database();
+    console.log(`[SQLite] Initialized clean database instance at: ${dbPath}`);
   }
 
-  // Create tables
-  dbInstance.run(`
+  const schemaSql = `
     CREATE TABLE IF NOT EXISTS settings (
       id TEXT PRIMARY KEY,
       data TEXT NOT NULL,
@@ -117,19 +191,12 @@ export async function getSqliteDb(): Promise<Database> {
       created_at TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS documents (
+    CREATE TABLE IF NOT EXISTS attendance (
       id TEXT PRIMARY KEY,
       employee_id TEXT NOT NULL,
-      document_type TEXT NOT NULL,
-      title TEXT NOT NULL,
-      file_name TEXT NOT NULL,
-      file_path TEXT NOT NULL,
-      file_size INTEGER,
-      file_type TEXT,
-      uploaded_at TEXT,
-      uploaded_by TEXT,
-      notes TEXT,
-      data TEXT
+      date TEXT NOT NULL,
+      data TEXT NOT NULL,
+      updated_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS shift_assignments (
@@ -140,11 +207,17 @@ export async function getSqliteDb(): Promise<Database> {
       data TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS exceptions (
+    CREATE TABLE IF NOT EXISTS shifts (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      data TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS leave (
       id TEXT PRIMARY KEY,
       employee_id TEXT NOT NULL,
       date TEXT NOT NULL,
-      type TEXT NOT NULL,
+      status TEXT,
       data TEXT NOT NULL
     );
 
@@ -172,11 +245,33 @@ export async function getSqliteDb(): Promise<Database> {
       data TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS payroll (
+      id TEXT PRIMARY KEY,
+      employee_id TEXT NOT NULL,
+      month TEXT NOT NULL,
+      data TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS payroll_runs (
       id TEXT PRIMARY KEY,
       month TEXT NOT NULL,
       status TEXT,
       data TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS documents (
+      id TEXT PRIMARY KEY,
+      employee_id TEXT NOT NULL,
+      document_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      file_size INTEGER,
+      file_type TEXT,
+      uploaded_at TEXT,
+      uploaded_by TEXT,
+      notes TEXT,
+      data TEXT
     );
 
     CREATE TABLE IF NOT EXISTS audit_logs (
@@ -199,10 +294,78 @@ export async function getSqliteDb(): Promise<Database> {
       employee_id TEXT NOT NULL,
       data TEXT NOT NULL
     );
-  `);
+
+    CREATE TABLE IF NOT EXISTS zk_sync_logs (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS zk_unmapped_punches (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL,
+      created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS holidays (
+      id TEXT PRIMARY KEY,
+      date TEXT NOT NULL,
+      name TEXT NOT NULL,
+      data TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS weekly_offs (
+      id TEXT PRIMARY KEY,
+      day TEXT NOT NULL,
+      data TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS departments (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      data TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS sections (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      data TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS designations (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      data TEXT
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_punch_dedup ON attendance_punches (employee_id, punch_datetime, device_id);
+  `;
+
+  try {
+    dbInstance.run(schemaSql);
+  } catch (schemaErr) {
+    console.warn('[SQLite] Schema setup error on existing instance, re-initializing clean database:', schemaErr);
+    dbInstance = new SQL.Database();
+    dbInstance.run(schemaSql);
+  }
 
   saveSqliteDb();
   return dbInstance;
+}
+
+export async function resetSqliteDb(): Promise<Database> {
+  dbInstance = null;
+  const dbPath = getSqliteDbPath();
+  if (fs.existsSync(dbPath)) {
+    try {
+      const corruptPath = `${dbPath}.corrupted_${Date.now()}`;
+      fs.copyFileSync(dbPath, corruptPath);
+      fs.unlinkSync(dbPath);
+    } catch (e) {
+      // ignore
+    }
+  }
+  return await getSqliteDb();
 }
 
 export function saveSqliteDb() {
@@ -210,18 +373,16 @@ export function saveSqliteDb() {
   try {
     const data = dbInstance.export();
     const buffer = Buffer.from(data);
-    const root = getSanitizedRootFolder();
-    
-    // Save to Database.db (matching DB Browser for SQLite default file)
-    fs.writeFileSync(path.join(root, 'Database.db'), buffer);
-    
-    // Save to database/hris.db (matching subdirectory structure)
-    const dbSubDir = path.join(root, 'database');
-    if (!fs.existsSync(dbSubDir)) {
-      fs.mkdirSync(dbSubDir, { recursive: true });
+    const targetPath = activeDbPath || getSqliteDbPath();
+
+    const dir = path.dirname(targetPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(path.join(dbSubDir, 'hris.db'), buffer);
+
+    fs.writeFileSync(targetPath, buffer);
   } catch (err) {
-    console.error('[SQLite] Failed to persist SQLite database file:', err);
+    console.error('[SQLite] Failed to save SQLite database:', err);
   }
 }
+

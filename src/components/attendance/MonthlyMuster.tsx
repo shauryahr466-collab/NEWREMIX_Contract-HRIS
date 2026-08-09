@@ -129,9 +129,20 @@ export function MonthlyMuster() {
     const key = `${emp.id}_${dayDetail.adDateStr}`;
     const record = processedDataMap.get(key);
     
-    // Check holiday & weekly off
+    // Check shift assignment for this date
+    const assignment = shiftAssignments.find(a => a.employeeId === emp.id && a.date === dayDetail.adDateStr);
+    const assignedShift = settings.shifts?.find(s => s.id === (assignment?.shiftId || emp.shiftId));
+
+    // Determine weekly off for this employee on this date:
+    // Interconnect assigned shift weekly off, employee weekly off, or default Saturday
+    const effectiveWeeklyOffDay = (assignedShift as any)?.weeklyOff || emp.weeklyOff;
+    const isWeeklyOff = record?.status === 'Weekly Off' || record?.status === 'PWO' || (
+      effectiveWeeklyOffDay 
+        ? effectiveWeeklyOffDay.toLowerCase() === dayDetail.dayOfWeek.toLowerCase()
+        : dayDetail.isSaturday
+    );
+
     const isHoliday = settings.holidays?.some(h => h.date === dayDetail.adDateStr);
-    const isWeeklyOff = dayDetail.isSaturday || emp.weeklyOff?.toLowerCase() === dayDetail.dayOfWeek.toLowerCase();
 
     if (!record) {
       if (isHoliday) {
@@ -148,13 +159,13 @@ export function MonthlyMuster() {
       return { code: 'PPH', bg: 'bg-sky-100 dark:bg-sky-950 text-sky-900 dark:text-sky-200 font-extrabold', record };
     }
 
-    // 2. Present in Weekly Off
-    if (record.status === 'PWO') {
+    // 2. Present in Weekly Off (PWO)
+    if (record.status === 'PWO' || (isWeeklyOff && (record.firstPunch || record.workingHours > 0 || record.status === 'Present' || record.status === 'Late' || record.status === 'On Time' || record.status === 'Early'))) {
       return { code: 'PWO', bg: 'bg-indigo-100 dark:bg-indigo-950 text-indigo-900 dark:text-indigo-200 font-bold', record };
     }
 
     // 3. Weekly Off without attendance
-    if (record.status === 'Weekly Off') {
+    if (record.status === 'Weekly Off' || (isWeeklyOff && !record.firstPunch && record.status !== 'Present')) {
       return { code: 'WO', bg: 'bg-amber-100/80 dark:bg-amber-950/60 text-amber-900 dark:text-amber-300 font-semibold', record };
     }
 

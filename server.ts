@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import nodemailer from 'nodemailer';
 import { fileURLToPath } from 'url';
@@ -8,9 +9,10 @@ import { getFirestore, doc, setDoc, writeBatch, getDocs, collection } from 'fire
 
 import firebaseConfig from './firebase-applet-config.json';
 import { localRouter } from './src/server/localApi.js';
+import { getSqliteDb, saveSqliteDb } from './src/server/sqliteDb.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __filename_val = typeof __filename !== 'undefined' ? __filename : (typeof import.meta !== 'undefined' && import.meta?.url ? fileURLToPath(import.meta.url) : process.cwd());
+const __dirname_val = typeof __dirname !== 'undefined' ? __dirname : path.dirname(__filename_val);
 
 // Initialize Firebase Client SDK for Server (Event pushing only)
 const appConfig = initializeApp(firebaseConfig);
@@ -34,6 +36,16 @@ async function startServer() {
       return res.sendStatus(200);
     }
     next();
+  });
+
+  // Health Check Endpoint
+  app.get('/api/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      mode: 'LOCAL-FIRST',
+      databasePath: 'E:\\SHRM_HRIS\\Database.db',
+      timestamp: new Date().toISOString()
+    });
   });
 
   // Mount Local SQLite & Local Disk Storage API Routes
@@ -170,7 +182,8 @@ async function startServer() {
     }
 
     res.set('Content-Type', 'text/plain');
-    res.send(`GET OPTION FROM: ${sn}\nStamp=99999999\nOpStamp=99999999\nErrorDelay=60\nDelay=15\nRealtime=1\nEncrypt=0`);
+    // Realtime=0 and Delay=86400 disables automatic real-time background pooling as requested by user
+    res.send(`GET OPTION FROM: ${sn}\nStamp=99999999\nOpStamp=99999999\nErrorDelay=3600\nDelay=86400\nRealtime=0\nEncrypt=0`);
   });
 
   app.post(['/iclock/cdata.aspx', '/iclock/cdata', '/iclock/fdata.aspx', '/iclock/fdata'], express.text({ limit: '50mb', type: '*/*' }), async (req, res) => {
@@ -184,17 +197,28 @@ async function startServer() {
     try {
       if (bodyText && (table === 'ATTLOG' || bodyText.includes('\t') || bodyText.includes(' '))) {
         const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
-        const punchBatch = writeBatch(db);
+        const sqliteDb = await getSqliteDb();
+        sqliteDb.run('BEGIN TRANSACTION');
+
+        const punchStmt = sqliteDb.prepare(`
+          INSERT INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET data=excluded.data
+        `);
 
         // Fetch mappings
-        const mappingsSnap = await getDocs(collection(db, 'zkUserMappings'));
-        const userMappings = new Map<string, string>();
-        mappingsSnap.docs.forEach(dDoc => {
-          const d = dDoc.data();
-          if (d.deviceUserId && d.employeeId) {
-            userMappings.set(d.deviceUserId, d.employeeId);
-          }
-        });
+        let userMappings = new Map<string, string>();
+        try {
+          const mappingsSnap = await getDocs(collection(db, 'zkUserMappings'));
+          mappingsSnap.docs.forEach(dDoc => {
+            const d = dDoc.data();
+            if (d.deviceUserId && d.employeeId) {
+              userMappings.set(d.deviceUserId, d.employeeId);
+            }
+          });
+        } catch (mErr) {
+          console.warn('ADMS mapping fetch note:', mErr);
+        }
 
         for (const line of lines) {
           // Format line e.g. "121\t2026-08-03 09:15:22\t0\t1\t0\t0"
@@ -205,11 +229,9 @@ async function startServer() {
             const punchDateTime = String(rawTime).replace(' ', 'T');
             const transactionId = `adms_${sn}_${deviceUserId}_${punchDateTime}`;
             const employeeId = userMappings.get(deviceUserId) || (deviceUserId.startsWith('EMP') ? deviceUserId : `EMP${deviceUserId}`);
-
             const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
-            const punchRef = doc(db, 'punches', punchId);
 
-            punchBatch.set(punchRef, {
+            const punchObj = {
               id: punchId,
               employeeId,
               punchDatetime: punchDateTime,
@@ -222,19 +244,64 @@ async function startServer() {
               transactionId,
               location: `ADMS Cloud Push (${sn})`,
               importFormat: 'adms'
-            }, { merge: true });
+            };
+
+            punchStmt.run([
+              punchId,
+              employeeId,
+              punchDateTime,
+              `sn_${sn}`,
+              'ZKTeco',
+              JSON.stringify(punchObj),
+              now
+            ]);
 
             newRecords++;
           }
         }
 
-        if (newRecords > 0) {
+        punchStmt.free();
+        sqliteDb.run('COMMIT');
+        saveSqliteDb();
+
+        // Optional cloud push to Firestore
+        try {
+          const punchBatch = writeBatch(db);
+          for (const line of lines) {
+            const parts = line.split(/\s+/);
+            if (parts.length >= 2) {
+              const deviceUserId = parts[0];
+              const rawTime = parts[1] + (parts[2] ? ` ${parts[2]}` : '');
+              const punchDateTime = String(rawTime).replace(' ', 'T');
+              const transactionId = `adms_${sn}_${deviceUserId}_${punchDateTime}`;
+              const employeeId = userMappings.get(deviceUserId) || (deviceUserId.startsWith('EMP') ? deviceUserId : `EMP${deviceUserId}`);
+              const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+              punchBatch.set(doc(db, 'punches', punchId), {
+                id: punchId,
+                employeeId,
+                punchDatetime: punchDateTime,
+                deviceId: `sn_${sn}`,
+                deviceName: `ZKTeco (${sn})`,
+                deviceIP: 'ADMS Push',
+                deviceUserId,
+                source: 'ZKTeco',
+                syncTime: now,
+                transactionId,
+                location: `ADMS Cloud Push (${sn})`,
+                importFormat: 'adms'
+              }, { merge: true });
+            }
+          }
           await punchBatch.commit();
+        } catch (fsErr) {
+          console.warn('ADMS Firestore backup sync note:', fsErr);
         }
       }
 
-      // Update Device Online status
-      await setDoc(doc(db, 'zkDevices', `sn_${sn}`), {
+      // Update Device Online status in SQLite
+      const sqliteDb = await getSqliteDb();
+      const devObj = {
         id: `sn_${sn}`,
         name: `ZKTeco ${sn}`,
         ip: 'ADMS Push',
@@ -245,7 +312,22 @@ async function startServer() {
         lastConnection: now,
         lastSync: now,
         enabled: true
-      }, { merge: true });
+      };
+      const devStmt = sqliteDb.prepare(`
+        INSERT INTO zk_devices (id, name, ip, port, model, serial_number, status, last_connection, last_sync, enabled, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data, status=excluded.status, last_sync=excluded.last_sync
+      `);
+      devStmt.run([devObj.id, devObj.name, devObj.ip, devObj.port, devObj.model, devObj.serialNumber, devObj.status, now, now, 1, JSON.stringify(devObj)]);
+      devStmt.free();
+      saveSqliteDb();
+
+      // Optional Firestore update
+      try {
+        await setDoc(doc(db, 'zkDevices', `sn_${sn}`), devObj, { merge: true });
+      } catch (fsDevErr) {
+        // ignore
+      }
 
       res.set('Content-Type', 'text/plain');
       res.send(`OK: ${newRecords}`);
@@ -316,125 +398,126 @@ async function startServer() {
         }
       });
 
-      // 3. Process Punches & Save
+      // 3. Process Punches & Save to SQLite
       let recordsRead = punches ? punches.length : 0;
       let newRecords = 0;
       let duplicates = 0;
       let unmappedCount = 0;
 
       if (punches && Array.isArray(punches) && punches.length > 0) {
-        const CHUNK_SIZE = 75; // 75 items * max 4 ops = 300 ops (well under Firestore 500 limit)
-        for (let i = 0; i < punches.length; i += CHUNK_SIZE) {
-          const chunk = punches.slice(i, i + CHUNK_SIZE);
-          const chunkBatch = writeBatch(db);
-          let chunkOps = 0;
+        const sqliteDb = await getSqliteDb();
+        sqliteDb.run('BEGIN TRANSACTION');
 
-          const preparedItems = chunk.map((p: any) => {
-            const deviceUserId = String(p.deviceUserId || p.userId || p.pin || p.userSn || p.sn || p.id || '').trim();
-            const normDevId = deviceUserId.replace(/[^0-9]/g, '').replace(/^0+/, '') || deviceUserId;
-            const rawDateTime = p.punchDateTime || p.recordTime || p.timestamp || p.attTime || p.time || p.date || now;
-            const punchDateTime = String(rawDateTime).replace(' ', 'T');
-            const transactionId = `${devIdToUse}_${deviceUserId}_${punchDateTime}`;
-            const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
-            const unmappedId = `unmapped_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        const punchStmt = sqliteDb.prepare(`
+          INSERT INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET data=excluded.data
+        `);
 
-            let employeeId = userMappings.get(deviceUserId) || (normDevId ? userMappings.get(normDevId) : undefined);
-            if (!employeeId) {
-              employeeId = empNormMap.get(deviceUserId) || 
-                           (normDevId ? empNormMap.get(normDevId) : undefined) ||
-                           empNormMap.get(`EMP${normDevId}`) ||
-                           empNormMap.get(`EMP-${normDevId}`) ||
-                           empNormMap.get(`EMP${normDevId.padStart(3, '0')}`) ||
-                           empNormMap.get(`EMP-${normDevId.padStart(3, '0')}`) ||
-                           empNormMap.get(deviceUserId.toLowerCase());
-            }
+        for (const p of punches) {
+          const deviceUserId = String(p.deviceUserId || p.userId || p.pin || p.userSn || p.sn || p.id || '').trim();
+          if (!deviceUserId) continue;
 
-            // AC-No on device directly matches Employee ID in system
-            const resolvedEmpId = employeeId || deviceUserId || (normDevId ? `EMP-${normDevId.padStart(3, '0')}` : 'UNKNOWN');
+          const normDevId = deviceUserId.replace(/[^0-9]/g, '').replace(/^0+/, '') || deviceUserId;
+          const rawDateTime = p.punchDateTime || p.recordTime || p.timestamp || p.attTime || p.time || p.date || now;
+          const punchDateTime = String(rawDateTime).replace(' ', 'T');
+          const transactionId = `${devIdToUse}_${deviceUserId}_${punchDateTime}`;
+          const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 
-            return {
-              p,
-              deviceUserId,
-              normDevId,
-              punchDateTime,
-              transactionId,
-              punchId,
-              unmappedId,
-              employeeId,
-              resolvedEmpId,
-              ref: doc(db, 'punches', punchId)
-            };
-          });
-
-          for (const item of preparedItems) {
-            if (!item.deviceUserId) continue;
-
-            newRecords++;
-            chunkOps++;
-
-            // Always record in punches so physical device punch appears in HRIS Attendance
-            chunkBatch.set(item.ref, {
-              id: item.punchId,
-              employeeId: item.resolvedEmpId,
-              punchDatetime: item.punchDateTime,
-              deviceId: devIdToUse,
-              deviceName: deviceName || 'ZKTeco Device',
-              deviceIP: deviceIP || '192.168.117.200',
-              deviceUserId: item.deviceUserId,
-              source: 'ZKTeco',
-              syncTime: now,
-              transactionId: item.transactionId,
-              location: `${deviceName || 'Biometric'} (${deviceIP || 'LAN'})`,
-              importFormat: 'standard'
-            }, { merge: true });
-
-            // If not previously mapped, also flag in zkUnmappedPunches for explicit mapping review
-            if (!item.employeeId) {
-              unmappedCount++;
-              const unmappedRef = doc(db, 'zkUnmappedPunches', item.unmappedId);
-              chunkBatch.set(unmappedRef, {
-                id: item.unmappedId,
-                transactionId: item.transactionId,
-                deviceId: devIdToUse,
-                deviceName: deviceName || 'ZKTeco Device',
-                deviceIP: deviceIP || '192.168.117.200',
-                deviceUserId: item.deviceUserId,
-                punchDateTime: item.punchDateTime,
-                syncTime: now,
-                status: 'pending'
-              }, { merge: true });
-
-              // Auto-seed biometric user mapping if not present
-              const mappingRef = doc(db, 'zkUserMappings', `map_${devIdToUse}_${item.deviceUserId}`);
-              chunkBatch.set(mappingRef, {
-                id: `map_${devIdToUse}_${item.deviceUserId}`,
-                deviceId: devIdToUse,
-                deviceUserId: item.deviceUserId,
-                employeeId: item.resolvedEmpId,
-                mappedAt: now,
-                mappedBy: 'Auto-ZKTeco-Bridge'
-              }, { merge: true });
-
-              // Auto-create basic employee entry if employee doesn't exist yet
-              const empDocRef = doc(db, 'employees', item.resolvedEmpId);
-              chunkBatch.set(empDocRef, {
-                id: item.resolvedEmpId,
-                name: `Employee (AC-No: ${item.deviceUserId})`,
-                department: 'Biometric Devices',
-                designation: 'Staff',
-                joiningDate: now.split('T')[0],
-                status: 'Active',
-                deviceUserId: item.deviceUserId,
-                biometricId: item.deviceUserId,
-                acNo: item.deviceUserId,
-                zkPin: item.deviceUserId
-              }, { merge: true });
-            }
+          let employeeId = userMappings.get(deviceUserId) || (normDevId ? userMappings.get(normDevId) : undefined);
+          if (!employeeId) {
+            employeeId = empNormMap.get(deviceUserId) || 
+                         (normDevId ? empNormMap.get(normDevId) : undefined) ||
+                         empNormMap.get(`EMP${normDevId}`) ||
+                         empNormMap.get(`EMP-${normDevId}`) ||
+                         empNormMap.get(`EMP${normDevId.padStart(3, '0')}`) ||
+                         empNormMap.get(`EMP-${normDevId.padStart(3, '0')}`) ||
+                         empNormMap.get(deviceUserId.toLowerCase());
           }
 
-          if (chunkOps > 0) {
-            await chunkBatch.commit();
+          const resolvedEmpId = employeeId || deviceUserId || (normDevId ? `EMP-${normDevId.padStart(3, '0')}` : 'UNKNOWN');
+
+          const punchObj = {
+            id: punchId,
+            employeeId: resolvedEmpId,
+            punchDatetime: punchDateTime,
+            deviceId: devIdToUse,
+            deviceName: deviceName || 'ZKTeco Device',
+            deviceIP: deviceIP || '192.168.117.200',
+            deviceUserId,
+            source: 'ZKTeco',
+            syncTime: now,
+            transactionId,
+            location: `${deviceName || 'Biometric'} (${deviceIP || 'LAN'})`,
+            importFormat: 'standard'
+          };
+
+          punchStmt.run([
+            punchId,
+            resolvedEmpId,
+            punchDateTime,
+            devIdToUse,
+            'ZKTeco',
+            JSON.stringify(punchObj),
+            now
+          ]);
+
+          newRecords++;
+        }
+
+        punchStmt.free();
+        sqliteDb.run('COMMIT');
+        saveSqliteDb();
+
+        // Optional cloud backup to Firestore
+        try {
+          const CHUNK_SIZE = 1000;
+          for (let i = 0; i < punches.length; i += CHUNK_SIZE) {
+            const chunk = punches.slice(i, i + CHUNK_SIZE);
+            
+            // Sub-batching to respect Firestore writeBatch 500 limit
+            const FS_BATCH_LIMIT = 400;
+            for (let sb = 0; sb < chunk.length; sb += FS_BATCH_LIMIT) {
+              const subChunk = chunk.slice(sb, sb + FS_BATCH_LIMIT);
+              const chunkBatch = writeBatch(db);
+
+              for (const p of subChunk) {
+                const deviceUserId = String(p.deviceUserId || p.userId || p.pin || p.userSn || p.sn || p.id || '').trim();
+                if (!deviceUserId) continue;
+
+                const normDevId = deviceUserId.replace(/[^0-9]/g, '').replace(/^0+/, '') || deviceUserId;
+                const rawDateTime = p.punchDateTime || p.recordTime || p.timestamp || p.attTime || p.time || p.date || now;
+                const punchDateTime = String(rawDateTime).replace(' ', 'T');
+                const transactionId = `${devIdToUse}_${deviceUserId}_${punchDateTime}`;
+                const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+                let employeeId = userMappings.get(deviceUserId) || (normDevId ? userMappings.get(normDevId) : undefined);
+                if (!employeeId) {
+                  employeeId = empNormMap.get(deviceUserId) || empNormMap.get(normDevId);
+                }
+                const resolvedEmpId = employeeId || deviceUserId || (normDevId ? `EMP-${normDevId.padStart(3, '0')}` : 'UNKNOWN');
+
+                chunkBatch.set(doc(db, 'punches', punchId), {
+                  id: punchId,
+                  employeeId: resolvedEmpId,
+                  punchDatetime: punchDateTime,
+                  deviceId: devIdToUse,
+                  deviceName: deviceName || 'ZKTeco Device',
+                  deviceIP: deviceIP || '192.168.117.200',
+                  deviceUserId,
+                  source: 'ZKTeco',
+                  syncTime: now,
+                  transactionId,
+                  location: `${deviceName || 'Biometric'} (${deviceIP || 'LAN'})`,
+                  importFormat: 'standard'
+                }, { merge: true });
+              }
+
+              await chunkBatch.commit();
+            }
           }
+        } catch (fsSyncErr) {
+          console.warn('Agent sync Firestore backup note:', fsSyncErr);
         }
       }
 
@@ -510,19 +593,21 @@ async function startServer() {
     }
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== 'production') {
+  // Vite middleware for development vs static build serving
+  const distPath = path.join(process.cwd(), 'dist');
+  const isProduction = process.env.NODE_ENV === 'production' || (!process.env.VITE_DEV && fs.existsSync(path.join(distPath, 'index.html')) && fs.existsSync(path.join(distPath, 'server.cjs')));
+
+  if (isProduction) {
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {

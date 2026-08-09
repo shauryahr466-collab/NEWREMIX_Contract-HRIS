@@ -3,6 +3,8 @@ import { X, Clock, Calendar, ShieldCheck, UserCheck, CheckCircle2, AlertTriangle
 import { format, parseISO } from 'date-fns';
 import { formatAMPM, formatMinutes, formatDuration } from '../../lib/utils';
 import { ProcessedAttendance, Employee, ShiftMaster, RawPunch } from '../../types';
+import { useAppStore } from '../../store';
+import { toast } from 'sonner';
 
 interface MusterCellModalProps {
   isOpen: boolean;
@@ -27,7 +29,47 @@ export function MusterCellModal({
   shift,
   rawPunches
 }: MusterCellModalProps) {
+  const { settings, shiftAssignments, setShiftAssignments, addAssignmentLog, quotaExceeded } = useAppStore();
+
   if (!isOpen || !employee) return null;
+
+  const currentAssignment = shiftAssignments.find(a => a.employeeId === employee.id && a.date === adDateStr);
+
+  const handleShiftChangeInModal = async (newShiftId: string) => {
+    if (quotaExceeded) return;
+
+    const existingIndex = shiftAssignments.findIndex(
+      s => s.employeeId === employee.id && s.date === adDateStr
+    );
+
+    let nextAssignments = [...shiftAssignments];
+    const action = existingIndex > -1 ? (newShiftId ? 'Updated' : 'Removed') : 'Assigned';
+
+    if (existingIndex > -1) {
+      if (newShiftId) {
+        nextAssignments[existingIndex] = { ...nextAssignments[existingIndex], shiftId: newShiftId };
+      } else {
+        nextAssignments.splice(existingIndex, 1);
+      }
+    } else if (newShiftId) {
+      nextAssignments.push({
+        employeeId: employee.id,
+        date: adDateStr,
+        shiftId: newShiftId
+      });
+    }
+
+    const shiftObj = settings.shifts?.find(s => s.id === newShiftId);
+
+    await setShiftAssignments(nextAssignments);
+    await addAssignmentLog(employee.id, adDateStr, newShiftId, action as any);
+
+    toast.success(
+      newShiftId 
+        ? `Shift updated to "${shiftObj?.name}" for ${employee.name} on ${adDateStr}`
+        : `Shift reset to default for ${employee.name} on ${adDateStr}`
+    );
+  };
 
   // Determine source
   let source = 'BIO';
@@ -89,10 +131,28 @@ export function MusterCellModal({
               <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5 mb-1">
                 <Clock size={12} className="text-indigo-500" /> Assigned Shift
               </p>
-              <p className="text-sm font-bold text-slate-800 dark:text-slate-100">
-                {shift?.name || 'General Shift'}
-              </p>
-              <p className="text-xs text-slate-500 font-mono mt-0.5">
+              <div className="flex items-center gap-1.5 mt-0.5">
+                <select
+                  value={currentAssignment?.shiftId || ''}
+                  onChange={(e) => handleShiftChangeInModal(e.target.value)}
+                  className="text-xs font-bold py-1 px-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-800 dark:text-slate-100 shadow-2xs focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+                >
+                  <option value="">
+                    {shift?.name ? `${shift.name} (Default)` : 'Default Shift'}
+                  </option>
+                  {settings.shifts?.map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.startTime}-{s.endTime})
+                    </option>
+                  ))}
+                </select>
+                {currentAssignment?.shiftId && (
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 rounded font-mono">
+                    Assigned
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 font-mono mt-1">
                 {shift ? `${shift.startTime} - ${shift.endTime}` : '09:00 - 18:00'}
               </p>
             </div>

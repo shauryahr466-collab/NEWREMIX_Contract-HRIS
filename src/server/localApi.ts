@@ -1,7 +1,8 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import { getSqliteDb, saveSqliteDb, getSanitizedRootFolder, setRootFolder } from './sqliteDb.js';
+import initSqlJs from 'sql.js';
+import { getSqliteDb, saveSqliteDb, getSanitizedRootFolder, setRootFolder, getSqliteDbPath } from './sqliteDb.js';
 
 export const localRouter = express.Router();
 
@@ -88,7 +89,13 @@ localRouter.get('/data/:table', async (req, res) => {
     payroll_runs: 'payroll_runs',
     audit_logs: 'audit_logs',
     zk_devices: 'zk_devices',
-    zk_user_mappings: 'zk_user_mappings'
+    zk_user_mappings: 'zk_user_mappings',
+    zk_sync_logs: 'zk_sync_logs',
+    zk_unmapped_punches: 'zk_unmapped_punches',
+    leave_records: 'leave_records',
+    departments: 'departments',
+    sections: 'sections',
+    designations: 'designations'
   };
 
   const sqlTable = validTables[table];
@@ -143,7 +150,13 @@ localRouter.post('/data/:table', async (req, res) => {
     payroll_runs: 'payroll_runs',
     audit_logs: 'audit_logs',
     zk_devices: 'zk_devices',
-    zk_user_mappings: 'zk_user_mappings'
+    zk_user_mappings: 'zk_user_mappings',
+    zk_sync_logs: 'zk_sync_logs',
+    zk_unmapped_punches: 'zk_unmapped_punches',
+    leave_records: 'leave_records',
+    departments: 'departments',
+    sections: 'sections',
+    designations: 'designations'
   };
 
   const sqlTable = validTables[table];
@@ -255,7 +268,13 @@ localRouter.post('/data/:table/delete', async (req, res) => {
     payroll_runs: 'payroll_runs',
     audit_logs: 'audit_logs',
     zk_devices: 'zk_devices',
-    zk_user_mappings: 'zk_user_mappings'
+    zk_user_mappings: 'zk_user_mappings',
+    zk_sync_logs: 'zk_sync_logs',
+    zk_unmapped_punches: 'zk_unmapped_punches',
+    leave_records: 'leave_records',
+    departments: 'departments',
+    sections: 'sections',
+    designations: 'designations'
   };
 
   const sqlTable = validTables[table];
@@ -317,16 +336,16 @@ localRouter.post('/documents/upload', async (req, res) => {
     }
 
     const root = getSanitizedRootFolder();
-    const docsDir = path.join(root, 'data', 'documents');
-    if (!fs.existsSync(docsDir)) {
-      fs.mkdirSync(docsDir, { recursive: true });
+    const cleanEmpId = sanitizeFileName(String(employeeId));
+    const empDocsDir = path.join(root, 'Documents', 'Employees', cleanEmpId);
+    if (!fs.existsSync(empDocsDir)) {
+      fs.mkdirSync(empDocsDir, { recursive: true });
     }
 
-    const cleanEmpId = sanitizeFileName(String(employeeId));
     const cleanFileName = sanitizeFileName(String(fileName));
     const uniqueId = `doc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-    const physicalName = `${cleanEmpId}_${Date.now()}_${cleanFileName}`;
-    const physicalPath = path.join(docsDir, physicalName);
+    const physicalName = `${Date.now()}_${cleanFileName}`;
+    const physicalPath = path.join(empDocsDir, physicalName);
 
     // Decode Base64 and write to local disk
     const base64Data = fileBase64.replace(/^data:([A-Za-z-+/]+);base64,/, '');
@@ -560,3 +579,395 @@ localRouter.post('/migrate-from-firestore', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// 13. Phase 8: Local Excel/CSV Data Import Endpoint
+localRouter.post('/import-excel', async (req, res) => {
+  const { type, rows } = req.body;
+  if (!type || !Array.isArray(rows)) {
+    return res.status(400).json({ error: 'Missing import type or rows array' });
+  }
+
+  try {
+    const db = await getSqliteDb();
+    const now = new Date().toISOString();
+    let importedCount = 0;
+
+    db.run('BEGIN TRANSACTION');
+
+    if (type === 'employees') {
+      const stmt = db.prepare(`
+        INSERT INTO employees (id, name, department, designation, shift_id, joining_date, status, data, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name=excluded.name,
+          department=excluded.department,
+          designation=excluded.designation,
+          data=excluded.data,
+          updated_at=excluded.updated_at
+      `);
+      for (const r of rows) {
+        const empId = String(r.id || r.employeeId || r.code || r.EmployeeID || '').trim();
+        if (!empId) continue;
+        const emp = {
+          id: empId,
+          name: r.name || r.EmployeeName || r.fullName || 'Unnamed',
+          department: r.department || r.Department || '',
+          designation: r.designation || r.Designation || '',
+          shiftId: r.shiftId || r.Shift || 'S1',
+          joiningDate: r.joiningDate || r.JoiningDate || now.substring(0, 10),
+          status: r.status || 'Active',
+          email: r.email || '',
+          phone: r.phone || ''
+        };
+        stmt.run([emp.id, emp.name, emp.department, emp.designation, emp.shiftId, emp.joiningDate, emp.status, JSON.stringify(emp), now]);
+        importedCount++;
+      }
+      stmt.free();
+    } else if (type === 'punches') {
+      const stmt = db.prepare(`
+        INSERT INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+      `);
+      for (const r of rows) {
+        const empId = String(r.employeeId || r.id || r.EmployeeID || r.code || '').trim();
+        const punchTime = String(r.punchDatetime || r.punchTime || r.time || r.date || now).replace(' ', 'T');
+        if (!empId) continue;
+        const id = `import_${empId}_${punchTime.replace(/[^a-zA-Z0-9]/g, '_')}`;
+        const punchObj = {
+          id,
+          employeeId: empId,
+          punchDatetime: punchTime,
+          deviceId: r.deviceId || 'ExcelImport',
+          source: r.source || 'Excel/CSV Import',
+          importFormat: 'excel'
+        };
+        stmt.run([id, empId, punchTime, punchObj.deviceId, punchObj.source, JSON.stringify(punchObj), now]);
+        importedCount++;
+      }
+      stmt.free();
+    } else {
+      // Generic batch save
+      const targetTable = type === 'shift_assignments' ? 'shift_assignments' : 'attendance_punches';
+      const stmt = db.prepare(`
+        INSERT INTO ${targetTable} (id, data)
+        VALUES (?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+      `);
+      for (const r of rows) {
+        const id = r.id || `imp_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        stmt.run([id, JSON.stringify(r)]);
+        importedCount++;
+      }
+      stmt.free();
+    }
+
+    db.run('COMMIT');
+    saveSqliteDb();
+
+    res.json({ success: true, importedCount, message: `Successfully imported ${importedCount} records locally into SQLite.` });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 14. Phase 18: Real Local Backend Diagnostics Endpoint
+localRouter.get('/diagnostics', async (req, res) => {
+  const startTime = Date.now();
+  const root = getSanitizedRootFolder();
+  const actualDbPath = getSqliteDbPath();
+  const configuredDbPath = process.env.LOCAL_DB_PATH || (process.platform === 'win32' ? 'E:\\SHRM_HRIS\\Database.db' : actualDbPath);
+  const docsPath = path.join(root, 'Documents');
+
+  const isWin32 = process.platform === 'win32';
+  const isCloudRun = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB || !isWin32);
+
+  const diagResult: any = {
+    timestamp: new Date().toISOString(),
+    runtime: {
+      platform: process.platform,
+      arch: process.arch,
+      nodeVersion: process.version,
+      environment: process.env.NODE_ENV || 'development',
+      isCloudRunPreview: isCloudRun,
+      runtimeLabel: isWin32 ? 'WINDOWS NATIVE SERVER (win32)' : 'GOOGLE AI STUDIO PREVIEW CONTAINER (Linux Container)'
+    },
+    paths: {
+      configuredDatabasePath: configuredDbPath,
+      actualDatabasePath: actualDbPath,
+      rootDirectory: root,
+      rootDirectoryExists: fs.existsSync(root),
+      documentsDirectoryPath: docsPath,
+      documentsDirectoryExists: fs.existsSync(docsPath)
+    },
+    databaseFile: {
+      exists: fs.existsSync(actualDbPath),
+      sizeBytes: 0,
+      sizeFormatted: '0 KB',
+      lastModified: null
+    },
+    sqliteTests: {
+      connection: 'UNKNOWN',
+      readTest: { passed: false, employeeCount: 0, latencyMs: 0, error: null },
+      writeTest: { passed: false, latencyMs: 0, error: null },
+      transactionTest: { passed: false, latencyMs: 0, error: null }
+    },
+    fileIoTest: {
+      passed: false,
+      testFilePath: null,
+      error: null
+    },
+    accessibilityStatus: '',
+    summaryNote: ''
+  };
+
+  // 1. Check DB File Info
+  if (diagResult.paths.databaseFileExists = fs.existsSync(actualDbPath)) {
+    try {
+      const stats = fs.statSync(actualDbPath);
+      diagResult.databaseFile.sizeBytes = stats.size;
+      diagResult.databaseFile.sizeFormatted = `${(stats.size / 1024).toFixed(2)} KB (${(stats.size / (1024 * 1024)).toFixed(2)} MB)`;
+      diagResult.databaseFile.lastModified = stats.mtime.toISOString();
+    } catch (e: any) {
+      diagResult.databaseFile.error = e.message;
+    }
+  }
+
+  // 2. Test SQLite Operations
+  try {
+    const db = await getSqliteDb();
+    diagResult.sqliteTests.connection = 'Connected (sql.js / SQLite)';
+
+    // 2a. Read Test
+    const rStart = Date.now();
+    try {
+      const empRes = db.exec('SELECT COUNT(*) as cnt FROM employees');
+      let count = 0;
+      if (empRes.length > 0 && empRes[0].values.length > 0) {
+        count = Number(empRes[0].values[0][0]);
+      }
+      diagResult.sqliteTests.readTest = {
+        passed: true,
+        employeeCount: count,
+        latencyMs: Date.now() - rStart,
+        error: null
+      };
+    } catch (rErr: any) {
+      diagResult.sqliteTests.readTest = {
+        passed: false,
+        employeeCount: 0,
+        latencyMs: Date.now() - rStart,
+        error: rErr.message
+      };
+    }
+
+    // 2b. Write & Delete Test
+    const wStart = Date.now();
+    const diagId = `_diag_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    try {
+      const stmt = db.prepare('INSERT INTO audit_logs (id, employee_id, date, data, created_at) VALUES (?, ?, ?, ?, ?)');
+      stmt.run([diagId, 'DIAGNOSTIC', 'TODAY', JSON.stringify({ diagnostic: true }), new Date().toISOString()]);
+      stmt.free();
+
+      // Verify read back
+      const verifyRes = db.exec(`SELECT id FROM audit_logs WHERE id = '${diagId}'`);
+      const verifyPassed = verifyRes.length > 0 && verifyRes[0].values.length > 0;
+
+      // Clean up test row
+      db.run(`DELETE FROM audit_logs WHERE id = '${diagId}'`);
+      saveSqliteDb();
+
+      diagResult.sqliteTests.writeTest = {
+        passed: verifyPassed,
+        latencyMs: Date.now() - wStart,
+        error: verifyPassed ? null : 'Row inserted but verification query returned no records.'
+      };
+    } catch (wErr: any) {
+      diagResult.sqliteTests.writeTest = {
+        passed: false,
+        latencyMs: Date.now() - wStart,
+        error: wErr.message
+      };
+    }
+
+    // 2c. Transaction Test
+    const tStart = Date.now();
+    try {
+      db.run('BEGIN TRANSACTION;');
+      const txId = `_tx_${Date.now()}`;
+      db.run(`INSERT INTO departments (id, name, data) VALUES ('${txId}', 'DiagDept', '{"tx":true}');`);
+      db.run(`DELETE FROM departments WHERE id = '${txId}';`);
+      db.run('COMMIT;');
+      saveSqliteDb();
+
+      diagResult.sqliteTests.transactionTest = {
+        passed: true,
+        latencyMs: Date.now() - tStart,
+        error: null
+      };
+    } catch (tErr: any) {
+      try { db.run('ROLLBACK;'); } catch (e) {}
+      diagResult.sqliteTests.transactionTest = {
+        passed: false,
+        latencyMs: Date.now() - tStart,
+        error: tErr.message
+      };
+    }
+
+  } catch (dbErr: any) {
+    diagResult.sqliteTests.connection = 'FAILED: ' + dbErr.message;
+  }
+
+  // 3. File I/O Test
+  try {
+    if (!fs.existsSync(docsPath)) {
+      fs.mkdirSync(docsPath, { recursive: true });
+    }
+    const testFilePath = path.join(docsPath, '_diag_io_test.tmp');
+    const testContent = `DIAGNOSTIC_TEST_${Date.now()}`;
+    fs.writeFileSync(testFilePath, testContent, 'utf-8');
+    const readBack = fs.readFileSync(testFilePath, 'utf-8');
+    fs.unlinkSync(testFilePath);
+
+    diagResult.fileIoTest = {
+      passed: readBack === testContent,
+      testFilePath: testFilePath,
+      error: readBack === testContent ? null : 'Content mismatch during file readback.'
+    };
+  } catch (ioErr: any) {
+    diagResult.fileIoTest = {
+      passed: false,
+      testFilePath: path.join(docsPath, '_diag_io_test.tmp'),
+      error: ioErr.message
+    };
+  }
+
+  // 4. Determine Honest Accessibility Status
+  if (isWin32 && diagResult.sqliteTests.readTest.passed && diagResult.sqliteTests.writeTest.passed) {
+    diagResult.accessibilityStatus = 'WINDOWS DISK & DATABASE FULLY ACCESSIBLE';
+    diagResult.summaryNote = 'Running natively on Windows. Backend is physically reading & writing E:\\SHRM_HRIS\\Database.db.';
+  } else if (!isWin32) {
+    diagResult.accessibilityStatus = 'LOCAL WINDOWS DATABASE NOT ACCESSIBLE FROM THIS PREVIEW CONTAINER';
+    diagResult.summaryNote = `This preview is running inside a Linux Cloud Run container. SQLite is operating in container storage (${actualDbPath}). To write directly to your Windows E:\\ drive, download the project and run start-hris.bat locally on Windows.`;
+  } else {
+    diagResult.accessibilityStatus = 'LOCAL STORAGE ERROR DETECTED';
+    diagResult.summaryNote = 'Windows host detected but SQLite read/write diagnostic encountered errors.';
+  }
+
+  diagResult.totalDiagnosticTimeMs = Date.now() - startTime;
+  res.json(diagResult);
+});
+
+// 12. Final Real Physical Database Persistence Test
+localRouter.post('/persistence-test', async (req, res) => {
+  try {
+    const dbPath = getSqliteDbPath();
+
+    // 1. Get active database instance & ensure initialization
+    const mainDb = await getSqliteDb();
+    saveSqliteDb();
+
+    // Confirm physical database file exists on disk
+    const physicalFileExists = fs.existsSync(dbPath);
+    if (!physicalFileExists) {
+      return res.status(500).json({
+        physicalDatabase: dbPath,
+        physicalFileExists: false,
+        writeToPhysicalFile: false,
+        reloadFromPhysicalFile: false,
+        temporaryRecordFoundAfterReload: false,
+        temporaryRecordDeleted: false,
+        finalReloadConfirmedDeleted: false,
+        persistenceStatus: 'FAILED',
+        error: 'Database file does not exist on physical disk.'
+      });
+    }
+
+    // 2. Ensure persistence_test table exists
+    mainDb.run(`
+      CREATE TABLE IF NOT EXISTS persistence_test (
+        id TEXT PRIMARY KEY,
+        test_val TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+
+    // 3. Create a unique temporary test record
+    const testId = `test_pers_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const timestamp = new Date().toISOString();
+
+    mainDb.run(
+      `INSERT INTO persistence_test (id, test_val, created_at) VALUES (?, ?, ?)`,
+      [testId, 'REAL_PHYSICAL_PERSISTENCE_VERIFICATION', timestamp]
+    );
+
+    // 4. Explicitly persist/export the sql.js database contents to physical file on disk
+    saveSqliteDb();
+
+    // 5. Confirm that the physical database file has been updated on disk
+    const statAfterWrite = fs.statSync(dbPath);
+    const writeToPhysicalFile = fs.existsSync(dbPath) && statAfterWrite.size > 0;
+
+    // 6. Open / reload the SQLite database from the physical file on disk
+    const SQL = await initSqlJs();
+    const fileBuffer1 = fs.readFileSync(dbPath);
+    const reloadedDb1 = new SQL.Database(fileBuffer1);
+    const reloadFromPhysicalFile = true;
+
+    // 7. Query temporary test record from reloaded physical database instance
+    const queryRes1 = reloadedDb1.exec(`SELECT id, test_val FROM persistence_test WHERE id = '${testId}'`);
+    const temporaryRecordFoundAfterReload = Boolean(
+      queryRes1.length > 0 &&
+      queryRes1[0].values.length > 0 &&
+      queryRes1[0].values[0][0] === testId
+    );
+    reloadedDb1.close();
+
+    // 8. Delete ONLY the temporary test record
+    mainDb.run(`DELETE FROM persistence_test WHERE id = ?`, [testId]);
+    saveSqliteDb();
+
+    // 9. Reload the physical database again from disk to confirm deletion
+    const fileBuffer2 = fs.readFileSync(dbPath);
+    const reloadedDb2 = new SQL.Database(fileBuffer2);
+    const queryRes2 = reloadedDb2.exec(`SELECT id FROM persistence_test WHERE id = '${testId}'`);
+    const finalReloadConfirmedDeleted = Boolean(
+      queryRes2.length === 0 || queryRes2[0].values.length === 0
+    );
+    const temporaryRecordDeleted = true;
+    reloadedDb2.close();
+
+    const isPassed = physicalFileExists &&
+      writeToPhysicalFile &&
+      reloadFromPhysicalFile &&
+      temporaryRecordFoundAfterReload &&
+      temporaryRecordDeleted &&
+      finalReloadConfirmedDeleted;
+
+    res.json({
+      physicalDatabase: dbPath,
+      physicalFileExists,
+      writeToPhysicalFile,
+      reloadFromPhysicalFile,
+      temporaryRecordFoundAfterReload,
+      temporaryRecordDeleted,
+      finalReloadConfirmedDeleted,
+      persistenceStatus: isPassed ? 'PASSED' : 'FAILED'
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      physicalDatabase: getSqliteDbPath(),
+      physicalFileExists: fs.existsSync(getSqliteDbPath()),
+      writeToPhysicalFile: false,
+      reloadFromPhysicalFile: false,
+      temporaryRecordFoundAfterReload: false,
+      temporaryRecordDeleted: false,
+      finalReloadConfirmedDeleted: false,
+      persistenceStatus: 'FAILED',
+      error: error.message
+    });
+  }
+});
+
+
+

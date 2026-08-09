@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '../store';
-import { Save, Plus, Trash2, AlertTriangle, Database, Download, CheckCircle2, XCircle, X, Info, Settings, Clock, Building2, Calendar, ShieldAlert, History, Loader2 } from 'lucide-react';
+import { Save, Plus, Trash2, AlertTriangle, Database, Download, CheckCircle2, XCircle, X, Info, Settings, Clock, Building2, Calendar, ShieldAlert, History, Loader2, Activity, FileCheck, Server, HardDrive } from 'lucide-react';
 import { format } from 'date-fns';
 import { ShiftMaster } from '../types';
 import { generateId, cn } from '../lib/utils';
@@ -16,6 +16,24 @@ export function SettingsPage() {
   const [dismissedWarnings, setDismissedWarnings] = useState(false);
   const [isConfirmingPurge, setIsConfirmingPurge] = useState(false);
   const [purgeConfirmationInput, setPurgeConfirmationInput] = useState('');
+
+  const [diagData, setDiagData] = useState<any>(null);
+  const [isRunningDiag, setIsRunningDiag] = useState(false);
+  const [showDiagModal, setShowDiagModal] = useState(false);
+
+  const handleRunDiagnostics = async () => {
+    setIsRunningDiag(true);
+    try {
+      const res = await fetch('/api/local/diagnostics').then(r => r.json());
+      setDiagData(res);
+      setShowDiagModal(true);
+      toast.success('Local backend diagnostic complete!');
+    } catch (err: any) {
+      toast.error('Diagnostic failed: ' + (err.message || 'Server error'));
+    } finally {
+      setIsRunningDiag(false);
+    }
+  };
 
   useEffect(() => {
     setLocalSettings(settings);
@@ -502,24 +520,37 @@ export function SettingsPage() {
            </Card>
 
            <Card className="p-6">
-              <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest mb-4 flex items-center gap-2">
-                <Info size={14} className="text-primary" />
-                Environment Info
-              </h3>
-              <div className="space-y-3">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest flex items-center gap-2">
+                  <Activity size={14} className="text-primary" />
+                  System Health & Diagnostics
+                </h3>
+                <Badge variant="success" className="text-[8px] h-4">Active</Badge>
+              </div>
+              <div className="space-y-3 mb-4">
                  <div className="flex justify-between items-center text-[10px]">
                    <span className="text-slate-400 font-bold uppercase">System Version</span>
                    <span className="text-slate-900 dark:text-white font-mono">v1.4.2-enterprise</span>
                  </div>
                  <div className="flex justify-between items-center text-[10px]">
                    <span className="text-slate-400 font-bold uppercase">Database Engine</span>
-                   <Badge variant="success" className="text-[8px] h-4">SQLite Local First</Badge>
+                   <span className="text-indigo-600 dark:text-indigo-400 font-mono font-bold">SQLite (Local DB)</span>
                  </div>
                  <div className="flex justify-between items-center text-[10px]">
-                   <span className="text-slate-400 font-bold uppercase">Storage Mode</span>
-                   <span className="text-emerald-600 dark:text-emerald-400 font-mono font-bold">Offline Local Disk</span>
+                   <span className="text-slate-400 font-bold uppercase">Storage Path</span>
+                   <span className="text-slate-700 dark:text-slate-300 font-mono font-bold">E:\SHRM_HRIS\</span>
                  </div>
               </div>
+
+              <Button
+                onClick={handleRunDiagnostics}
+                disabled={isRunningDiag}
+                variant="outline"
+                className="w-full text-xs gap-2 border-indigo-200 dark:border-indigo-900/50 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-950/30"
+              >
+                {isRunningDiag ? <Loader2 size={14} className="animate-spin" /> : <Activity size={14} />}
+                {isRunningDiag ? 'Running Diagnostic...' : 'Run Local Diagnostic'}
+              </Button>
            </Card>
 
            <Card className="p-6 bg-slate-900 text-white">
@@ -533,13 +564,13 @@ export function SettingsPage() {
                  </div>
               </div>
               <p className="text-xs text-slate-300 leading-relaxed mb-4">
-                Your system reads and writes directly to local SQLite database and local disk files (`D:\SHRM-HRIS\`). No Firebase Storage required for daily operations.
+                Your system reads and writes directly to local SQLite database and local disk files (`E:\SHRM_HRIS\Database.db`). No cloud database required for daily operations.
               </p>
               <div className="space-y-2">
                 <Button 
                   onClick={async () => {
                     const res = await fetch('/api/local/backup', { method: 'POST' }).then(r => r.json());
-                    toast.success(res.message || 'Local backup saved to D:\\SHRM-HRIS\\backups\\');
+                    toast.success(res.message || 'Local backup saved to E:\\SHRM_HRIS\\backups\\');
                   }}
                   variant="outline"
                   className="w-full text-xs border-slate-700 text-slate-200 hover:bg-slate-800 justify-center gap-2"
@@ -550,6 +581,185 @@ export function SettingsPage() {
            </Card>
         </div>
       </div>
+
+      {showDiagModal && diagData && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <Card className="max-w-2xl w-full p-6 my-8 animate-in zoom-in-95 duration-200 space-y-5">
+            <div className="flex items-start justify-between border-b border-slate-100 dark:border-slate-800 pb-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Activity className="text-indigo-600" size={20} />
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                    Real Backend Local Diagnostic Report
+                  </h3>
+                </div>
+                <p className="text-xs text-slate-500 mt-1 font-mono">
+                  GET /api/local/diagnostics • Tested at {new Date(diagData.timestamp).toLocaleTimeString()}
+                </p>
+              </div>
+              <button 
+                onClick={() => setShowDiagModal(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-lg"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Accessibility Status Banner */}
+            <div className={cn(
+              "p-4 rounded-xl border flex gap-3 items-start",
+              diagData.runtime?.platform === 'win32'
+                ? "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900/50 text-emerald-900 dark:text-emerald-300"
+                : "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-900/50 text-amber-900 dark:text-amber-300"
+            )}>
+              <Info className="shrink-0 mt-0.5" size={20} />
+              <div className="space-y-1 min-w-0 flex-1">
+                <span className="text-xs font-black uppercase tracking-wider block">
+                  {diagData.accessibilityStatus}
+                </span>
+                <p className="text-xs leading-relaxed">
+                  {diagData.summaryNote}
+                </p>
+              </div>
+            </div>
+
+            {/* 15 Point Diagnostic Grid */}
+            <div className="space-y-4 text-xs">
+              {/* Runtime Environment */}
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-2">
+                <h4 className="font-bold text-slate-700 dark:text-slate-300 flex items-center gap-2 uppercase tracking-wider text-[10px]">
+                  <Server size={14} className="text-indigo-500" />
+                  1. Runtime & OS Environment
+                </h4>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
+                  <div>
+                    <span className="text-slate-400 block">Current Operating System:</span>
+                    <span className="font-bold text-slate-800 dark:text-slate-200">{diagData.runtime?.platform} ({diagData.runtime?.arch})</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Node.js Version:</span>
+                    <span className="font-bold text-slate-800 dark:text-slate-200">{diagData.runtime?.nodeVersion}</span>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-slate-400 block">Environment Classification:</span>
+                    <span className="font-bold text-indigo-600 dark:text-indigo-400">{diagData.runtime?.runtimeLabel}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Paths & File System */}
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-2">
+                <h4 className="font-bold text-slate-700 dark:text-slate-300 flex items-center gap-2 uppercase tracking-wider text-[10px]">
+                  <HardDrive size={14} className="text-emerald-500" />
+                  2. Database Paths & File Checks
+                </h4>
+                <div className="space-y-1.5 text-[11px] font-mono">
+                  <div>
+                    <span className="text-slate-400 block">Target Configured Path:</span>
+                    <span className="font-bold text-slate-800 dark:text-slate-200">{diagData.paths?.configuredDatabasePath}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Active Runtime Physical Database Path:</span>
+                    <span className="font-bold text-indigo-600 dark:text-indigo-400">{diagData.paths?.actualDatabasePath}</span>
+                  </div>
+                  <div className="flex justify-between items-center pt-1 border-t border-slate-200/50 dark:border-slate-700/50">
+                    <span className="text-slate-500">Root Directory Exists:</span>
+                    <Badge variant={diagData.paths?.rootDirectoryExists ? "success" : "danger"}>
+                      {diagData.paths?.rootDirectoryExists ? "EXISTS" : "MISSING"}
+                    </Badge>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">Database File Exists:</span>
+                    <Badge variant={diagData.paths?.databaseFileExists ? "success" : "danger"}>
+                      {diagData.paths?.databaseFileExists ? "EXISTS" : "NOT FOUND"}
+                    </Badge>
+                  </div>
+                  {diagData.databaseFile?.exists && (
+                    <>
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500">Database Size:</span>
+                        <span className="font-bold text-slate-800 dark:text-slate-200">{diagData.databaseFile?.sizeFormatted}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-slate-500">Last Modified:</span>
+                        <span className="font-bold text-slate-800 dark:text-slate-200">{new Date(diagData.databaseFile?.lastModified).toLocaleString()}</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* SQLite Tests */}
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-2">
+                <h4 className="font-bold text-slate-700 dark:text-slate-300 flex items-center gap-2 uppercase tracking-wider text-[10px]">
+                  <Database size={14} className="text-indigo-500" />
+                  3. SQLite Engine & Query Tests
+                </h4>
+                <div className="space-y-2 text-[11px]">
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500 font-mono">SQLite Connection:</span>
+                    <span className="font-bold text-emerald-600 dark:text-emerald-400">{diagData.sqliteTests?.connection}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500 font-mono">SELECT Read Test (Count: {diagData.sqliteTests?.readTest?.employeeCount}):</span>
+                    <Badge variant={diagData.sqliteTests?.readTest?.passed ? "success" : "danger"}>
+                      {diagData.sqliteTests?.readTest?.passed ? `PASSED (${diagData.sqliteTests?.readTest?.latencyMs}ms)` : "FAILED"}
+                    </Badge>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500 font-mono">INSERT/VERIFY/DELETE Write Test:</span>
+                    <Badge variant={diagData.sqliteTests?.writeTest?.passed ? "success" : "danger"}>
+                      {diagData.sqliteTests?.writeTest?.passed ? `PASSED (${diagData.sqliteTests?.writeTest?.latencyMs}ms)` : "FAILED"}
+                    </Badge>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500 font-mono">BEGIN/COMMIT Transaction Test:</span>
+                    <Badge variant={diagData.sqliteTests?.transactionTest?.passed ? "success" : "danger"}>
+                      {diagData.sqliteTests?.transactionTest?.passed ? `PASSED (${diagData.sqliteTests?.transactionTest?.latencyMs}ms)` : "FAILED"}
+                    </Badge>
+                  </div>
+                </div>
+              </div>
+
+              {/* Document Storage File I/O */}
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-2">
+                <h4 className="font-bold text-slate-700 dark:text-slate-300 flex items-center gap-2 uppercase tracking-wider text-[10px]">
+                  <FileCheck size={14} className="text-amber-500" />
+                  4. Local Document Disk Storage
+                </h4>
+                <div className="space-y-1.5 text-[11px] font-mono">
+                  <div>
+                    <span className="text-slate-400 block">Documents Folder Path:</span>
+                    <span className="font-bold text-slate-800 dark:text-slate-200">{diagData.paths?.documentsDirectoryPath}</span>
+                  </div>
+                  <div className="flex justify-between items-center pt-1 border-t border-slate-200/50 dark:border-slate-700/50">
+                    <span className="text-slate-500">Folder Exists:</span>
+                    <Badge variant={diagData.paths?.documentsDirectoryExists ? "success" : "danger"}>
+                      {diagData.paths?.documentsDirectoryExists ? "EXISTS" : "MISSING"}
+                    </Badge>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500">Create/Read/Delete Temp File Test:</span>
+                    <Badge variant={diagData.fileIoTest?.passed ? "success" : "danger"}>
+                      {diagData.fileIoTest?.passed ? "PASSED" : "FAILED"}
+                    </Badge>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-between items-center pt-3 border-t border-slate-100 dark:border-slate-800">
+              <span className="text-[10px] text-slate-400 font-mono">
+                Diagnostic Time: {diagData.totalDiagnosticTimeMs}ms
+              </span>
+              <Button onClick={() => setShowDiagModal(false)}>
+                Close Diagnostic
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
+
 
       {isConfirmingPurge && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">

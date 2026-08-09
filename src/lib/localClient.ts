@@ -138,3 +138,12 @@ export async function migrateFirestoreToLocal(snapshot: any) {
   if (!res.ok) throw new Error('Migration failed');
   return await res.json();
 }
+
+export async function runPersistenceTest() {
+  const res = await fetch('/api/local/persistence-test', { method: 'POST' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ persistenceStatus: 'FAILED', error: 'Request failed' }));
+    return err;
+  }
+  return await res.json();
+}

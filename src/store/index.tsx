@@ -151,22 +151,45 @@ const defaultSettings: Settings = {
   payrollConfig: DEFAULT_PAYROLL_CONFIG
 };
 
+function loadCache<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(`hris_cache_${key}`);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) ? parsed.length > 0 : parsed && Object.keys(parsed).length > 0) {
+        return parsed;
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+  return fallback;
+}
+
+function saveCache<T>(key: string, data: T) {
+  try {
+    localStorage.setItem(`hris_cache_${key}`, JSON.stringify(data));
+  } catch (e) {
+    // ignore
+  }
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [employees, setEmployeesState] = useState<Employee[]>([]);
-  const [punches, setPunchesState] = useState<RawPunch[]>([]);
-  const [settings, setSettingsState] = useState<Settings>(defaultSettings);
-  const [shiftAssignments, setShiftAssignmentsState] = useState<ShiftAssignment[]>([]);
-  const [assignmentLogs, setAssignmentLogsState] = useState<AssignmentLog[]>([]);
-  const [exceptions, setExceptionsState] = useState<AttendanceException[]>([]);
-  const [auditLogs, setAuditLogsState] = useState<AuditLog[]>([]);
-  const [overtimeRecords, setOvertimeRecordsState] = useState<OvertimeRecord[]>([]);
-  const [sblRecords, setSblRecordsState] = useState<SBLRecord[]>([]);
-  const [forceAttendanceRecords, setForceAttendanceRecordsState] = useState<ForceAttendanceRecord[]>([]);
-  const [payrollRuns, setPayrollRunsState] = useState<PayrollRun[]>([]);
-  const [zkDevices, setZkDevicesState] = useState<ZkDevice[]>([]);
-  const [zkUserMappings, setZkUserMappingsState] = useState<ZkUserMapping[]>([]);
-  const [zkSyncLogs, setZkSyncLogsState] = useState<ZkSyncLog[]>([]);
-  const [zkUnmappedPunches, setZkUnmappedPunchesState] = useState<ZkUnmappedPunch[]>([]);
+  const [employees, setEmployeesState] = useState<Employee[]>(() => loadCache('employees', []));
+  const [punches, setPunchesState] = useState<RawPunch[]>(() => loadCache('punches', []));
+  const [settings, setSettingsState] = useState<Settings>(() => loadCache('settings', defaultSettings));
+  const [shiftAssignments, setShiftAssignmentsState] = useState<ShiftAssignment[]>(() => loadCache('shift_assignments', []));
+  const [assignmentLogs, setAssignmentLogsState] = useState<AssignmentLog[]>(() => loadCache('assignment_logs', []));
+  const [exceptions, setExceptionsState] = useState<AttendanceException[]>(() => loadCache('exceptions', []));
+  const [auditLogs, setAuditLogsState] = useState<AuditLog[]>(() => loadCache('audit_logs', []));
+  const [overtimeRecords, setOvertimeRecordsState] = useState<OvertimeRecord[]>(() => loadCache('overtime', []));
+  const [sblRecords, setSblRecordsState] = useState<SBLRecord[]>(() => loadCache('sbl', []));
+  const [forceAttendanceRecords, setForceAttendanceRecordsState] = useState<ForceAttendanceRecord[]>(() => loadCache('force_attendance', []));
+  const [payrollRuns, setPayrollRunsState] = useState<PayrollRun[]>(() => loadCache('payroll_runs', []));
+  const [zkDevices, setZkDevicesState] = useState<ZkDevice[]>(() => loadCache('zk_devices', []));
+  const [zkUserMappings, setZkUserMappingsState] = useState<ZkUserMapping[]>(() => loadCache('zk_user_mappings', []));
+  const [zkSyncLogs, setZkSyncLogsState] = useState<ZkSyncLog[]>(() => loadCache('zk_sync_logs', []));
+  const [zkUnmappedPunches, setZkUnmappedPunchesState] = useState<ZkUnmappedPunch[]>(() => loadCache('zk_unmapped_punches', []));
   const [calculationSource, setCalculationSource] = useState<'all' | 'standard' | 'multi-time'>('all');
   const [user, setUser] = useState<any>(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -267,30 +290,33 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return processPunches(filteredPunches, employees, settings, shiftAssignments);
   }, [punches, employees, settings, shiftAssignments, calculationSource]);
 
-  // Sync Data from Firestore
+  // Sync Data from Local SQLite + optional Firestore
   useEffect(() => {
-    if (!user) {
-      setIsInitializing(false);
-      return;
-    }
-
     let unsubs: (() => void)[] = [];
     let active = true;
 
     const startSync = async () => {
       try {
-        console.log("Initializing local SQLite + shared Firestore sync for user:", user.email);
+        console.log("Initializing local SQLite database (E:\\SHRM_HRIS\\Database.db)...");
         setIsInitializing(true);
 
-        // 1. First, load local SQLite records immediately for instant offline reactivity
+        // 1. Load local SQLite records immediately for instant offline reactivity with localStorage fallbacks
         try {
           const localEmps = await fetchLocalTable<Employee>('employees');
           if (localEmps && localEmps.length > 0) {
             setEmployeesState(prev => {
               const eMap = new Map(prev.map(e => [e.id, e]));
               localEmps.forEach(e => eMap.set(e.id, e));
-              return Array.from(eMap.values());
+              const merged = Array.from(eMap.values());
+              saveCache('employees', merged);
+              return merged;
             });
+          } else {
+            const cached = loadCache<Employee[]>('employees', []);
+            if (cached.length > 0) {
+              setEmployeesState(cached);
+              saveLocalTable('employees', cached);
+            }
           }
 
           const localPunches = await fetchLocalTable<RawPunch>('punches');
@@ -298,97 +324,286 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             setPunchesState(prev => {
               const pMap = new Map(prev.map(p => [p.id, p]));
               localPunches.forEach(p => pMap.set(p.id, p));
-              return Array.from(pMap.values());
+              const merged = Array.from(pMap.values());
+              saveCache('punches', merged);
+              return merged;
             });
+          } else {
+            const cached = loadCache<RawPunch[]>('punches', []);
+            if (cached.length > 0) {
+              setPunchesState(cached);
+              saveLocalTable('punches', cached);
+            }
           }
 
           const localSettings = await fetchLocalTable<Settings>('settings');
           if (localSettings && localSettings.length > 0) {
             setSettingsState(localSettings[0]);
+            saveCache('settings', localSettings[0]);
+          } else {
+            const cached = loadCache<Settings>('settings', defaultSettings);
+            if (cached) {
+              setSettingsState(cached);
+              saveLocalTable('settings', [cached]);
+            }
+          }
+
+          const localShifts = await fetchLocalTable<ShiftAssignment>('shift_assignments');
+          if (localShifts && localShifts.length > 0) {
+            setShiftAssignmentsState(localShifts);
+            saveCache('shift_assignments', localShifts);
+          } else {
+            const cached = loadCache<ShiftAssignment[]>('shift_assignments', []);
+            if (cached.length > 0) {
+              setShiftAssignmentsState(cached);
+              saveLocalTable('shift_assignments', cached);
+            }
+          }
+
+          const localDevs = await fetchLocalTable<ZkDevice>('zk_devices');
+          if (localDevs && localDevs.length > 0) {
+            setZkDevicesState(localDevs);
+            saveCache('zk_devices', localDevs);
+          } else {
+            const cached = loadCache<ZkDevice[]>('zk_devices', []);
+            if (cached.length > 0) {
+              setZkDevicesState(cached);
+              saveLocalTable('zk_devices', cached);
+            }
+          }
+
+          const localSbl = await fetchLocalTable<SBLRecord>('sbl');
+          if (localSbl && localSbl.length > 0) {
+            setSblRecordsState(localSbl);
+            saveCache('sbl', localSbl);
+          } else {
+            const cached = loadCache<SBLRecord[]>('sbl', []);
+            if (cached.length > 0) {
+              setSblRecordsState(cached);
+              saveLocalTable('sbl', cached);
+            }
+          }
+
+          const localOt = await fetchLocalTable<OvertimeRecord>('overtime');
+          if (localOt && localOt.length > 0) {
+            setOvertimeRecordsState(localOt);
+            saveCache('overtime', localOt);
+          } else {
+            const cached = loadCache<OvertimeRecord[]>('overtime', []);
+            if (cached.length > 0) {
+              setOvertimeRecordsState(cached);
+              saveLocalTable('overtime', cached);
+            }
+          }
+
+          const localForce = await fetchLocalTable<ForceAttendanceRecord>('force_attendance');
+          if (localForce && localForce.length > 0) {
+            setForceAttendanceRecordsState(localForce);
+            saveCache('force_attendance', localForce);
+          } else {
+            const cached = loadCache<ForceAttendanceRecord[]>('force_attendance', []);
+            if (cached.length > 0) {
+              setForceAttendanceRecordsState(cached);
+              saveLocalTable('force_attendance', cached);
+            }
+          }
+
+          const localPayroll = await fetchLocalTable<PayrollRun>('payroll_runs');
+          if (localPayroll && localPayroll.length > 0) {
+            setPayrollRunsState(localPayroll);
+            saveCache('payroll_runs', localPayroll);
+          } else {
+            const cached = loadCache<PayrollRun[]>('payroll_runs', []);
+            if (cached.length > 0) {
+              setPayrollRunsState(cached);
+              saveLocalTable('payroll_runs', cached);
+            }
           }
         } catch (localErr) {
           console.warn('Initial local SQLite load note:', localErr);
+        } finally {
+          if (active) setIsInitializing(false);
         }
         
-        if (!active) return;
+        if (!active || !user) return;
 
         unsubs.push(
           onSnapshot(query(collection(db, 'punches'), limit(10000)), 
-            (s) => setPunchesState(prev => {
-              const fresh = s.docs.map(d => d.data() as RawPunch);
-              const map = new Map(fresh.map(p => [p.id, p]));
-              let hasNewLocal = false;
-              prev.forEach(p => {
-                if (!map.has(p.id)) {
-                  map.set(p.id, p);
-                  hasNewLocal = true;
-                }
+            (s) => {
+              if (s.empty) return;
+              setPunchesState(prev => {
+                const fresh = s.docs.map(d => d.data() as RawPunch);
+                const map = new Map(fresh.map(p => [p.id, p]));
+                let hasNewLocal = false;
+                prev.forEach(p => {
+                  if (!map.has(p.id)) {
+                    map.set(p.id, p);
+                    hasNewLocal = true;
+                  }
+                });
+                const result = Array.from(map.values());
+                saveCache('punches', result);
+                saveLocalTable('punches', result);
+                return result;
               });
-              const result = Array.from(map.values());
-              if (!hasNewLocal && result.length === prev.length) {
-                return prev;
-              }
-              return result;
-            }),
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'punches')
           ),
           onSnapshot(collection(db, 'employees'), 
-            (s) => setEmployeesState(s.docs.map(d => d.data() as Employee)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as Employee);
+              setEmployeesState(prev => {
+                const map = new Map(fresh.map(e => [e.id, e]));
+                prev.forEach(e => { if (!map.has(e.id)) map.set(e.id, e); });
+                const result = Array.from(map.values());
+                saveCache('employees', result);
+                saveLocalTable('employees', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'employees')
           ),
           onSnapshot(doc(db, 'settings', 'config'), 
             (s) => { 
               if (s.exists()) {
                 const data = s.data() as Settings;
-                // Migration: Fix "My Company" persistence if it exists in DB
                 if (data.companyName === "My Company" || !data.companyName) {
                   const updated = { ...data, companyName: "Contractor HRIS" };
                   setSettingsState(updated);
-                  // Don't auto-write back here to avoid quota issues, 
-                  // but the local state will at least be correct.
+                  saveCache('settings', updated);
                 } else {
                   setSettingsState(data);
+                  saveCache('settings', data);
                 }
               } 
             },
             (error) => handleFirestoreError(error, OperationType.LIST, 'settings/config')
           ),
           onSnapshot(collection(db, 'shiftAssignments'), 
-            (s) => setShiftAssignmentsState(s.docs.map(d => d.data() as ShiftAssignment)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as ShiftAssignment);
+              setShiftAssignmentsState(prev => {
+                const map = new Map(fresh.map(a => [`${a.employeeId}_${a.date}`, a]));
+                prev.forEach(a => {
+                  const k = `${a.employeeId}_${a.date}`;
+                  if (!map.has(k)) map.set(k, a);
+                });
+                const result = Array.from(map.values());
+                saveCache('shift_assignments', result);
+                saveLocalTable('shift_assignments', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'shiftAssignments')
           ),
           onSnapshot(query(collection(db, 'assignmentLogs'), limit(100)), 
-            (s) => setAssignmentLogsState(s.docs.map(d => d.data() as AssignmentLog)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as AssignmentLog);
+              setAssignmentLogsState(prev => {
+                const map = new Map(fresh.map(l => [l.id, l]));
+                prev.forEach(l => { if (!map.has(l.id)) map.set(l.id, l); });
+                const result = Array.from(map.values());
+                saveCache('assignment_logs', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'assignmentLogs')
           ),
           onSnapshot(collection(db, 'exceptions'), 
-            (s) => setExceptionsState(s.docs.map(d => d.data() as AttendanceException)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as AttendanceException);
+              setExceptionsState(prev => {
+                const map = new Map(fresh.map(e => [e.id, e]));
+                prev.forEach(e => { if (!map.has(e.id)) map.set(e.id, e); });
+                const result = Array.from(map.values());
+                saveCache('exceptions', result);
+                saveLocalTable('exceptions', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'exceptions')
           ),
           onSnapshot(query(collection(db, 'auditLogs'), limit(500)), 
-            (s) => setAuditLogsState(s.docs.map(d => d.data() as AuditLog)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as AuditLog);
+              setAuditLogsState(prev => {
+                const map = new Map(fresh.map(l => [l.id, l]));
+                prev.forEach(l => { if (!map.has(l.id)) map.set(l.id, l); });
+                const result = Array.from(map.values());
+                saveCache('audit_logs', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'auditLogs')
           ),
           onSnapshot(collection(db, 'overtime'), 
-            (s) => setOvertimeRecordsState(s.docs.map(d => d.data() as OvertimeRecord)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as OvertimeRecord);
+              setOvertimeRecordsState(prev => {
+                const map = new Map(fresh.map(r => [r.id, r]));
+                prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
+                const result = Array.from(map.values());
+                saveCache('overtime', result);
+                saveLocalTable('overtime', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'overtime')
           ),
           onSnapshot(collection(db, 'sbl'), 
-            (s) => setSblRecordsState(s.docs.map(d => d.data() as SBLRecord)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as SBLRecord);
+              setSblRecordsState(prev => {
+                const map = new Map(fresh.map(r => [r.id, r]));
+                prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
+                const result = Array.from(map.values());
+                saveCache('sbl', result);
+                saveLocalTable('sbl', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'sbl')
           ),
           onSnapshot(collection(db, 'forceAttendance'), 
-            (s) => setForceAttendanceRecordsState(s.docs.map(d => d.data() as ForceAttendanceRecord)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as ForceAttendanceRecord);
+              setForceAttendanceRecordsState(prev => {
+                const map = new Map(fresh.map(r => [r.id, r]));
+                prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
+                const result = Array.from(map.values());
+                saveCache('force_attendance', result);
+                saveLocalTable('force_attendance', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'forceAttendance')
           ),
           onSnapshot(collection(db, 'payrollRuns'), 
-            (s) => setPayrollRunsState(s.docs.map(d => d.data() as PayrollRun)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as PayrollRun);
+              setPayrollRunsState(prev => {
+                const map = new Map(fresh.map(r => [r.id, r]));
+                prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
+                const result = Array.from(map.values());
+                saveCache('payroll_runs', result);
+                saveLocalTable('payroll_runs', result);
+                return result;
+              });
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'payrollRuns')
           ),
           onSnapshot(collection(db, 'zkDevices'), 
             (s) => {
               if (s.empty) {
-                // Seed default ZKTeco devices specified in requirements
                 const initialDevs: ZkDevice[] = [
                   {
                     id: 'dev_main_192_168_117_200',
@@ -439,7 +654,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                     autoSyncMinutes: 30
                   }
                 ];
-                setZkDevicesState(initialDevs);
+                setZkDevicesState(prev => prev.length > 0 ? prev : initialDevs);
+                saveCache('zk_devices', initialDevs);
                 if (checkQuota() && !hasAttemptedZkDeviceSeed.current) {
                   hasAttemptedZkDeviceSeed.current = true;
                   Promise.all(initialDevs.map(dev => 
@@ -449,26 +665,43 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                   )).catch(e => handleFirestoreError(e, OperationType.CREATE, 'zkDevices'));
                 }
               } else {
-                setZkDevicesState(s.docs.map(d => d.data() as ZkDevice));
+                const fresh = s.docs.map(d => d.data() as ZkDevice);
+                setZkDevicesState(fresh);
+                saveCache('zk_devices', fresh);
+                saveLocalTable('zk_devices', fresh);
               }
             },
             (error) => handleFirestoreError(error, OperationType.LIST, 'zkDevices')
           ),
           onSnapshot(collection(db, 'zkUserMappings'), 
-            (s) => setZkUserMappingsState(s.docs.map(d => d.data() as ZkUserMapping)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as ZkUserMapping);
+              setZkUserMappingsState(fresh);
+              saveCache('zk_user_mappings', fresh);
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'zkUserMappings')
           ),
           onSnapshot(query(collection(db, 'zkSyncLogs'), orderBy('timestamp', 'desc'), limit(100)), 
-            (s) => setZkSyncLogsState(s.docs.map(d => d.data() as ZkSyncLog)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as ZkSyncLog);
+              setZkSyncLogsState(fresh);
+              saveCache('zk_sync_logs', fresh);
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'zkSyncLogs')
           ),
           onSnapshot(collection(db, 'zkUnmappedPunches'), 
-            (s) => setZkUnmappedPunchesState(s.docs.map(d => d.data() as ZkUnmappedPunch)),
+            (s) => {
+              if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as ZkUnmappedPunch);
+              setZkUnmappedPunchesState(fresh);
+              saveCache('zk_unmapped_punches', fresh);
+            },
             (error) => handleFirestoreError(error, OperationType.LIST, 'zkUnmappedPunches')
           ),
         );
         
-        // Wait a very small amount of time for initial snapshot or local cache to resolve
         await new Promise(resolve => setTimeout(resolve, 300));
       } catch (e) {
         console.error("Initialization error:", e);
@@ -480,18 +713,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
-    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
-      if (user) {
-        startSync();
-      } else {
-        setEmployeesState([]);
-        setPunchesState([]);
-        setShiftAssignmentsState([]);
-        setAssignmentLogsState([]);
-        setIsInitializing(false);
-        unsubs.forEach(u => u());
-        unsubs = [];
-      }
+    const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      startSync();
     });
 
     return () => {
@@ -741,7 +965,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setEmployeesState(prev => {
       const eMap = new Map(prev.map(e => [e.id, e]));
       data.forEach(e => eMap.set(e.id, e));
-      return Array.from(eMap.values());
+      const res = Array.from(eMap.values());
+      saveCache('employees', res);
+      return res;
     });
 
     // Save to local SQLite database asynchronously
@@ -785,7 +1011,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setPunchesState(prev => {
       const pMap = new Map(prev.map(p => [p.id, p]));
       data.forEach(p => pMap.set(p.id, p));
-      return Array.from(pMap.values());
+      const res = Array.from(pMap.values());
+      saveCache('punches', res);
+      return res;
     });
 
     // Immediate non-blocking local SQLite persistence
@@ -838,6 +1066,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const setSettings = useCallback(async (data: Settings) => {
     setSettingsState(data);
+    saveCache('settings', data);
+    saveLocalTable('settings', [data]);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'settings', 'config'), data);
@@ -848,11 +1078,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const setShiftAssignments = useCallback(async (data: ShiftAssignment[]) => {
-    setShiftAssignmentsState(prev => {
-      const aMap = new Map(prev.map(a => [`${a.employeeId}_${a.date}`, a]));
-      data.forEach(a => aMap.set(`${a.employeeId}_${a.date}`, a));
-      return Array.from(aMap.values());
-    });
+    setShiftAssignmentsState(data);
+    saveCache('shift_assignments', data);
+    saveLocalTable('shift_assignments', data);
     if (checkQuota()) {
       try {
         const existingMap = new Map(shiftAssignments.map(a => [`${a.employeeId}_${a.date}`, a]));
@@ -919,6 +1147,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       timestamp: new Date().toISOString()
     };
     setAuditLogsState(prev => [newLog, ...prev]);
+    saveLocalTable('audit_logs', [newLog]);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'auditLogs', newLog.id), newLog);
@@ -929,7 +1158,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const updateException = useCallback(async (id: string, data: Partial<AttendanceException>) => {
-    setExceptionsState(prev => prev.map(ex => ex.id === id ? { ...ex, ...data } : ex));
+    setExceptionsState(prev => {
+      const updated = prev.map(ex => ex.id === id ? { ...ex, ...data } : ex);
+      const target = updated.find(ex => ex.id === id);
+      if (target) saveLocalTable('exceptions', [target]);
+      return updated;
+    });
     if (checkQuota()) {
       try {
         const existing = exceptions.find(ex => ex.id === id);
@@ -944,6 +1178,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const setExceptionsBatch = useCallback(async (data: AttendanceException[]) => {
     setExceptionsState(data);
+    saveLocalTable('exceptions', data);
     if (checkQuota()) {
       try {
         const batch = writeBatch(db);
@@ -958,7 +1193,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const updateOvertime = useCallback(async (id: string, data: Partial<OvertimeRecord>) => {
-    setOvertimeRecordsState(prev => prev.map(r => r.id === id ? { ...r, ...data } : r));
+    setOvertimeRecordsState(prev => {
+      const updated = prev.map(r => r.id === id ? { ...r, ...data } : r);
+      const target = updated.find(r => r.id === id);
+      if (target) saveLocalTable('overtime', [target]);
+      return updated;
+    });
     if (checkQuota()) {
       try {
         const existing = overtimeRecords.find(r => r.id === id);
@@ -975,6 +1215,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const id = `ot_${Math.random().toString(36).substr(2, 9)}`;
     const newRecord = { ...data, id };
     setOvertimeRecordsState(prev => [newRecord, ...prev]);
+    saveLocalTable('overtime', [newRecord]);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'overtime', id), newRecord);
@@ -985,7 +1226,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const updateSBL = useCallback(async (id: string, data: Partial<SBLRecord>) => {
-    setSblRecordsState(prev => prev.map(r => r.id === id ? { ...r, ...data } : r));
+    setSblRecordsState(prev => {
+      const updated = prev.map(r => r.id === id ? { ...r, ...data } : r);
+      const target = updated.find(r => r.id === id);
+      if (target) saveLocalTable('sbl', [target]);
+      return updated;
+    });
     if (checkQuota()) {
       try {
         const existing = sblRecords.find(r => r.id === id);
@@ -1002,6 +1248,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const id = `sbl_${Math.random().toString(36).substr(2, 9)}`;
     const newRecord = { ...data, id };
     setSblRecordsState(prev => [newRecord, ...prev]);
+    saveLocalTable('sbl', [newRecord]);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'sbl', id), newRecord);
@@ -1013,6 +1260,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteOvertime = useCallback(async (id: string) => {
     setOvertimeRecordsState(prev => prev.filter(r => r.id !== id));
+    deleteLocalTableRecords('overtime', [id]);
     if (checkQuota()) {
       try {
         await deleteDoc(doc(db, 'overtime', id));
@@ -1024,6 +1272,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteSBL = useCallback(async (id: string) => {
     setSblRecordsState(prev => prev.filter(r => r.id !== id));
+    deleteLocalTableRecords('sbl', [id]);
     if (checkQuota()) {
       try {
         await deleteDoc(doc(db, 'sbl', id));
@@ -1038,6 +1287,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const timestamp = new Date().toISOString();
     const newRecord = { ...data, id, timestamp };
     setForceAttendanceRecordsState(prev => [newRecord, ...prev.filter(r => r.id !== id)]);
+    saveLocalTable('force_attendance', [newRecord]);
 
     const emp = employees.find(e => e.id === data.employeeId);
 
@@ -1071,6 +1321,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const activeConfig = settings.payrollConfig || DEFAULT_PAYROLL_CONFIG;
     const run = generatePayrollRun(month, employees, processedData, overtimeRecords, createdBy, bsMonthDetails, activeConfig);
     setPayrollRunsState(prev => [run, ...prev.filter(r => r.id !== run.id)]);
+    saveLocalTable('payroll_runs', [run]);
 
     if (checkQuota()) {
       try {
@@ -1107,6 +1358,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
 
     setPayrollRunsState(prev => prev.map(r => r.id === runId ? updatedRun : r));
+    saveLocalTable('payroll_runs', [updatedRun]);
 
     if (checkQuota()) {
       try {
@@ -1129,6 +1381,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
 
     setPayrollRunsState(prev => prev.map(r => r.id === runId ? updatedRun : r));
+    saveLocalTable('payroll_runs', [updatedRun]);
 
     addAuditLog({
       employeeId: 'PAYROLL',
@@ -1173,6 +1426,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
 
     setPayrollRunsState(prev => prev.map(r => r.id === runId ? updatedRun : r));
+    saveLocalTable('payroll_runs', [updatedRun]);
 
     addAuditLog({
       employeeId: 'PAYROLL',

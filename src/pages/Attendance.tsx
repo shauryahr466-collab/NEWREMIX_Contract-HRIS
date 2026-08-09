@@ -474,6 +474,42 @@ function AttendanceReconciliation() {
     setAssignmentModal({ ...assignmentModal, isOpen: false });
   };
 
+  const handleDirectShiftChange = async (empId: string, date: string, shiftId: string) => {
+    if (quotaExceeded) return;
+    const existingIndex = shiftAssignments.findIndex(
+      s => s.employeeId === empId && s.date === date
+    );
+
+    let nextAssignments = [...shiftAssignments];
+    const action = existingIndex > -1 ? (shiftId ? 'Updated' : 'Removed') : 'Assigned';
+
+    if (existingIndex > -1) {
+      if (shiftId) {
+        nextAssignments[existingIndex] = { ...nextAssignments[existingIndex], shiftId };
+      } else {
+        nextAssignments.splice(existingIndex, 1);
+      }
+    } else if (shiftId) {
+      nextAssignments.push({
+        employeeId: empId,
+        date,
+        shiftId
+      });
+    }
+
+    const shiftObj = settings.shifts?.find(s => s.id === shiftId);
+    const empObj = employees.find(e => e.id === empId);
+
+    await setShiftAssignments(nextAssignments);
+    await addAssignmentLog(empId, date, shiftId, action as any);
+
+    toast.success(
+      shiftId 
+        ? `Shift updated to "${shiftObj?.name}" for ${empObj?.name || empId} on ${date}`
+        : `Shift reset to default for ${empObj?.name || empId} on ${date}`
+    );
+  };
+
   // Optimizing lookups for the filtering process
   const empMap = useMemo(() => new Map(employees.map(e => [e.id, e])), [employees]);
   const shiftMap = useMemo(() => new Map(settings.shifts?.map(s => [s.id, s]) || []), [settings.shifts]);
@@ -593,28 +629,37 @@ function AttendanceReconciliation() {
               {isRefreshing ? 'Calculating...' : 'Recalculate'}
             </Button>
             
+            <Button 
+              onClick={() => {
+                if (quotaExceeded) return;
+                if (selectedEmployees.length === 0) {
+                  setSelectedEmployees(uniqueEmployeesInFilter);
+                }
+                setBulkModal({
+                  isOpen: true,
+                  step: 1,
+                  shiftId: '',
+                  startDate: startDate,
+                  endDate: endDate
+                });
+              }}
+              disabled={quotaExceeded}
+              variant="outline"
+              size="sm"
+              className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800 font-bold hover:bg-indigo-100"
+            >
+              <UserPlus size={14} className="mr-1" /> Bulk Shift Assign {selectedEmployees.length > 0 ? `(${selectedEmployees.length})` : `(${uniqueEmployeesInFilter.length})`}
+            </Button>
+
             {selectedEmployees.length > 0 && (
-              <div className="flex items-center gap-2">
-                <Button 
-                  onClick={() => {
-                    if (quotaExceeded) return;
-                    setBulkModal({ ...bulkModal, isOpen: true });
-                  }}
-                  disabled={quotaExceeded}
-                  variant="outline"
-                  size="sm"
-                >
-                  <UserPlus size={14} /> Bulk Assign ({selectedEmployees.length})
-                </Button>
-                <Button 
-                  onClick={handleDeleteSelectedRecords}
-                  disabled={quotaExceeded}
-                  variant="danger"
-                  size="sm"
-                >
-                  <Trash2 size={14} /> Delete Records
-                </Button>
-              </div>
+              <Button 
+                onClick={handleDeleteSelectedRecords}
+                disabled={quotaExceeded}
+                variant="danger"
+                size="sm"
+              >
+                <Trash2 size={14} /> Delete Records ({selectedEmployees.length})
+              </Button>
             )}
             
             <Button variant="outline" onClick={handlePrint} className="hidden sm:flex">
@@ -884,7 +929,31 @@ function AttendanceReconciliation() {
                     </td>
                     <td className="px-4 py-2.5 text-slate-500 truncate max-w-[120px]">{emp?.department || '-'}</td>
                     <td className="px-6 py-2.5">
-                      <Badge variant="muted" className="text-[10px] font-semibold">{shift?.name || '-'}</Badge>
+                      <div className="flex items-center gap-1.5">
+                        <select
+                          value={assignment?.shiftId || ''}
+                          onChange={(e) => handleDirectShiftChange(d.employeeId, d.date, e.target.value)}
+                          className={cn(
+                            "text-[11px] font-bold py-1 px-2.5 rounded-lg border transition-all cursor-pointer shadow-2xs focus:ring-2 focus:ring-indigo-500 focus:outline-hidden",
+                            assignment?.shiftId 
+                              ? "bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-300 dark:border-indigo-700 font-extrabold" 
+                              : "bg-slate-100/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400"
+                          )}
+                          title={`Current Shift: ${shift?.name || 'Default'}. Click to change shift for this date.`}
+                        >
+                          <option value="" className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200">
+                            {shift?.name ? `${shift.name} (Default)` : 'Default Shift'}
+                          </option>
+                          {settings.shifts?.map(s => (
+                            <option key={s.id} value={s.id} className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200">
+                              {s.name} ({s.startTime}-{s.endTime})
+                            </option>
+                          ))}
+                        </select>
+                        {assignment?.shiftId && (
+                          <span className="w-2 h-2 rounded-full bg-indigo-600 dark:bg-indigo-400 animate-pulse shrink-0" title="Custom shift override assigned for this date" />
+                        )}
+                      </div>
                     </td>
                     <td className="px-6 py-2.5 font-mono text-[12px]">
                       {d.firstPunch ? (

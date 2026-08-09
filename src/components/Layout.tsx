@@ -7,6 +7,7 @@ import { useZkSync } from '../hooks/useZkSync';
 import { auth } from '../lib/firebase';
 import { signOut } from 'firebase/auth';
 import { motion, AnimatePresence } from 'motion/react';
+import { toast } from 'sonner';
 import { EmployeeDrawer } from './EmployeeDrawer';
 import { LocalModeIndicator } from './LocalModeIndicator';
 
@@ -238,7 +239,14 @@ export function Layout() {
             
             <div className="flex items-center gap-1.5">
               <HeaderButton 
-                onClick={() => recalculate()}
+                onClick={async () => {
+                  try {
+                    await recalculate();
+                    toast.success("System data synchronized and recalculated successfully!");
+                  } catch (err) {
+                    toast.error("Failed to sync system data.");
+                  }
+                }}
                 disabled={isInitializing}
                 title="Sync Data"
               >

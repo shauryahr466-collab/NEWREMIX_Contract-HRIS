@@ -21,6 +21,8 @@ import { Reports } from './pages/Reports';
 import { Payroll } from './pages/Payroll';
 import { DeviceSetup } from './pages/DeviceSetup';
 import { SettingsPage } from './pages/Settings';
+import { SalaryAnalysisPage } from './pages/SalaryAnalysisPage';
+import { MovementAttritionPage } from './pages/MovementAttritionPage';
 import { AdminDashboard } from './pages/Admin';
 import { Login } from './pages/Login';
 import { SignUp } from './pages/SignUp';
@@ -168,6 +170,8 @@ function AppContent() {
         <Route path="/" element={<Layout />}>
           <Route index element={<Dashboard />} />
           <Route path="employees" element={<Employees />} />
+          <Route path="salary-analysis" element={<SalaryAnalysisPage />} />
+          <Route path="movement-attrition" element={<MovementAttritionPage />} />
           <Route path="devices" element={<DeviceSetup />} />
           <Route path="import" element={<Import />} />
           <Route path="attendance" element={<Attendance />} />

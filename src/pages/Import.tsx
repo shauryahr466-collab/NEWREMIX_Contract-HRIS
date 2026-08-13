@@ -1,8 +1,8 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { UploadCloud, CheckCircle2, AlertCircle, Trash2, History, Database, Download, Filter, CalendarDays, ClipboardList, Loader2, Info } from 'lucide-react';
+import { UploadCloud, CheckCircle2, AlertCircle, Trash2, History, Database, Download, Filter, CalendarDays, ClipboardList, Loader2, Info, Eye, Check, X, Layers, AlertTriangle } from 'lucide-react';
 import { useAppStore } from '../store';
-import { RawPunch, ShiftAssignment, Employee } from '../types';
+import { RawPunch, ShiftAssignment, Employee, RosterBatch, RosterAssignment, ShiftAuditLog } from '../types';
 import { generateId, cn, normalizeEmployeeId } from '../lib/utils';
 import { processPunches } from '../lib/engine';
 import { useNavigate } from 'react-router-dom';
@@ -10,6 +10,7 @@ import { format, parse, parseISO } from 'date-fns';
 import { toast } from 'sonner';
 import { processRosterUpload, generateRosterTemplate } from '../lib/roster';
 import { PageHeader, Card, Button, Input, Badge } from '../components/ui';
+import { fetchLocalTable, saveLocalTable, deleteLocalTableRecords } from '../lib/localClient';
 
 export function Import() {
   const { 
@@ -32,6 +33,77 @@ export function Import() {
   const [purgeProgressMessage, setPurgeProgressMessage] = useState('');
   const [showOnlyRegistered, setShowOnlyRegistered] = useState(true);
   const navigate = useNavigate();
+
+  // Roster Template Generator State
+  const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const now = new Date();
+  const defaultStart = format(new Date(now.getFullYear(), now.getMonth(), 1), 'yyyy-MM-dd');
+  const defaultEnd = format(new Date(now.getFullYear(), now.getMonth() + 1, 0), 'yyyy-MM-dd');
+  const [templateStartDate, setTemplateStartDate] = useState(defaultStart);
+  const [templateEndDate, setTemplateEndDate] = useState(defaultEnd);
+
+  // SQLite Database Roster Batches State
+  const [rosterBatches, setRosterBatches] = useState<RosterBatch[]>([]);
+  const [isRosterLoading, setIsRosterLoading] = useState(false);
+
+  // Roster Audit Preview Modal State
+  const [rosterAuditModalOpen, setRosterAuditModalOpen] = useState(false);
+  const [rosterFilterTab, setRosterFilterTab] = useState<'all' | 'valid' | 'issues'>('all');
+  const [isRosterSaving, setIsRosterSaving] = useState(false);
+  const [rosterSaveProgress, setRosterSaveProgress] = useState('');
+  const [rosterBatchMeta, setRosterBatchMeta] = useState<{
+    fileName: string;
+    periodStart: string;
+    periodEnd: string;
+    totalDays: number;
+    totalRows: number;
+    validCount: number;
+    missingEmpCount: number;
+    unknownShiftCount: number;
+    duplicateCount: number;
+  }>({
+    fileName: '',
+    periodStart: '',
+    periodEnd: '',
+    totalDays: 0,
+    totalRows: 0,
+    validCount: 0,
+    missingEmpCount: 0,
+    unknownShiftCount: 0,
+    duplicateCount: 0
+  });
+
+  const [rosterAuditRecords, setRosterAuditRecords] = useState<Array<{
+    id: string;
+    employeeId: string;
+    employeeName: string;
+    date: string;
+    shiftCode: string;
+    shiftIn: string;
+    shiftOut: string;
+    resolvedShiftId: string;
+    status: 'valid' | 'missing_emp' | 'unknown_shift' | 'duplicate';
+    statusMessage: string;
+  }>>([]);
+
+  // Fetch Roster Batches from SQLite
+  const loadRosterBatches = async () => {
+    setIsRosterLoading(true);
+    try {
+      const batches = await fetchLocalTable<RosterBatch>('roster_batches');
+      setRosterBatches(batches.sort((a, b) => b.importedAt.localeCompare(a.importedAt)));
+    } catch (e) {
+      console.error("Error loading roster batches from SQLite:", e);
+    } finally {
+      setIsRosterLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (importType === 'roster') {
+      loadRosterBatches();
+    }
+  }, [importType]);
 
   const handleConfirmPurge = async () => {
     if (purgeConfirmationInput.trim().toUpperCase() !== 'DELETE' || isPurging) return;
@@ -77,9 +149,15 @@ export function Import() {
       XLSX.utils.book_append_sheet(wb, ws, "Raw Punches");
       XLSX.writeFile(wb, "Raw_Punch_Template.xlsx");
     } else {
-      const wb = generateRosterTemplate();
-      XLSX.writeFile(wb, "Roster_Import_Template.xlsx");
+      setTemplateModalOpen(true);
     }
+  };
+
+  const handleDownloadRosterTemplateWithDates = () => {
+    const wb = generateRosterTemplate(templateStartDate, templateEndDate, employees);
+    XLSX.writeFile(wb, `Roster_Import_Template_${templateStartDate}_to_${templateEndDate}.xlsx`);
+    toast.success("Downloaded roster import template Excel file!");
+    setTemplateModalOpen(false);
   };
 
   const sessions = useMemo(() => {
@@ -370,68 +448,139 @@ export function Import() {
           setMessage(`Successfully imported ${finalNewPunches.length} records.`);
           toast.success(`Successfully imported ${finalNewPunches.length} records.`);
         } else {
-          // Roster Import
+          // Roster Import Process
           const aoa = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
-          setMessage(`Processing horizontal matrix of ${aoa.length} rows...`);
+          setMessage(`Processing roster matrix of ${aoa.length} rows...`);
           
           const rosterRecords = await processRosterUpload(aoa);
-          setMessage(`Generated ${rosterRecords.length} normalized assignments...`);
+          if (!rosterRecords || rosterRecords.length === 0) {
+            throw new Error("No valid roster data extracted from sheet. Check sheet format.");
+          }
 
-          // Map shift codes to shift IDs if possible, or use standard mapping
-          const newAssignments: ShiftAssignment[] = rosterRecords.map(r => {
-            // Find shift in master data if possible
+          // Build Employee Lookup Maps
+          const empMapById = new Map<string, Employee>();
+          const empMapByNorm = new Map<string, Employee>();
+          employees.forEach(e => {
+            empMapById.set(e.id, e);
+            empMapById.set(e.id.toLowerCase(), e);
+            const norm = normalizeEmployeeId(e.id);
+            if (norm) empMapByNorm.set(norm, e);
+          });
+
+          // Determine Date Range
+          const dates = Array.from(new Set(rosterRecords.map(r => r.date))).sort();
+          const periodStart = dates[0] || format(new Date(), 'yyyy-MM-dd');
+          const periodEnd = dates[dates.length - 1] || periodStart;
+
+          // Standard Shift Mapping Table
+          const commonShiftNames: Record<string, string> = {
+            'A': 'A Shift (06:00 - 14:00)',
+            'B': 'B Shift (14:00 - 22:00)',
+            'C': 'C Shift (22:00 - 06:00)',
+            'D': 'Day Shift (08:00 - 20:00)',
+            'N': 'Night Shift (20:00 - 08:00)',
+            'DAY': 'Day Shift (08:00 - 20:00)',
+            'NIGHT': 'Night Shift (20:00 - 08:00)',
+            'GSD': 'GSD Shift (06:00 - 18:00)',
+            'GSN': 'GSN Shift (18:00 - 06:00)',
+            'OFFICE': 'Office Shift (10:00 - 18:00)',
+            'G': 'General Shift (09:00 - 18:00)',
+            'DO': 'Weekly Day Off',
+            'OFF': 'Weekly Day Off'
+          };
+
+          const seenKeys = new Set<string>();
+          let validCount = 0;
+          let missingEmpCount = 0;
+          let unknownShiftCount = 0;
+          let duplicateCount = 0;
+
+          const auditRecords = rosterRecords.map((r, idx) => {
+            const rawEmpId = r.employeeId.trim();
+            const normEmpId = normalizeEmployeeId(rawEmpId);
+            
+            // Resolve Employee
+            const matchedEmp = empMapById.get(rawEmpId) || empMapById.get(rawEmpId.toLowerCase()) || (normEmpId ? empMapByNorm.get(normEmpId) : undefined);
+            const empName = matchedEmp ? matchedEmp.name : (r.employeeName || 'Unknown Employee');
+
+            // Resolve Shift
+            const code = r.shiftCode.trim().toUpperCase();
             let shiftId = '';
+            let isKnownShift = false;
+
             const matchingShift = settings.shifts?.find(s => 
-              s.name.toUpperCase() === r.shiftCode || 
-              s.name.toUpperCase().includes(r.shiftCode) ||
-              s.id === r.shiftCode ||
+              s.name.toUpperCase() === code || 
+              s.name.toUpperCase().includes(code) ||
+              s.id === code ||
               (s.startTime === r.shiftIn && s.endTime === r.shiftOut)
             );
 
             if (matchingShift) {
               shiftId = matchingShift.id;
-            } else if (r.shiftCode === 'DO' || r.shiftCode === 'OFF') {
+              isKnownShift = true;
+            } else if (code === 'DO' || code === 'OFF') {
               shiftId = 'OFF';
-            } else if (r.shiftCode === 'G') {
-              // Try to find Day Shift shift
-              const dayShift = settings.shifts?.find(s => s.name.toUpperCase().includes('DAY SHIFT'));
-              shiftId = dayShift ? dayShift.id : r.shiftCode;
+              isKnownShift = true;
+            } else if (commonShiftNames[code]) {
+              shiftId = code;
+              isKnownShift = true;
+            }
+
+            // Check Duplicate
+            const key = `${matchedEmp?.id || rawEmpId}_${r.date}`;
+            const isDuplicate = seenKeys.has(key);
+            seenKeys.add(key);
+
+            // Audit Status
+            let recordStatus: 'valid' | 'missing_emp' | 'unknown_shift' | 'duplicate' = 'valid';
+            let statusMessage = 'Valid Assignment';
+
+            if (!matchedEmp) {
+              recordStatus = 'missing_emp';
+              statusMessage = `Employee ID '${rawEmpId}' not found in Employee Directory`;
+              missingEmpCount++;
+            } else if (isDuplicate) {
+              recordStatus = 'duplicate';
+              statusMessage = `Duplicate assignment for ${matchedEmp.id} on ${r.date}`;
+              duplicateCount++;
+            } else if (!isKnownShift) {
+              recordStatus = 'unknown_shift';
+              statusMessage = `Unknown shift code '${code}'`;
+              unknownShiftCount++;
             } else {
-              // Try finding by name if the code matches ShiftMaster names in screenshot
-              const commonNames: Record<string, string> = {
-                'A': 'A Shift',
-                'B': 'B Shift',
-                'C': 'C Shift',
-                'N': 'Night Shift',
-                'D': 'Day Shift',
-                'NIGHT': 'Night Shift',
-                'DAY': 'Day Shift',
-                'GSD': 'GSD Shift',
-                'GSN': 'GSN Shift',
-                'OFFICE': 'Office Shift'
-              };
-              const mappedName = commonNames[r.shiftCode] || r.shiftCode;
-              const byName = settings.shifts?.find(s => s.name.toUpperCase() === mappedName.toUpperCase());
-              shiftId = byName ? byName.id : (matchingShift ? matchingShift.id : r.shiftCode);
+              validCount++;
             }
 
             return {
-              employeeId: r.employeeId,
+              id: `audit_${idx}_${Date.now()}`,
+              employeeId: matchedEmp ? matchedEmp.id : rawEmpId,
+              employeeName: empName,
               date: r.date,
-              shiftId: shiftId
+              shiftCode: code,
+              shiftIn: r.shiftIn,
+              shiftOut: r.shiftOut,
+              resolvedShiftId: shiftId || code,
+              status: recordStatus,
+              statusMessage
             };
           });
 
-          if (newAssignments.length === 0) {
-            throw new Error("No valid roster data extracted from sheet.");
-          }
+          setRosterBatchMeta({
+            fileName: file.name,
+            periodStart,
+            periodEnd,
+            totalDays: dates.length,
+            totalRows: rosterRecords.length,
+            validCount,
+            missingEmpCount,
+            unknownShiftCount,
+            duplicateCount
+          });
 
-          setMessage(`Syncing ${newAssignments.length} roster assignments with database...`);
-          await setShiftAssignments(newAssignments);
-          
-          setStatus('success');
-          setMessage(`Successfully imported roster for ${newAssignments.length} employee-days.`);
-          toast.success(`Roster Import Complete: ${newAssignments.length} assignments updated.`);
+          setRosterAuditRecords(auditRecords);
+          setStatus('idle');
+          setMessage('');
+          setRosterAuditModalOpen(true);
         }
       } catch (err: any) {
         setStatus('error');
@@ -443,6 +592,89 @@ export function Import() {
       setMessage('Error reading file.');
     };
     reader.readAsArrayBuffer(file);
+  };
+
+  // Confirm and Save Roster Batch to SQLite Database
+  const confirmAndSaveRoster = async () => {
+    if (!file || rosterAuditRecords.length === 0 || isRosterSaving) return;
+    setIsRosterSaving(true);
+    setRosterSaveProgress('Initializing SQLite roster batch save...');
+
+    try {
+      const nowIso = new Date().toISOString();
+      const batchId = `ROSTER_${Date.now()}`;
+      
+      const validRecords = rosterAuditRecords.filter(r => r.status === 'valid' || r.status === 'unknown_shift');
+      if (validRecords.length === 0) {
+        toast.error("No valid roster records to save.");
+        setIsRosterSaving(false);
+        return;
+      }
+
+      // 1. Prepare Roster Batch Record
+      const rosterBatch: RosterBatch = {
+        id: batchId,
+        rosterName: `${file.name.replace(/\.[^/.]+$/, "")} (${rosterBatchMeta.periodStart} to ${rosterBatchMeta.periodEnd})`,
+        periodStart: rosterBatchMeta.periodStart,
+        periodEnd: rosterBatchMeta.periodEnd,
+        totalDays: rosterBatchMeta.totalDays,
+        importedAt: nowIso,
+        importedBy: 'Admin',
+        sourceFileName: file.name,
+        status: 'Active',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
+
+      // 2. Prepare Roster Assignments Records for SQLite
+      setRosterSaveProgress(`Saving ${validRecords.length} roster assignments to SQLite Database (Database.db)...`);
+      const rosterAssignments: RosterAssignment[] = validRecords.map(r => ({
+        id: `ra_${r.employeeId}_${r.date}_${batchId}`,
+        rosterBatchId: batchId,
+        employeeId: r.employeeId,
+        rosterDate: r.date,
+        shiftCode: r.shiftCode,
+        shiftStart: r.shiftIn,
+        shiftEnd: r.shiftOut,
+        source: 'Imported Roster',
+        status: 'Active',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      }));
+
+      // 3. Save Batch & Assignments to SQLite Database via local API
+      await saveLocalTable('roster_batches', [rosterBatch]);
+      await saveLocalTable('roster_assignments', rosterAssignments);
+
+      // 4. Update ShiftAssignments in active Store
+      setRosterSaveProgress('Updating active shift assignments & recalculating attendance...');
+      const storeShiftAssignments: ShiftAssignment[] = validRecords.map(r => ({
+        id: `${r.employeeId}_${r.date}`,
+        employeeId: r.employeeId,
+        date: r.date,
+        shiftId: r.resolvedShiftId || r.shiftCode,
+        shiftCode: r.shiftCode,
+        source: 'Imported Roster',
+        rosterBatchId: batchId,
+        status: 'Active'
+      }));
+
+      await setShiftAssignments(storeShiftAssignments);
+
+      // 5. Reload SQLite roster batches
+      await loadRosterBatches();
+
+      toast.success(`Roster Batch Saved! ${validRecords.length} roster assignments permanently saved to SQLite database (Database.db).`);
+      setRosterAuditModalOpen(false);
+      setFile(null);
+      setStatus('success');
+      setMessage(`Successfully saved roster batch with ${validRecords.length} assignments.`);
+    } catch (e: any) {
+      toast.error(e.message || "Failed to save roster batch to SQLite.");
+    } finally {
+      setIsRosterSaving(false);
+      setRosterSaveProgress('');
+    }
   };
 
   return (
@@ -713,6 +945,77 @@ export function Import() {
               )}
             </Card>
           )}
+
+          {importType === 'roster' && (
+            <Card className="p-0 overflow-hidden">
+              <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                   <Database size={16} className="text-primary" />
+                   <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest">Roster Batches in SQLite Database</h3>
+                </div>
+                <Badge variant="info" className="text-[9px] uppercase font-bold">
+                  {rosterBatches.length} Batches Saved
+                </Badge>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="bg-slate-50/50 dark:bg-slate-900/50 border-b border-slate-100 dark:border-slate-800">
+                      <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Roster Batch Name</th>
+                      <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Period Window</th>
+                      <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-center">Days</th>
+                      <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-center">Imported At</th>
+                      <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {rosterBatches.map((b) => (
+                      <tr key={b.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-900/50">
+                        <td className="px-6 py-4">
+                          <div className="flex flex-col">
+                            <span className="text-xs font-bold text-slate-900 dark:text-white">{b.rosterName}</span>
+                            <span className="text-[10px] text-slate-400 font-mono">{b.sourceFileName || 'File Import'}</span>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4">
+                          <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">{b.periodStart} → {b.periodEnd}</span>
+                        </td>
+                        <td className="px-6 py-4 text-center">
+                          <Badge variant="muted" className="text-[10px] font-bold">{b.totalDays} Days</Badge>
+                        </td>
+                        <td className="px-6 py-4 text-center text-xs text-slate-500">
+                          {format(parseISO(b.importedAt), 'dd MMM yyyy HH:mm')}
+                        </td>
+                        <td className="px-6 py-4 text-right">
+                          <Button 
+                            variant="danger" 
+                            size="sm" 
+                            onClick={async () => {
+                              if (window.confirm(`Delete Roster Batch '${b.rosterName}' from SQLite database?`)) {
+                                await deleteLocalTableRecords('roster_batches', [b.id]);
+                                toast.success("Roster batch deleted from SQLite database.");
+                                loadRosterBatches();
+                              }
+                            }}
+                          >
+                            <Trash2 size={12} />
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                    {rosterBatches.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="py-12 text-center text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                          {isRosterLoading ? 'Loading roster batches from SQLite...' : 'No imported roster batches saved in SQLite yet'}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
         </div>
 
         <div className="lg:col-span-1 space-y-6">
@@ -723,7 +1026,7 @@ export function Import() {
             </h3>
             <div className="space-y-4">
                <div className="p-3 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-100 dark:border-slate-800">
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Total Logs</p>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Total Punch Logs</p>
                   <p className="text-2xl font-bold text-slate-900 dark:text-white">{punches.length}</p>
                </div>
                
@@ -744,25 +1047,25 @@ export function Import() {
           <Card className="p-6">
              <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest mb-6 flex items-center gap-2">
                <Info size={14} className="text-primary" />
-               Import Logic
+               Roster Persistence Flow
              </h3>
              <div className="space-y-4">
                 <div className="flex gap-3">
                    <div className="w-5 h-5 rounded bg-primary/10 text-primary flex items-center justify-center text-[10px] font-bold shrink-0">1</div>
                    <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
-                     <span className="font-bold text-slate-900 dark:text-white">Validation:</span> The system strictly validates Employee ID against the master directory.
+                     <span className="font-bold text-slate-900 dark:text-white">Excel Matrix:</span> Roster files contain date headers and employee shift rows.
                    </p>
                 </div>
                 <div className="flex gap-3">
                    <div className="w-5 h-5 rounded bg-primary/10 text-primary flex items-center justify-center text-[10px] font-bold shrink-0">2</div>
                    <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
-                     <span className="font-bold text-slate-900 dark:text-white">Deduplication:</span> Repeated imports of the same punch for the same employee are automatically ignored.
+                     <span className="font-bold text-slate-900 dark:text-white">Audit & Validation:</span> Verification highlights missing Employee IDs and shift codes before saving.
                    </p>
                 </div>
                 <div className="flex gap-3">
                    <div className="w-5 h-5 rounded bg-primary/10 text-primary flex items-center justify-center text-[10px] font-bold shrink-0">3</div>
                    <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
-                     <span className="font-bold text-slate-900 dark:text-white">Timezones:</span> All logs are processed and stored in UTC but displayed in your local browser timezone.
+                     <span className="font-bold text-slate-900 dark:text-white">SQLite Database:</span> Roster batches are permanently saved to <code className="text-primary font-mono text-[10px]">Database.db</code> for shift reconciliation & salary analytics.
                    </p>
                 </div>
              </div>
@@ -770,76 +1073,242 @@ export function Import() {
         </div>
       </div>
 
-      {isConfirmingPurge && (
+      {/* Roster Template Date Range Picker Modal */}
+      {templateModalOpen && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <Card className="max-w-md w-full p-6 animate-in zoom-in-95 duration-200">
-            <div className="flex items-center gap-3 mb-4 text-red-600">
-              <AlertCircle size={24} />
-              <h4 className="text-lg font-bold">Purge Database</h4>
+            <div className="flex items-center justify-between mb-4 border-b border-slate-100 dark:border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <CalendarDays className="text-primary" size={20} />
+                <h4 className="text-base font-bold text-slate-900 dark:text-white">Download Roster Excel Template</h4>
+              </div>
+              <button onClick={() => setTemplateModalOpen(false)} className="text-slate-400 hover:text-slate-600">
+                <X size={18} />
+              </button>
             </div>
-            <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-4">
-              You are about to wipe <span className="font-bold text-red-600 uppercase">all {punches.length} logs</span>. This action is final.
+
+            <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+              Select the period start and end dates for your roster matrix template. The generated Excel spreadsheet will pre-fill active employee IDs and dates.
             </p>
-            
-            <form onSubmit={(e) => { e.preventDefault(); handleConfirmPurge(); }}>
-              <div className="space-y-2 mb-6">
-                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest ml-1">
-                  Type <span className="text-red-600 font-bold">DELETE</span> to confirm
-                </label>
+
+            <div className="space-y-4 mb-6">
+              <div>
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-1">Template Period Start Date</label>
                 <Input 
-                  autoFocus
-                  disabled={isPurging}
-                  placeholder="Type DELETE"
-                  value={purgeConfirmationInput}
-                  onChange={(e) => setPurgeConfirmationInput(e.target.value)}
-                  className="text-center font-bold tracking-widest uppercase"
+                  type="date" 
+                  value={templateStartDate} 
+                  onChange={(e) => setTemplateStartDate(e.target.value)} 
                 />
               </div>
+              <div>
+                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-1">Template Period End Date</label>
+                <Input 
+                  type="date" 
+                  value={templateEndDate} 
+                  onChange={(e) => setTemplateEndDate(e.target.value)} 
+                />
+              </div>
+            </div>
 
-              {isPurging && (
-                <div className="mb-6 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 rounded-xl flex items-center gap-3">
-                  <Loader2 className="animate-spin text-red-600 shrink-0" size={20} />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-bold text-red-700 dark:text-red-300">
-                      Purging Database...
-                    </p>
-                    <p className="text-[11px] font-mono text-red-600 dark:text-red-400 truncate">
-                      {purgeProgressMessage || "Deleting logs in batches..."}
-                    </p>
-                  </div>
+            <div className="flex gap-3">
+              <Button variant="outline" className="flex-1" onClick={() => setTemplateModalOpen(false)}>
+                Cancel
+              </Button>
+              <Button className="flex-1 gap-2" onClick={handleDownloadRosterTemplateWithDates}>
+                <Download size={14} /> Download Template
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {/* Roster Import Verification & Audit Preview Modal */}
+      {rosterAuditModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-md z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <Card className="max-w-5xl w-full p-6 animate-in zoom-in-95 duration-200 max-h-[90vh] flex flex-col my-auto">
+            <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-4 mb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-primary/10 rounded-xl text-primary">
+                  <ClipboardList size={22} />
                 </div>
-              )}
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                    Roster Import Audit & Verification
+                  </h3>
+                  <p className="text-xs text-slate-500 font-medium">
+                    {rosterBatchMeta.fileName} • Period: <span className="font-bold text-slate-800 dark:text-slate-200">{rosterBatchMeta.periodStart} to {rosterBatchMeta.periodEnd}</span> ({rosterBatchMeta.totalDays} Days)
+                  </p>
+                </div>
+              </div>
 
-              <div className="flex gap-3">
+              <button 
+                onClick={() => setRosterAuditModalOpen(false)} 
+                disabled={isRosterSaving}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded-lg"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* Metrics Breakdown Cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+              <div className="p-3 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-100 dark:border-slate-800">
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Total Records</p>
+                <p className="text-xl font-bold text-slate-900 dark:text-white">{rosterBatchMeta.totalRows}</p>
+              </div>
+              <div className="p-3 bg-emerald-50 dark:bg-emerald-950/30 rounded-xl border border-emerald-100 dark:border-emerald-900/50">
+                <p className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 uppercase tracking-widest mb-0.5">Valid</p>
+                <p className="text-xl font-bold text-emerald-700 dark:text-emerald-300">{rosterBatchMeta.validCount}</p>
+              </div>
+              <div className="p-3 bg-red-50 dark:bg-red-950/30 rounded-xl border border-red-100 dark:border-red-900/50">
+                <p className="text-[10px] font-bold text-red-600 dark:text-red-400 uppercase tracking-widest mb-0.5">Missing Emp ID</p>
+                <p className="text-xl font-bold text-red-700 dark:text-red-300">{rosterBatchMeta.missingEmpCount}</p>
+              </div>
+              <div className="p-3 bg-amber-50 dark:bg-amber-950/30 rounded-xl border border-amber-100 dark:border-amber-900/50">
+                <p className="text-[10px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-widest mb-0.5">Unknown Shift</p>
+                <p className="text-xl font-bold text-amber-700 dark:text-amber-300">{rosterBatchMeta.unknownShiftCount}</p>
+              </div>
+              <div className="p-3 bg-indigo-50 dark:bg-indigo-950/30 rounded-xl border border-indigo-100 dark:border-indigo-900/50">
+                <p className="text-[10px] font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-widest mb-0.5">Duplicates</p>
+                <p className="text-xl font-bold text-indigo-700 dark:text-indigo-300">{rosterBatchMeta.duplicateCount}</p>
+              </div>
+            </div>
+
+            {/* Filter Tabs */}
+            <div className="flex items-center justify-between mb-4 border-b border-slate-100 dark:border-slate-800 pb-2">
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setRosterFilterTab('all')}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    rosterFilterTab === 'all' ? "bg-primary text-white" : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                  )}
+                >
+                  All Records ({rosterAuditRecords.length})
+                </button>
+                <button
+                  onClick={() => setRosterFilterTab('valid')}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    rosterFilterTab === 'valid' ? "bg-emerald-600 text-white" : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                  )}
+                >
+                  Valid Only ({rosterBatchMeta.validCount})
+                </button>
+                <button
+                  onClick={() => setRosterFilterTab('issues')}
+                  className={cn(
+                    "px-3 py-1.5 rounded-lg text-xs font-bold transition-all",
+                    rosterFilterTab === 'issues' ? "bg-red-600 text-white" : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                  )}
+                >
+                  Issues / Warnings ({rosterBatchMeta.missingEmpCount + rosterBatchMeta.unknownShiftCount + rosterBatchMeta.duplicateCount})
+                </button>
+              </div>
+            </div>
+
+            {/* Audit Data Table */}
+            <div className="overflow-y-auto flex-1 border border-slate-200 dark:border-slate-800 rounded-xl min-h-[250px] max-h-[350px]">
+              <table className="w-full text-left text-xs divide-y divide-slate-100 dark:divide-slate-800">
+                <thead className="bg-slate-50 dark:bg-slate-900 sticky top-0 font-bold text-slate-400 text-[10px] uppercase tracking-wider z-10">
+                  <tr>
+                    <th className="py-2.5 px-3">Employee</th>
+                    <th className="py-2.5 px-3">Date</th>
+                    <th className="py-2.5 px-3 text-center">Shift Code</th>
+                    <th className="py-2.5 px-3">Timing</th>
+                    <th className="py-2.5 px-3">Audit Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {rosterAuditRecords
+                    .filter(r => {
+                      if (rosterFilterTab === 'valid') return r.status === 'valid';
+                      if (rosterFilterTab === 'issues') return r.status !== 'valid';
+                      return true;
+                    })
+                    .slice(0, 200)
+                    .map((rec) => (
+                      <tr key={rec.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                        <td className="py-2 px-3">
+                          <p className="font-bold text-slate-900 dark:text-white">{rec.employeeName}</p>
+                          <p className="text-[10px] font-mono text-primary font-bold">{rec.employeeId}</p>
+                        </td>
+                        <td className="py-2 px-3 font-semibold text-slate-700 dark:text-slate-300">
+                          {rec.date}
+                        </td>
+                        <td className="py-2 px-3 text-center">
+                          <Badge variant="info" className="font-mono font-bold text-[10px]">{rec.shiftCode}</Badge>
+                        </td>
+                        <td className="py-2 px-3 text-slate-600 dark:text-slate-400 font-mono text-[11px]">
+                          {rec.shiftIn && rec.shiftOut ? `${rec.shiftIn} - ${rec.shiftOut}` : 'Off Day'}
+                        </td>
+                        <td className="py-2 px-3">
+                          <div className="flex items-center gap-1.5">
+                            <Badge 
+                              variant={
+                                rec.status === 'valid' ? 'success' :
+                                rec.status === 'missing_emp' ? 'danger' :
+                                rec.status === 'duplicate' ? 'warning' : 'muted'
+                              }
+                              className="text-[10px] font-bold"
+                            >
+                              {rec.status === 'valid' ? 'Valid' :
+                               rec.status === 'missing_emp' ? 'Missing Emp ID' :
+                               rec.status === 'duplicate' ? 'Duplicate' : 'Unknown Shift'}
+                            </Badge>
+                            <span className="text-[10px] text-slate-500 truncate max-w-[200px]" title={rec.statusMessage}>
+                              {rec.statusMessage}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Progress Bar during SQLite Saving */}
+            {isRosterSaving && (
+              <div className="mt-4 p-3 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-900/50 rounded-xl flex items-center gap-3">
+                <Loader2 size={20} className="animate-spin text-indigo-600 shrink-0" />
+                <div>
+                  <p className="text-xs font-bold text-indigo-900 dark:text-indigo-200">Saving Batch to SQLite Database...</p>
+                  <p className="text-[11px] font-mono text-indigo-700 dark:text-indigo-300">{rosterSaveProgress}</p>
+                </div>
+              </div>
+            )}
+
+            {/* Footer Action Buttons */}
+            <div className="flex items-center justify-between gap-3 mt-6 pt-4 border-t border-slate-100 dark:border-slate-800">
+              <p className="text-[11px] text-slate-500 font-medium">
+                Saving will permanently write this roster batch to <code className="text-primary font-mono">E:\SHRM_HRIS\Database.db</code>.
+              </p>
+
+              <div className="flex items-center gap-2">
                 <Button 
-                  type="button"
                   variant="outline" 
-                  className="flex-1"
-                  disabled={isPurging}
-                  onClick={() => {
-                    setIsConfirmingPurge(false);
-                    setPurgeConfirmationInput('');
-                  }}
+                  onClick={() => setRosterAuditModalOpen(false)}
+                  disabled={isRosterSaving}
                 >
                   Cancel
                 </Button>
                 <Button 
-                  type="submit"
-                  variant="danger" 
-                  className="flex-1 gap-2"
-                  disabled={purgeConfirmationInput.trim().toUpperCase() !== 'DELETE' || isPurging}
+                  onClick={confirmAndSaveRoster}
+                  disabled={isRosterSaving || (rosterBatchMeta.validCount === 0 && rosterBatchMeta.unknownShiftCount === 0)}
+                  className="gap-2 bg-primary hover:bg-primary-dark text-white shadow-lg shadow-primary/20 px-6"
                 >
-                  {isPurging ? (
+                  {isRosterSaving ? (
                     <>
-                      <Loader2 size={14} className="animate-spin" />
-                      Purging...
+                      <Loader2 size={16} className="animate-spin" /> Saving Roster...
                     </>
                   ) : (
-                    'Confirm Purge'
+                    <>
+                      <CheckCircle2 size={16} /> Save Roster to Database
+                    </>
                   )}
                 </Button>
               </div>
-            </form>
+            </div>
           </Card>
         </div>
       )}

@@ -1,12 +1,13 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
-import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch } from '../types';
+import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch, EmployeeMovement } from '../types';
+import type { FieldAttendanceRecord } from '../types/attendanceAudit';
 import { processPunches, detectExceptions } from '../lib/engine';
 import { generatePayrollRun, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
 import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../lib/firebase';
 import { logAdminOverride } from '../lib/audit';
 import { normalizeEmployeeId } from '../lib/utils';
-import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords } from '../lib/localClient';
+import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords, purgeLocalTable } from '../lib/localClient';
 import { toast } from 'sonner';
 import { 
   collection, 
@@ -54,6 +55,7 @@ interface StoreState {
   sblRecords: SBLRecord[];
   forceAttendanceRecords: ForceAttendanceRecord[];
   payrollRuns: PayrollRun[];
+  movements: EmployeeMovement[];
   zkDevices: ZkDevice[];
   zkUserMappings: ZkUserMapping[];
   zkSyncLogs: ZkSyncLog[];
@@ -103,18 +105,29 @@ interface StoreState {
   // OT, SBL, Force Attendance & Payroll
   updateOvertime: (id: string, data: Partial<OvertimeRecord>) => Promise<void>;
   addOvertime: (data: Omit<OvertimeRecord, 'id'>) => Promise<void>;
+  setOvertimeBatch: (records: OvertimeRecord[]) => Promise<void>;
+  deleteOvertimeBatch: (ids: string[]) => Promise<void>;
   updateSBL: (id: string, data: Partial<SBLRecord>) => Promise<void>;
   addSBL: (data: Omit<SBLRecord, 'id'>) => Promise<void>;
+  setSBLBatch: (records: SBLRecord[]) => Promise<void>;
+  deleteSBLBatch: (ids: string[]) => Promise<void>;
   deleteOvertime: (id: string) => Promise<void>;
   deleteSBL: (id: string) => Promise<void>;
   addForceAttendance: (data: Omit<ForceAttendanceRecord, 'id' | 'timestamp'>) => Promise<void>;
 
   // Payroll Actions
-  createPayrollRun: (month: string) => Promise<PayrollRun>;
+  createPayrollRun: (month: string, bsMonthDetails?: { bsYear: number; monthObj: any }) => Promise<PayrollRun>;
+  recalculatePayrollRun: (runId: string) => Promise<PayrollRun | null>;
   updatePayrollRecord: (runId: string, recordId: string, updates: Partial<PayrollRecord>) => Promise<void>;
   approvePayrollRun: (runId: string) => Promise<void>;
   disbursePayrollRun: (runId: string, method: DisbursementMethod) => Promise<void>;
   deletePayrollRun: (runId: string) => Promise<void>;
+
+  // Movement Actions
+  addMovement: (data: Omit<EmployeeMovement, 'id'>) => Promise<void>;
+  updateMovement: (id: string, data: Partial<EmployeeMovement>) => Promise<void>;
+  deleteMovement: (id: string) => Promise<void>;
+  setMovementsBatch: (movements: EmployeeMovement[]) => Promise<void>;
 
   // ZKTeco Device Actions
   addZkDevice: (device: Omit<ZkDevice, 'id'>) => Promise<void>;
@@ -125,6 +138,30 @@ interface StoreState {
   syncZkDevice: (deviceId: string) => Promise<{ success: boolean; recordsRead: number; newRecords: number; duplicates: number }>;
   resolveUnmappedPunches: (deviceUserId: string, employeeId: string) => Promise<void>;
   clearZkSyncLogs: () => Promise<void>;
+
+  // Field Attendance Audit State
+  fieldRecords: FieldAttendanceRecord[];
+  fieldMusterFileName: string;
+  fieldImportType: 'matrix' | 'flat' | 'sample';
+  auditDecisions: Record<string, {
+    decision: 'Accepted' | 'Rejected';
+    remarks: string;
+    auditedBy: string;
+    auditedAt: string;
+    overrideStatus?: string;
+  }>;
+  auditDateRange: { startDate: string; endDate: string };
+  setFieldRecords: (records: FieldAttendanceRecord[], fileName?: string, importType?: 'matrix' | 'flat' | 'sample') => Promise<void>;
+  saveAuditDecision: (key: string, decision: {
+    decision: 'Accepted' | 'Rejected';
+    remarks: string;
+    auditedBy: string;
+    auditedAt: string;
+    overrideStatus?: string;
+  }) => Promise<void>;
+  saveAuditDecisionsBatch: (decisionsMap: Record<string, any>) => Promise<void>;
+  clearFieldMusterData: () => Promise<void>;
+  setAuditDateRange: (range: { startDate: string; endDate: string }) => void;
 
   setCalculationSource: (source: 'all' | 'standard' | 'multi-time') => void;
   recalculate: () => Promise<void>;
@@ -186,10 +223,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [sblRecords, setSblRecordsState] = useState<SBLRecord[]>(() => loadCache('sbl', []));
   const [forceAttendanceRecords, setForceAttendanceRecordsState] = useState<ForceAttendanceRecord[]>(() => loadCache('force_attendance', []));
   const [payrollRuns, setPayrollRunsState] = useState<PayrollRun[]>(() => loadCache('payroll_runs', []));
+  const [movements, setMovementsState] = useState<EmployeeMovement[]>(() => loadCache('movements', []));
   const [zkDevices, setZkDevicesState] = useState<ZkDevice[]>(() => loadCache('zk_devices', []));
   const [zkUserMappings, setZkUserMappingsState] = useState<ZkUserMapping[]>(() => loadCache('zk_user_mappings', []));
   const [zkSyncLogs, setZkSyncLogsState] = useState<ZkSyncLog[]>(() => loadCache('zk_sync_logs', []));
   const [zkUnmappedPunches, setZkUnmappedPunchesState] = useState<ZkUnmappedPunch[]>(() => loadCache('zk_unmapped_punches', []));
+  const [fieldRecords, setFieldRecordsState] = useState<FieldAttendanceRecord[]>(() => loadCache('field_records', []));
+  const [fieldMusterFileName, setFieldMusterFileNameState] = useState<string>(() => localStorage.getItem('hris_cache_field_filename') || '');
+  const [fieldImportType, setFieldImportTypeState] = useState<'matrix' | 'flat' | 'sample'>(() => (localStorage.getItem('hris_cache_field_import_type') as any) || 'matrix');
+  const [auditDecisions, setAuditDecisionsState] = useState<Record<string, any>>(() => loadCache('audit_decisions', {}));
+  const [auditDateRange, setAuditDateRangeState] = useState<{ startDate: string; endDate: string }>(() => loadCache('audit_date_range', { startDate: '', endDate: '' }));
   const [calculationSource, setCalculationSource] = useState<'all' | 'standard' | 'multi-time'>('all');
   const [user, setUser] = useState<any>(null);
   const [isAdmin, setIsAdmin] = useState(false);
@@ -287,8 +330,82 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       ? punches 
       : punches.filter(p => !p.importFormat || p.importFormat === calculationSource || p.source === 'biometric' || p.source === 'ZKTeco');
       
-    return processPunches(filteredPunches, employees, settings, shiftAssignments);
-  }, [punches, employees, settings, shiftAssignments, calculationSource]);
+    const baseProcessed = processPunches(filteredPunches, employees, settings, shiftAssignments);
+
+    if ((!forceAttendanceRecords || forceAttendanceRecords.length === 0) && (!auditDecisions || Object.keys(auditDecisions).length === 0)) {
+      return baseProcessed;
+    }
+
+    const recordMap = new Map(baseProcessed.map(r => [`${r.employeeId}_${r.date}`, { ...r }]));
+
+    // Apply forced attendance records (Admin Reconciliation)
+    (forceAttendanceRecords || []).forEach(f => {
+      const key = `${f.employeeId}_${f.date}`;
+      const existing = recordMap.get(key);
+      const statusMap: Record<string, ProcessedAttendance['status']> = {
+        'Present': 'Present',
+        'On Time': 'On Time',
+        'Late': 'Late',
+        'Forced': 'Present',
+        'On Duty': 'Present',
+        'Regularized': 'Present',
+        'Half Day': 'Half Day',
+        'Paid Leave': 'Paid Leave',
+        'Weekly Off': 'Weekly Off',
+        'Absent': 'Absent'
+      };
+      const mappedStatus = statusMap[f.status] || 'Present';
+      if (existing) {
+        existing.status = mappedStatus;
+        if (f.inTime) existing.inTime = f.inTime;
+        if (f.outTime) existing.outTime = f.outTime;
+        if (f.reason) existing.remarks = f.reason;
+      } else {
+        const emp = employees.find(e => e.id === f.employeeId);
+        recordMap.set(key, {
+          id: key,
+          employeeId: f.employeeId,
+          employeeName: emp?.name || f.employeeId,
+          department: emp?.department || 'General',
+          date: f.date,
+          inTime: f.inTime || '09:00',
+          outTime: f.outTime || '18:00',
+          firstPunch: f.inTime ? `${f.date}T${f.inTime}:00` : null,
+          lastPunch: f.outTime ? `${f.date}T${f.outTime}:00` : null,
+          workingHours: 8,
+          overtime: 0,
+          lateMinutes: 0,
+          earlyMinutes: 0,
+          logs: [],
+          rawLogs: [],
+          workHours: 8,
+          status: mappedStatus,
+          remarks: f.reason || 'Forced Attendance via Reconciliation'
+        });
+      }
+    });
+
+    // Apply audit decisions (Fresh Attendance Audit)
+    Object.entries(auditDecisions || {}).forEach(([key, decisionObj]: [string, any]) => {
+      const existing = recordMap.get(key);
+      const dec = (decisionObj?.decision || decisionObj?.overrideStatus || '').toLowerCase();
+      if (!dec) return;
+
+      let mappedStatus: ProcessedAttendance['status'] = 'Present';
+      if (dec === 'present' || dec === 'regularized' || dec === 'on_duty' || dec === 'accepted') mappedStatus = 'Present';
+      else if (dec === 'half_day' || dec === 'half day') mappedStatus = 'Half Day';
+      else if (dec === 'leave' || dec === 'paid leave') mappedStatus = 'Paid Leave';
+      else if (dec === 'pwo') mappedStatus = 'PWO';
+      else if (dec === 'absent' || dec === 'rejected') mappedStatus = 'Absent';
+
+      if (existing) {
+        existing.status = mappedStatus;
+        if (decisionObj.remarks) existing.remarks = decisionObj.remarks;
+      }
+    });
+
+    return Array.from(recordMap.values());
+  }, [punches, employees, settings, shiftAssignments, calculationSource, forceAttendanceRecords, auditDecisions]);
 
   // Sync Data from Local SQLite + optional Firestore
   useEffect(() => {
@@ -417,6 +534,50 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             if (cached.length > 0) {
               setPayrollRunsState(cached);
               saveLocalTable('payroll_runs', cached);
+            }
+          }
+
+          const localMovements = await fetchLocalTable<EmployeeMovement>('employee_movements');
+          if (localMovements && localMovements.length > 0) {
+            setMovementsState(localMovements);
+            saveCache('movements', localMovements);
+          } else {
+            const cached = loadCache<EmployeeMovement[]>('movements', []);
+            if (cached.length > 0) {
+              setMovementsState(cached);
+              saveLocalTable('employee_movements', cached);
+            }
+          }
+
+          const localFieldRecs = await fetchLocalTable<FieldAttendanceRecord>('field_attendance_audit');
+          if (localFieldRecs && localFieldRecs.length > 0) {
+            setFieldRecordsState(localFieldRecs);
+            saveCache('field_records', localFieldRecs);
+          } else {
+            const cached = loadCache<FieldAttendanceRecord[]>('field_records', []);
+            if (cached.length > 0) {
+              setFieldRecordsState(cached);
+              saveLocalTable('field_attendance_audit', cached);
+            }
+          }
+
+          const localDecisionsArr = await fetchLocalTable<any>('audit_decisions');
+          if (localDecisionsArr && localDecisionsArr.length > 0) {
+            const decMap: Record<string, any> = {};
+            localDecisionsArr.forEach(item => {
+              if (item.id) {
+                const { id, ...rest } = item;
+                decMap[id] = rest;
+              }
+            });
+            setAuditDecisionsState(decMap);
+            saveCache('audit_decisions', decMap);
+          } else {
+            const cached = loadCache<Record<string, any>>('audit_decisions', {});
+            if (Object.keys(cached).length > 0) {
+              setAuditDecisionsState(cached);
+              const decArr = Object.entries(cached).map(([id, val]) => ({ id, ...(val as object) }));
+              saveLocalTable('audit_decisions', decArr);
             }
           }
         } catch (localErr) {
@@ -588,16 +749,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           ),
           onSnapshot(collection(db, 'payrollRuns'), 
             (s) => {
-              if (s.empty) return;
-              const fresh = s.docs.map(d => d.data() as PayrollRun);
-              setPayrollRunsState(prev => {
-                const map = new Map(fresh.map(r => [r.id, r]));
-                prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
-                const result = Array.from(map.values());
-                saveCache('payroll_runs', result);
-                saveLocalTable('payroll_runs', result);
-                return result;
-              });
+              const deletedRunIds: string[] = JSON.parse(localStorage.getItem('deleted_payroll_run_ids') || '[]');
+              if (s.empty) {
+                setPayrollRunsState([]);
+                saveCache('payroll_runs', []);
+                saveLocalTable('payroll_runs', []);
+                return;
+              }
+              const fresh = s.docs
+                .map(d => d.data() as PayrollRun)
+                .filter(r => !deletedRunIds.includes(r.id));
+              setPayrollRunsState(fresh);
+              saveCache('payroll_runs', fresh);
+              saveLocalTable('payroll_runs', fresh);
             },
             (error) => handleFirestoreError(error, OperationType.LIST, 'payrollRuns')
           ),
@@ -828,7 +992,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const deletePunchBatch = useCallback(async (importId: string) => {
-    setPunchesState(prev => prev.filter(p => p.importId !== importId));
+    let idsToRemove: string[] = [];
+    setPunchesState(prev => {
+      const remaining = prev.filter(p => {
+        if (p.importId === importId) {
+          idsToRemove.push(p.id);
+          return false;
+        }
+        return true;
+      });
+      saveCache('punches', remaining);
+      return remaining;
+    });
+
+    if (idsToRemove.length > 0) {
+      deleteLocalTableRecords('punches', idsToRemove);
+    }
+
     try {
       const q = query(collection(db, 'punches'), where('importId', '==', importId));
       const snapshot = await getDocs(q);
@@ -856,7 +1036,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const deletePunchesBatch = useCallback(async (ids: string[]) => {
-    setPunchesState(prev => prev.filter(p => !ids.includes(p.id)));
+    setPunchesState(prev => {
+      const filtered = prev.filter(p => !ids.includes(p.id));
+      saveCache('punches', filtered);
+      return filtered;
+    });
+    deleteLocalTableRecords('punches', ids);
+
     try {
       const batchSize = 300;
       const chunks = [];
@@ -881,6 +1067,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const clearPunches = useCallback(async (onProgress?: (msg: string) => void) => {
     setPunchesState([]);
+    saveCache('punches', []);
+    await purgeLocalTable('punches');
+    if (onProgress) onProgress('Local SQLite punches table purged.');
+
     try {
       const q = collection(db, 'punches');
       const snapshot = await getDocs(q);
@@ -905,7 +1095,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           })
         );
         completed += group.reduce((acc, c) => acc + c.length, 0);
-        if (onProgress) onProgress(`Purging records ${Math.min(completed, total)} of ${total}...`);
+        if (onProgress) onProgress(`Purging cloud records ${Math.min(completed, total)} of ${total}...`);
       }
     } catch (e) {
       console.warn('clearPunches note:', e);
@@ -923,9 +1113,31 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setPayrollRunsState([]);
     window.localStorage.clear();
 
+    const localTables = [
+      'employees', 
+      'punches', 
+      'settings', 
+      'shift_assignments', 
+      'assignment_logs', 
+      'exceptions', 
+      'overtime', 
+      'sbl', 
+      'force_attendance', 
+      'payroll_runs', 
+      'zk_devices', 
+      'zk_user_mappings',
+      'zk_sync_logs',
+      'zk_unmapped_punches'
+    ];
+
+    for (const tbl of localTables) {
+      if (onProgress) onProgress(`Purging local table ${tbl}...`);
+      await purgeLocalTable(tbl).catch(() => {});
+    }
+
     const collectionsList = ['employees', 'punches', 'shiftAssignments', 'assignmentLogs', 'exceptions', 'overtime', 'sbl', 'forceAttendance', 'payrollRuns', 'zkDevices', 'zkUserMappings'];
     for (const coll of collectionsList) {
-      if (onProgress) onProgress(`Purging ${coll}...`);
+      if (onProgress) onProgress(`Purging cloud collection ${coll}...`);
       try {
         const q = collection(db, coll);
         const snapshot = await getDocs(q);
@@ -1225,6 +1437,82 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [handleFirestoreError, checkQuota]);
 
+  const setOvertimeBatch = useCallback(async (records: OvertimeRecord[]) => {
+    if (records.length === 0) return;
+
+    setOvertimeRecordsState(prev => {
+      const map = new Map(prev.map(r => [r.id, r]));
+      records.forEach(r => map.set(r.id, r));
+      const updated = Array.from(map.values());
+      saveCache('overtime', updated);
+      return updated;
+    });
+
+    saveLocalTable('overtime', records).catch(err => console.warn('SQLite overtime batch save note:', err));
+
+    if (checkQuota()) {
+      try {
+        const batchSize = 300;
+        const chunks: OvertimeRecord[][] = [];
+        for (let i = 0; i < records.length; i += batchSize) {
+          chunks.push(records.slice(i, i + batchSize));
+        }
+        const CONCURRENCY = 5;
+        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+          const group = chunks.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            group.map(async chunk => {
+              const batch = writeBatch(db);
+              chunk.forEach(r => {
+                batch.set(doc(db, 'overtime', r.id), r);
+              });
+              await batch.commit();
+            })
+          );
+        }
+      } catch (e) {
+        handleFirestoreError(e, OperationType.WRITE, 'overtime/batch');
+      }
+    }
+  }, [checkQuota, handleFirestoreError]);
+
+  const deleteOvertimeBatch = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return;
+
+    setOvertimeRecordsState(prev => {
+      const filtered = prev.filter(r => !ids.includes(r.id));
+      saveCache('overtime', filtered);
+      return filtered;
+    });
+
+    deleteLocalTableRecords('overtime', ids).catch(err => console.warn('SQLite overtime delete note:', err));
+
+    if (checkQuota()) {
+      try {
+        const batchSize = 300;
+        const chunks: string[][] = [];
+        for (let i = 0; i < ids.length; i += batchSize) {
+          chunks.push(ids.slice(i, i + batchSize));
+        }
+        const CONCURRENCY = 5;
+        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+          const group = chunks.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            group.map(async chunk => {
+              const batch = writeBatch(db);
+              chunk.forEach(id => {
+                batch.delete(doc(db, 'overtime', id));
+              });
+              await batch.commit();
+            })
+          );
+        }
+      } catch (e) {
+        handleFirestoreError(e, OperationType.DELETE, 'overtime/batch_delete');
+      }
+    }
+  }, [checkQuota, handleFirestoreError]);
+
   const updateSBL = useCallback(async (id: string, data: Partial<SBLRecord>) => {
     setSblRecordsState(prev => {
       const updated = prev.map(r => r.id === id ? { ...r, ...data } : r);
@@ -1258,8 +1546,88 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [handleFirestoreError, checkQuota]);
 
+  const setSBLBatch = useCallback(async (records: SBLRecord[]) => {
+    if (records.length === 0) return;
+
+    setSblRecordsState(prev => {
+      const map = new Map(prev.map(r => [r.id, r]));
+      records.forEach(r => map.set(r.id, r));
+      const updated = Array.from(map.values());
+      saveCache('sbl', updated);
+      return updated;
+    });
+
+    saveLocalTable('sbl', records).catch(err => console.warn('SQLite sbl batch save note:', err));
+
+    if (checkQuota()) {
+      try {
+        const batchSize = 300;
+        const chunks: SBLRecord[][] = [];
+        for (let i = 0; i < records.length; i += batchSize) {
+          chunks.push(records.slice(i, i + batchSize));
+        }
+        const CONCURRENCY = 5;
+        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+          const group = chunks.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            group.map(async chunk => {
+              const batch = writeBatch(db);
+              chunk.forEach(r => {
+                batch.set(doc(db, 'sbl', r.id), r);
+              });
+              await batch.commit();
+            })
+          );
+        }
+      } catch (e) {
+        handleFirestoreError(e, OperationType.WRITE, 'sbl/batch');
+      }
+    }
+  }, [checkQuota, handleFirestoreError]);
+
+  const deleteSBLBatch = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return;
+
+    setSblRecordsState(prev => {
+      const filtered = prev.filter(r => !ids.includes(r.id));
+      saveCache('sbl', filtered);
+      return filtered;
+    });
+
+    deleteLocalTableRecords('sbl', ids).catch(err => console.warn('SQLite sbl delete note:', err));
+
+    if (checkQuota()) {
+      try {
+        const batchSize = 300;
+        const chunks: string[][] = [];
+        for (let i = 0; i < ids.length; i += batchSize) {
+          chunks.push(ids.slice(i, i + batchSize));
+        }
+        const CONCURRENCY = 5;
+        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+          const group = chunks.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            group.map(async chunk => {
+              const batch = writeBatch(db);
+              chunk.forEach(id => {
+                batch.delete(doc(db, 'sbl', id));
+              });
+              await batch.commit();
+            })
+          );
+        }
+      } catch (e) {
+        handleFirestoreError(e, OperationType.DELETE, 'sbl/batch_delete');
+      }
+    }
+  }, [checkQuota, handleFirestoreError]);
+
   const deleteOvertime = useCallback(async (id: string) => {
-    setOvertimeRecordsState(prev => prev.filter(r => r.id !== id));
+    setOvertimeRecordsState(prev => {
+      const filtered = prev.filter(r => r.id !== id);
+      saveCache('overtime', filtered);
+      return filtered;
+    });
     deleteLocalTableRecords('overtime', [id]);
     if (checkQuota()) {
       try {
@@ -1271,7 +1639,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const deleteSBL = useCallback(async (id: string) => {
-    setSblRecordsState(prev => prev.filter(r => r.id !== id));
+    setSblRecordsState(prev => {
+      const filtered = prev.filter(r => r.id !== id);
+      saveCache('sbl', filtered);
+      return filtered;
+    });
     deleteLocalTableRecords('sbl', [id]);
     if (checkQuota()) {
       try {
@@ -1281,6 +1653,67 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }, [handleFirestoreError, checkQuota]);
+
+  // Movement Handlers
+  const addMovement = useCallback(async (data: Omit<EmployeeMovement, 'id'>) => {
+    const id = `move_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    const newRecord: EmployeeMovement = { ...data, id, changedAt: new Date().toISOString() };
+    setMovementsState(prev => {
+      const updated = [newRecord, ...prev];
+      saveCache('movements', updated);
+      return updated;
+    });
+    saveLocalTable('employee_movements', [newRecord]).catch(err => console.warn('SQLite movement save note:', err));
+    if (checkQuota()) {
+      try {
+        await setDoc(doc(db, 'employee_movements', id), newRecord);
+      } catch (e) {
+        handleFirestoreError(e, OperationType.CREATE, `employee_movements/${id}`);
+      }
+    }
+  }, [checkQuota, handleFirestoreError]);
+
+  const updateMovement = useCallback(async (id: string, updates: Partial<EmployeeMovement>) => {
+    setMovementsState(prev => {
+      const updated = prev.map(m => m.id === id ? { ...m, ...updates } : m);
+      saveCache('movements', updated);
+      return updated;
+    });
+    const existing = movements.find(m => m.id === id);
+    if (existing) {
+      const updated = { ...existing, ...updates };
+      saveLocalTable('employee_movements', [updated]).catch(err => console.warn('SQLite movement update note:', err));
+    }
+    if (checkQuota()) {
+      try {
+        await setDoc(doc(db, 'employee_movements', id), updates, { merge: true });
+      } catch (e) {
+        handleFirestoreError(e, OperationType.UPDATE, `employee_movements/${id}`);
+      }
+    }
+  }, [movements, checkQuota, handleFirestoreError]);
+
+  const deleteMovement = useCallback(async (id: string) => {
+    setMovementsState(prev => {
+      const updated = prev.filter(m => m.id !== id);
+      saveCache('movements', updated);
+      return updated;
+    });
+    deleteLocalTableRecords('employee_movements', [id]).catch(err => console.warn('SQLite movement delete note:', err));
+    if (checkQuota()) {
+      try {
+        await deleteDoc(doc(db, 'employee_movements', id));
+      } catch (e) {
+        handleFirestoreError(e, OperationType.DELETE, `employee_movements/${id}`);
+      }
+    }
+  }, [checkQuota, handleFirestoreError]);
+
+  const setMovementsBatch = useCallback(async (newMovements: EmployeeMovement[]) => {
+    setMovementsState(newMovements);
+    saveCache('movements', newMovements);
+    saveLocalTable('employee_movements', newMovements).catch(err => console.warn('SQLite movement batch save note:', err));
+  }, []);
 
   const addForceAttendance = useCallback(async (data: Omit<ForceAttendanceRecord, 'id' | 'timestamp'>) => {
     const id = `force_${data.employeeId}_${data.date.replace(/-/g, '')}`;
@@ -1316,11 +1749,33 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [handleFirestoreError, checkQuota, employees, addAuditLog]);
 
-  const createPayrollRun = useCallback(async (month: string, bsMonthDetails?: { bsYear: number; monthObj: any }) => {
+  const createPayrollRun = useCallback(async (
+    month: string, 
+    bsMonthDetails?: { bsYear: number; monthObj: any },
+    customDateRange?: { startDate?: string; endDate?: string }
+  ) => {
+    // Check if run for this month already exists and is locked/finalized
+    const existingForMonth = payrollRuns.find(r => r.month === month || r.id === `run_${month.replace(/[^a-zA-Z0-9]/g, '_')}`);
+    if (existingForMonth && (existingForMonth.status === 'Finalized' || existingForMonth.status === 'Locked' || existingForMonth.status === 'Approved' || existingForMonth.status === 'Disbursed')) {
+      throw new Error(`Payroll run for ${existingForMonth.monthName} is ${existingForMonth.status} and cannot be recalculated.`);
+    }
+
     const createdBy = user?.email || auth.currentUser?.email || 'System Admin';
     const activeConfig = settings.payrollConfig || DEFAULT_PAYROLL_CONFIG;
-    const run = generatePayrollRun(month, employees, processedData, overtimeRecords, createdBy, bsMonthDetails, activeConfig);
-    setPayrollRunsState(prev => [run, ...prev.filter(r => r.id !== run.id)]);
+    const run = generatePayrollRun(month, employees, processedData, overtimeRecords, createdBy, bsMonthDetails, activeConfig, customDateRange, existingForMonth?.id);
+    
+    // Clear deleted marker if re-created
+    const deletedRunIds: string[] = JSON.parse(localStorage.getItem('deleted_payroll_run_ids') || '[]');
+    if (deletedRunIds.includes(run.id)) {
+      const updatedDeleted = deletedRunIds.filter(id => id !== run.id);
+      localStorage.setItem('deleted_payroll_run_ids', JSON.stringify(updatedDeleted));
+    }
+
+    setPayrollRunsState(prev => {
+      const updated = [run, ...prev.filter(r => r.id !== run.id)];
+      saveCache('payroll_runs', updated);
+      return updated;
+    });
     saveLocalTable('payroll_runs', [run]);
 
     if (checkQuota()) {
@@ -1331,7 +1786,47 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     }
     return run;
-  }, [checkQuota, user, employees, processedData, overtimeRecords, settings.payrollConfig, handleFirestoreError]);
+  }, [checkQuota, user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig, handleFirestoreError]);
+
+  const recalculatePayrollRun = useCallback(async (runId: string) => {
+    const existingRun = payrollRuns.find(r => r.id === runId);
+    if (!existingRun) return null;
+
+    if (existingRun.status === 'Finalized' || existingRun.status === 'Locked' || existingRun.status === 'Approved' || existingRun.status === 'Disbursed') {
+      throw new Error(`Payroll run for ${existingRun.monthName} is ${existingRun.status} and cannot be recalculated.`);
+    }
+
+    const createdBy = existingRun.createdBy || user?.email || auth.currentUser?.email || 'System Admin';
+    const activeConfig = settings.payrollConfig || DEFAULT_PAYROLL_CONFIG;
+    const customDateRange = (existingRun.startDate && existingRun.endDate) ? { startDate: existingRun.startDate, endDate: existingRun.endDate } : undefined;
+    
+    // Regenerate run with fixed existingRun.id to ensure deterministic ID continuity
+    const freshRun = generatePayrollRun(existingRun.month, employees, processedData, overtimeRecords, createdBy, undefined, activeConfig, customDateRange, existingRun.id);
+    const updatedRun: PayrollRun = {
+      ...freshRun,
+      id: existingRun.id,
+      status: existingRun.status,
+      disbursedAt: existingRun.disbursedAt,
+      disbursedBy: existingRun.disbursedBy,
+      disbursementMethod: existingRun.disbursementMethod
+    };
+
+    setPayrollRunsState(prev => {
+      const updated = prev.map(r => r.id === runId ? updatedRun : r);
+      saveCache('payroll_runs', updated);
+      return updated;
+    });
+    saveLocalTable('payroll_runs', [updatedRun]);
+
+    if (checkQuota()) {
+      try {
+        await setDoc(doc(db, 'payrollRuns', runId), updatedRun);
+      } catch (e) {
+        handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
+      }
+    }
+    return updatedRun;
+  }, [checkQuota, user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig, handleFirestoreError]);
 
   const updatePayrollRecord = useCallback(async (runId: string, recordId: string, updates: Partial<PayrollRecord>) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -1391,7 +1886,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       oldValue: existingRun.status,
       newValue: 'Approved',
       changedBy: user?.email || 'Admin',
-      remarks: `Approved payroll run for ${existingRun.monthName} (Total Net: $${existingRun.totalNetSalary.toLocaleString()})`
+      remarks: `Approved payroll run for ${existingRun.monthName} (Total Net: NPR ${existingRun.totalNetSalary.toLocaleString()})`
     });
 
     if (checkQuota()) {
@@ -1449,7 +1944,44 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [checkQuota, payrollRuns, user, handleFirestoreError, addAuditLog]);
 
   const deletePayrollRun = useCallback(async (runId: string) => {
-    setPayrollRunsState(prev => prev.filter(r => r.id !== runId));
+    const existingRun = payrollRuns.find(r => r.id === runId);
+    if (existingRun && (existingRun.status === 'Finalized' || existingRun.status === 'Locked' || existingRun.status === 'Approved' || existingRun.status === 'Disbursed')) {
+      throw new Error(`Payroll run for ${existingRun.monthName} is ${existingRun.status} and cannot be deleted.`);
+    }
+    
+    // Register deleted ID marker so onSnapshot never resurrects it
+    const deletedRunIds: string[] = JSON.parse(localStorage.getItem('deleted_payroll_run_ids') || '[]');
+    if (!deletedRunIds.includes(runId)) {
+      deletedRunIds.push(runId);
+      localStorage.setItem('deleted_payroll_run_ids', JSON.stringify(deletedRunIds));
+    }
+
+    setPayrollRunsState(prev => {
+      const updated = prev.filter(r => r.id !== runId);
+      saveCache('payroll_runs', updated);
+      return updated;
+    });
+
+    await deleteLocalTableRecords('payroll_runs', [runId]);
+
+    // Issue direct HTTP DELETE call to backend endpoint
+    try {
+      await fetch(`/api/payroll/runs/${runId}`, { method: 'DELETE' });
+    } catch (e) {
+      // offline fallback handled by local storage
+    }
+
+    addAuditLog({
+      employeeId: 'PAYROLL',
+      employeeName: 'Payroll Deletion',
+      date: existingRun?.month || new Date().toISOString().substring(0, 7),
+      field: 'Payroll Run',
+      oldValue: existingRun?.monthName || runId,
+      newValue: 'DELETED',
+      changedBy: user?.email || 'HR Admin',
+      remarks: `Permanently deleted draft payroll run ${existingRun?.monthName || runId}`
+    });
+
     if (checkQuota()) {
       try {
         await deleteDoc(doc(db, 'payrollRuns', runId));
@@ -1457,7 +1989,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         handleFirestoreError(e, OperationType.DELETE, `payrollRuns/${runId}`);
       }
     }
-  }, [checkQuota, handleFirestoreError]);
+  }, [checkQuota, handleFirestoreError, payrollRuns, user, addAuditLog]);
 
   // ZKTeco Biometric Device Actions
   const addZkDevice = useCallback(async (deviceData: Omit<ZkDevice, 'id'>) => {
@@ -1499,6 +2031,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteZkDevice = useCallback(async (id: string) => {
     setZkDevicesState(prev => prev.filter(d => d.id !== id));
+    deleteLocalTableRecords('zk_devices', [id]);
     toast.success('Device deleted');
     if (checkQuota()) {
       try {
@@ -1534,6 +2067,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const unmapZkUser = useCallback(async (id: string) => {
     setZkUserMappingsState(prev => prev.filter(m => m.id !== id));
+    deleteLocalTableRecords('zk_user_mappings', [id]);
     toast.success('User mapping removed');
     if (checkQuota()) {
       try {
@@ -1786,41 +2320,209 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [checkQuota, handleFirestoreError]);
 
   const recalculate = useCallback(async () => {
-    const tId = toast.loading('Synchronizing entire system state...');
+    const tId = toast.loading('Synchronizing system state with local database...');
     try {
-      const results = await Promise.allSettled([
-        getDocs(collection(db, 'punches')),
-        getDocs(collection(db, 'employees')),
-        getDoc(doc(db, 'settings', 'config')),
-        getDocs(collection(db, 'shiftAssignments')),
-        getDocs(collection(db, 'exceptions')),
-        getDocs(collection(db, 'overtime')),
-        getDocs(collection(db, 'sbl')),
-        getDocs(collection(db, 'forceAttendance')),
-        getDocs(collection(db, 'payrollRuns'))
+      // 1. Fetch local SQLite database records first to protect local disk state
+      const [localPunches, localEmps, localSettings, localShifts, localEx, localOt, localSbl, localForce, localPayroll] = await Promise.all([
+        fetchLocalTable<RawPunch>('punches'),
+        fetchLocalTable<Employee>('employees'),
+        fetchLocalTable<Settings>('settings'),
+        fetchLocalTable<ShiftAssignment>('shift_assignments'),
+        fetchLocalTable<AttendanceException>('exceptions'),
+        fetchLocalTable<OvertimeRecord>('overtime'),
+        fetchLocalTable<SBLRecord>('sbl'),
+        fetchLocalTable<ForceAttendanceRecord>('force_attendance'),
+        fetchLocalTable<PayrollRun>('payroll_runs')
       ]);
-      
-      const [pRes, eRes, sRes, saRes, exRes, otRes, sblRes, forceRes, prRes] = results;
 
-      if (pRes.status === 'fulfilled') setPunchesState(pRes.value.docs.map(d => d.data() as RawPunch));
-      if (eRes.status === 'fulfilled') setEmployeesState(eRes.value.docs.map(d => d.data() as Employee));
-      if (sRes.status === 'fulfilled' && sRes.value.exists()) setSettingsState(sRes.value.data() as Settings);
-      if (saRes.status === 'fulfilled') setShiftAssignmentsState(saRes.value.docs.map(d => d.data() as ShiftAssignment));
-      if (exRes.status === 'fulfilled') setExceptionsState(exRes.value.docs.map(d => d.data() as AttendanceException));
-      if (otRes.status === 'fulfilled') setOvertimeRecordsState(otRes.value.docs.map(d => d.data() as OvertimeRecord));
-      if (sblRes.status === 'fulfilled') setSblRecordsState(sblRes.value.docs.map(d => d.data() as SBLRecord));
-      if (forceRes.status === 'fulfilled') setForceAttendanceRecordsState(forceRes.value.docs.map(d => d.data() as ForceAttendanceRecord));
-      if (prRes.status === 'fulfilled') setPayrollRunsState(prRes.value.docs.map(d => d.data() as PayrollRun));
-      
-      toast.success('Enterprise data synchronized', { id: tId });
-    } catch (e) {
-      toast.success('Data synchronized with local workspace', { id: tId });
+      // 2. Query Firestore (if available)
+      let fsPunches: RawPunch[] = [];
+      let fsEmps: Employee[] = [];
+      let fsSettings: Settings | null = null;
+      let fsShifts: ShiftAssignment[] = [];
+      let fsEx: AttendanceException[] = [];
+      let fsOt: OvertimeRecord[] = [];
+      let fsSbl: SBLRecord[] = [];
+      let fsForce: ForceAttendanceRecord[] = [];
+      let fsPayroll: PayrollRun[] = [];
+
+      try {
+        const results = await Promise.allSettled([
+          getDocs(collection(db, 'punches')),
+          getDocs(collection(db, 'employees')),
+          getDoc(doc(db, 'settings', 'config')),
+          getDocs(collection(db, 'shiftAssignments')),
+          getDocs(collection(db, 'exceptions')),
+          getDocs(collection(db, 'overtime')),
+          getDocs(collection(db, 'sbl')),
+          getDocs(collection(db, 'forceAttendance')),
+          getDocs(collection(db, 'payrollRuns'))
+        ]);
+
+        if (results[0].status === 'fulfilled') fsPunches = results[0].value.docs.map(d => d.data() as RawPunch);
+        if (results[1].status === 'fulfilled') fsEmps = results[1].value.docs.map(d => d.data() as Employee);
+        if (results[2].status === 'fulfilled' && results[2].value.exists()) fsSettings = results[2].value.data() as Settings;
+        if (results[3].status === 'fulfilled') fsShifts = results[3].value.docs.map(d => d.data() as ShiftAssignment);
+        if (results[4].status === 'fulfilled') fsEx = results[4].value.docs.map(d => d.data() as AttendanceException);
+        if (results[5].status === 'fulfilled') fsOt = results[5].value.docs.map(d => d.data() as OvertimeRecord);
+        if (results[6].status === 'fulfilled') fsSbl = results[6].value.docs.map(d => d.data() as SBLRecord);
+        if (results[7].status === 'fulfilled') fsForce = results[7].value.docs.map(d => d.data() as ForceAttendanceRecord);
+        if (results[8].status === 'fulfilled') fsPayroll = results[8].value.docs.map(d => d.data() as PayrollRun);
+      } catch (fsErr) {
+        console.warn('Firestore optional query note:', fsErr);
+      }
+
+      // 3. Merge Local SQLite + Existing Memory State + Firestore without losing any data!
+      setPunchesState(prev => {
+        const pMap = new Map<string, RawPunch>();
+        prev.forEach(p => pMap.set(p.id, p));
+        (localPunches || []).forEach(p => pMap.set(p.id, p));
+        fsPunches.forEach(p => pMap.set(p.id, p));
+        const merged = Array.from(pMap.values());
+        saveCache('punches', merged);
+        return merged;
+      });
+
+      setEmployeesState(prev => {
+        const eMap = new Map<string, Employee>();
+        prev.forEach(e => eMap.set(e.id, e));
+        (localEmps || []).forEach(e => eMap.set(e.id, e));
+        fsEmps.forEach(e => eMap.set(e.id, e));
+        const merged = Array.from(eMap.values());
+        saveCache('employees', merged);
+        return merged;
+      });
+
+      if (fsSettings) {
+        setSettingsState(fsSettings);
+        saveCache('settings', fsSettings);
+      } else if (localSettings && localSettings.length > 0) {
+        setSettingsState(localSettings[0]);
+        saveCache('settings', localSettings[0]);
+      }
+
+      setShiftAssignmentsState(prev => {
+        const map = new Map<string, ShiftAssignment>();
+        prev.forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
+        (localShifts || []).forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
+        fsShifts.forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
+        const merged = Array.from(map.values());
+        saveCache('shift_assignments', merged);
+        return merged;
+      });
+
+      setExceptionsState(prev => {
+        const map = new Map<string, AttendanceException>();
+        prev.forEach(x => map.set(x.id, x));
+        (localEx || []).forEach(x => map.set(x.id, x));
+        fsEx.forEach(x => map.set(x.id, x));
+        const merged = Array.from(map.values());
+        saveCache('exceptions', merged);
+        return merged;
+      });
+
+      setOvertimeRecordsState(prev => {
+        const map = new Map<string, OvertimeRecord>();
+        prev.forEach(r => map.set(r.id, r));
+        (localOt || []).forEach(r => map.set(r.id, r));
+        fsOt.forEach(r => map.set(r.id, r));
+        const merged = Array.from(map.values());
+        saveCache('overtime', merged);
+        return merged;
+      });
+
+      setSblRecordsState(prev => {
+        const map = new Map<string, SBLRecord>();
+        prev.forEach(r => map.set(r.id, r));
+        (localSbl || []).forEach(r => map.set(r.id, r));
+        fsSbl.forEach(r => map.set(r.id, r));
+        const merged = Array.from(map.values());
+        saveCache('sbl', merged);
+        return merged;
+      });
+
+      setForceAttendanceRecordsState(prev => {
+        const map = new Map<string, ForceAttendanceRecord>();
+        prev.forEach(r => map.set(r.id, r));
+        (localForce || []).forEach(r => map.set(r.id, r));
+        fsForce.forEach(r => map.set(r.id, r));
+        const merged = Array.from(map.values());
+        saveCache('force_attendance', merged);
+        return merged;
+      });
+
+      setPayrollRunsState(prev => {
+        const map = new Map<string, PayrollRun>();
+        prev.forEach(r => map.set(r.id, r));
+        (localPayroll || []).forEach(r => map.set(r.id, r));
+        fsPayroll.forEach(r => map.set(r.id, r));
+        const merged = Array.from(map.values());
+        saveCache('payroll_runs', merged);
+        return merged;
+      });
+
+      toast.success('System synchronized & recalculated successfully!', { id: tId });
+    } catch (e: any) {
+      toast.error('Sync failed: ' + (e?.message || 'Error syncing data'), { id: tId });
     }
   }, []);
   const resetError = useCallback(() => setLastError(null), []);
 
   const openEmployeeProfile = useCallback((id: string) => setSelectedEmployeeId(id), []);
   const closeEmployeeProfile = useCallback(() => setSelectedEmployeeId(null), []);
+
+  const setFieldRecords = useCallback(async (records: FieldAttendanceRecord[], fileName?: string, importType?: 'matrix' | 'flat' | 'sample') => {
+    setFieldRecordsState(records);
+    saveCache('field_records', records);
+    saveLocalTable('field_attendance_audit', records);
+
+    if (fileName !== undefined) {
+      setFieldMusterFileNameState(fileName);
+      localStorage.setItem('hris_cache_field_filename', fileName);
+    }
+    if (importType !== undefined) {
+      setFieldImportTypeState(importType);
+      localStorage.setItem('hris_cache_field_import_type', importType);
+    }
+  }, []);
+
+  const saveAuditDecision = useCallback(async (key: string, decision: any) => {
+    setAuditDecisionsState(prev => {
+      const updated = { ...prev, [key]: decision };
+      saveCache('audit_decisions', updated);
+      const decArr = Object.entries(updated).map(([id, val]) => ({ id, ...(val as object) }));
+      saveLocalTable('audit_decisions', decArr);
+      return updated;
+    });
+  }, []);
+
+  const saveAuditDecisionsBatch = useCallback(async (decisionsMap: Record<string, any>) => {
+    setAuditDecisionsState(prev => {
+      const updated = { ...prev, ...decisionsMap };
+      saveCache('audit_decisions', updated);
+      const decArr = Object.entries(updated).map(([id, val]) => ({ id, ...(val as object) }));
+      saveLocalTable('audit_decisions', decArr);
+      return updated;
+    });
+  }, []);
+
+  const clearFieldMusterData = useCallback(async () => {
+    setFieldRecordsState([]);
+    setFieldMusterFileNameState('');
+    setAuditDecisionsState({});
+    saveCache('field_records', []);
+    saveCache('audit_decisions', {});
+    localStorage.removeItem('hris_cache_field_filename');
+    localStorage.removeItem('hris_cache_field_import_type');
+    await purgeLocalTable('field_attendance_audit').catch(() => {});
+    await purgeLocalTable('audit_decisions').catch(() => {});
+    toast.success('Field Muster & Audit data cleared successfully');
+  }, []);
+
+  const setAuditDateRange = useCallback((range: { startDate: string; endDate: string }) => {
+    setAuditDateRangeState(range);
+    saveCache('audit_date_range', range);
+  }, []);
 
   const reportError = useCallback((error: unknown, operationType: OperationType = OperationType.WRITE, path: string | null = null) => {
     handleFirestoreError(error, operationType, path);
@@ -1854,18 +2556,38 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     syncZkDevice,
     resolveUnmappedPunches,
     clearZkSyncLogs,
+    fieldRecords,
+    fieldMusterFileName,
+    fieldImportType,
+    auditDecisions,
+    auditDateRange,
+    setFieldRecords,
+    saveAuditDecision,
+    saveAuditDecisionsBatch,
+    clearFieldMusterData,
+    setAuditDateRange,
     updateOvertime,
     addOvertime,
+    setOvertimeBatch,
     deleteOvertime,
+    deleteOvertimeBatch,
     updateSBL,
     addSBL,
+    setSBLBatch,
     deleteSBL,
+    deleteSBLBatch,
     addForceAttendance,
     createPayrollRun,
+    recalculatePayrollRun,
     updatePayrollRecord,
     approvePayrollRun,
     disbursePayrollRun,
     deletePayrollRun,
+    movements,
+    addMovement,
+    updateMovement,
+    deleteMovement,
+    setMovementsBatch,
     calculationSource, setCalculationSource,
     processedData,
     user, setUser,

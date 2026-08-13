@@ -151,26 +151,67 @@ async function processVerticalRoster(sheetData: any[][]): Promise<RosterRecord[]
   return result;
 }
 
-export function generateRosterTemplate() {
-  const currentMonth = new Date();
-  const year = currentMonth.getFullYear();
-  const month = currentMonth.getMonth();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
+export function generateRosterTemplate(startDateStr?: string, endDateStr?: string, employeesList: any[] = []) {
+  let dateList: string[] = [];
 
-  const headers = ['Employee ID', 'Employee Name', 'Department'];
-  for (let day = 1; day <= daysInMonth; day++) {
-    headers.push(format(new Date(year, month, day), 'yyyy-MM-dd'));
+  if (startDateStr && endDateStr) {
+    const start = new Date(startDateStr);
+    const end = new Date(endDateStr);
+    if (!isNaN(start.getTime()) && !isNaN(end.getTime()) && start <= end) {
+      let curr = new Date(start);
+      while (curr <= end) {
+        dateList.push(format(curr, 'yyyy-MM-dd'));
+        curr.setDate(curr.getDate() + 1);
+      }
+    }
   }
 
-  const sampleData = [
-    ['Roster Template - ' + format(currentMonth, 'MMMM yyyy')],
-    headers,
-    ['3058', 'Mukesh Kumar', 'RA Energy', 'DAY', 'DAY', 'DAY', 'DAY', 'DAY', 'DO', 'DO'],
-    ['1246', 'Hemant Dahal', 'HR/Admin', 'A', 'A', 'A', 'B', 'B', 'DO', 'DO'],
-    ['4012', 'Sita Dev', 'Quality', 'C', 'C', 'C', 'NIGHT', 'NIGHT', 'DO', 'DO']
+  if (dateList.length === 0) {
+    const currentMonth = new Date();
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    for (let day = 1; day <= daysInMonth; day++) {
+      dateList.push(format(new Date(year, month, day), 'yyyy-MM-dd'));
+    }
+  }
+
+  const headers = ['Employee ID', 'Employee Name', 'Department', ...dateList];
+
+  const rows: any[][] = [
+    [`Roster Template (${dateList[0]} to ${dateList[dateList.length - 1]} - ${dateList.length} Days)`],
+    headers
   ];
 
-  const ws = XLSX.utils.aoa_to_sheet(sampleData);
+  if (employeesList && employeesList.length > 0) {
+    employeesList.slice(0, 50).forEach((emp, i) => {
+      // Shift pattern sample rotation A, B, C, DO
+      const shiftPatterns = ['A', 'A', 'A', 'A', 'A', 'DO', 'DO', 'B', 'B', 'B', 'B', 'B', 'DO', 'DO'];
+      const empRow = [emp.id, emp.name, emp.department || 'General'];
+      dateList.forEach((_, idx) => {
+        empRow.push(shiftPatterns[(idx + i) % shiftPatterns.length]);
+      });
+      rows.push(empRow);
+    });
+  } else {
+    // Default sample employees with Bio ID / numeric Employee ID
+    const sampleEmps = [
+      ['2', 'Rajesh Sharma', 'Production'],
+      ['1256', 'Mukesh Kumar', 'RA Energy'],
+      ['3058', 'Hemant Dahal', 'HR/Admin'],
+      ['4012', 'Sita Dev', 'Quality']
+    ];
+    sampleEmps.forEach((emp, i) => {
+      const shiftPatterns = ['A', 'A', 'A', 'A', 'A', 'DO', 'DO'];
+      const empRow = [...emp];
+      dateList.forEach((_, idx) => {
+        empRow.push(shiftPatterns[idx % shiftPatterns.length]);
+      });
+      rows.push(empRow);
+    });
+  }
+
+  const ws = XLSX.utils.aoa_to_sheet(rows);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Roster");
   return wb;

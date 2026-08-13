@@ -10,14 +10,14 @@ import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import { OTAuditLog } from '../components/OTAuditLog';
-import { OvertimeRecord } from '../types';
+import { OvertimeRecord, Employee, ProcessedAttendance, ShiftMaster } from '../types';
 import { PageHeader, Card, Button, Input, KPICard, Badge } from '../components/ui';
 import { cn } from '../lib/utils';
 
 export default function Overtime() {
   const { 
     overtimeRecords, employees, processedData, settings,
-    updateOvertime, addOvertime, deleteOvertime, user, openEmployeeProfile, globalSearchTerm 
+    updateOvertime, addOvertime, deleteOvertime, setOvertimeBatch, deleteOvertimeBatch, user, openEmployeeProfile, globalSearchTerm 
   } = useAppStore();
   
   const [searchTerm, setSearchTerm] = useState('');
@@ -28,6 +28,7 @@ export default function Overtime() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [selectedRecord, setSelectedRecord] = useState<OvertimeRecord | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [dateRange, setDateRange] = useState({
     start: format(new Date(), 'yyyy-MM-01'),
     end: format(new Date(), 'yyyy-MM-dd')
@@ -44,6 +45,21 @@ export default function Overtime() {
   });
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+
+  // O(1) Employee Map for instant lookups
+  const empMap = useMemo(() => new Map<string, Employee>(employees.map(e => [e.id, e])), [employees]);
+
+  // Memoize designation and contractor options
+  const designations = useMemo(() => {
+    const list = employees.map(e => e.designation).filter(Boolean);
+    return Array.from(new Set(list));
+  }, [employees]);
+
+  const contractors = useMemo(() => {
+    const list = employees.map(e => e.contractorName).filter(Boolean);
+    return Array.from(new Set(list));
+  }, [employees]);
 
   const handleSelect = (id: string) => {
     setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
@@ -51,72 +67,102 @@ export default function Overtime() {
 
   const handleBulkDelete = async () => {
     if (selectedIds.length === 0) return;
-    if (!window.confirm(`Are you sure you want to delete ${selectedIds.length} selected records?`)) return;
-
-    const tId = toast.loading('Deleting records...');
+    const count = selectedIds.length;
+    const tId = toast.loading(`Deleting ${count} selected records...`);
     try {
-      for (const id of selectedIds) {
-        await deleteOvertime(id);
-      }
+      await deleteOvertimeBatch(selectedIds);
       setSelectedIds([]);
-      toast.success(`Successfully deleted ${selectedIds.length} records`, { id: tId });
+      setIsDeleteModalOpen(false);
+      toast.success(`Successfully deleted ${count} record(s)`, { id: tId });
     } catch (e) {
       toast.error('Bulk delete failed', { id: tId });
     }
   };
 
+  // Ultra-fast filtered records using O(1) map and direct string comparison
   const filteredRecords = useMemo(() => {
-    return overtimeRecords.filter(record => {
-      const emp = employees.find(e => e.id === record.employeeId);
-      const matchesSearch = !activeSearch || 
-        emp?.name.toLowerCase().includes(activeSearch.toLowerCase()) || 
-        record.employeeId.toLowerCase().includes(activeSearch.toLowerCase()) ||
-        emp?.designation?.toLowerCase().includes(activeSearch.toLowerCase());
-      const matchesStatus = statusFilter === 'All' || record.status === statusFilter;
-      const matchesDesignation = designationFilter === 'All' || emp?.designation === designationFilter;
-      const matchesContractor = contractorFilter === 'All' || emp?.contractorName === contractorFilter;
-      const matchesDate = isWithinInterval(parseISO(record.date), {
-        start: parseISO(dateRange.start),
-        end: parseISO(dateRange.end)
-      });
-      return matchesSearch && matchesStatus && matchesDate && matchesDesignation && matchesContractor;
-    }).sort((a, b) => a.date.localeCompare(b.date));
-  }, [overtimeRecords, employees, activeSearch, statusFilter, dateRange, designationFilter, contractorFilter]);
+    const activeLower = activeSearch ? activeSearch.toLowerCase() : '';
+    const startDate = dateRange.start;
+    const endDate = dateRange.end;
 
-  const stats = useMemo(() => ({
-    total: overtimeRecords.length,
-    pending: overtimeRecords.filter(r => r.status === 'Pending').length,
-    approved: overtimeRecords.filter(r => r.status === 'Approved').length,
-    totalHours: overtimeRecords.reduce((acc, curr) => acc + (Number(curr.hours) || 0), 0)
-  }), [overtimeRecords]);
+    return overtimeRecords.filter(record => {
+      // Direct string date comparison (microsecond fast)
+      if (record.date < startDate || record.date > endDate) return false;
+      if (statusFilter !== 'All' && record.status !== statusFilter) return false;
+
+      const emp = empMap.get(record.employeeId);
+      if (designationFilter !== 'All' && emp?.designation !== designationFilter) return false;
+      if (contractorFilter !== 'All' && emp?.contractorName !== contractorFilter) return false;
+
+      if (activeLower) {
+        const nameMatch = emp?.name?.toLowerCase().includes(activeLower);
+        const idMatch = record.employeeId.toLowerCase().includes(activeLower);
+        const desigMatch = emp?.designation?.toLowerCase().includes(activeLower);
+        if (!nameMatch && !idMatch && !desigMatch) return false;
+      }
+
+      return true;
+    }).sort((a, b) => b.date.localeCompare(a.date));
+  }, [overtimeRecords, empMap, activeSearch, statusFilter, dateRange, designationFilter, contractorFilter]);
+
+  // Single-pass stats calculation
+  const stats = useMemo(() => {
+    let pending = 0;
+    let approved = 0;
+    let totalHours = 0;
+    for (let i = 0; i < overtimeRecords.length; i++) {
+      const r = overtimeRecords[i];
+      if (r.status === 'Pending') pending++;
+      else if (r.status === 'Approved') approved++;
+      totalHours += Number(r.hours) || 0;
+    }
+    return {
+      total: overtimeRecords.length,
+      pending,
+      approved,
+      totalHours
+    };
+  }, [overtimeRecords]);
 
   const handleSyncAttendance = async () => {
-    toast.loading('Syncing attendance data...', { id: 'sync' });
+    if (isSyncing) return;
+    setIsSyncing(true);
+    const tId = toast.loading('Syncing OT audit log & attendance data...');
+    
+    // Non-blocking UI tick
+    await new Promise(r => setTimeout(r, 40));
+
     try {
       let added = 0;
       let updated = 0;
 
-      for (const att of processedData) {
-        if (!isWithinInterval(parseISO(att.date), {
-          start: parseISO(dateRange.start),
-          end: parseISO(dateRange.end)
-        })) continue;
+      const otMap = new Map<string, OvertimeRecord>(overtimeRecords.map(r => [`${r.employeeId}_${r.date}`, r]));
+      const batchToUpsert: OvertimeRecord[] = [];
+      const startDate = dateRange.start;
+      const endDate = dateRange.end;
 
-        const emp = employees.find(e => e.id === att.employeeId);
+      for (let i = 0; i < processedData.length; i++) {
+        const att = processedData[i];
+        if (att.date < startDate || att.date > endDate) continue;
+
+        const emp = empMap.get(att.employeeId);
         const standardDutyHours = Number(emp?.targetWorkingHours) || Number(att.expectedHours) || 8;
         const workingHours = Number(att.workingHours) || 0;
         const bioOtHours = Math.max(0, workingHours - standardDutyHours);
         
         if (bioOtHours <= 0 && att.status !== 'Present') continue;
 
-        const existing = overtimeRecords.find(r => r.employeeId === att.employeeId && r.date === att.date);
+        const key = `${att.employeeId}_${att.date}`;
+        const existing = otMap.get(key);
         
         if (existing) {
           if (existing.bioOtHours !== bioOtHours || existing.standardDutyHours !== standardDutyHours) {
             const supOt = Number(existing.supervisorOtHours) || 0;
             const finalOtEligible = Math.min(bioOtHours, supOt);
             const hrSaving = Math.max(0, bioOtHours - finalOtEligible);
-            await updateOvertime(existing.id, {
+            
+            batchToUpsert.push({
+              ...existing,
               bioOtHours: Number(bioOtHours.toFixed(2)),
               standardDutyHours: Number(standardDutyHours.toFixed(2)),
               hours: Number(finalOtEligible.toFixed(2)),
@@ -125,11 +171,13 @@ export default function Overtime() {
             updated++;
           }
         } else {
+          const id = `ot_${Math.random().toString(36).substr(2, 9)}`;
           const supervisorOtHours = 0; 
           const finalOtEligible = Math.min(bioOtHours, supervisorOtHours);
           const hrSaving = Math.max(0, bioOtHours - finalOtEligible);
 
-          await addOvertime({
+          batchToUpsert.push({
+            id,
             employeeId: att.employeeId,
             date: att.date,
             bioOtHours: Number(bioOtHours.toFixed(2)),
@@ -145,9 +193,17 @@ export default function Overtime() {
           added++;
         }
       }
-      toast.success(`Sync complete: ${added} added, ${updated} updated`, { id: 'sync' });
+
+      if (batchToUpsert.length > 0) {
+        await setOvertimeBatch(batchToUpsert);
+      }
+
+      toast.success(`OT Audit Sync complete: ${added} added, ${updated} updated`, { id: tId });
     } catch (e) {
-      toast.error('Sync failed', { id: 'sync' });
+      console.error('OT Audit Log Sync Error:', e);
+      toast.error('Sync failed', { id: tId });
+    } finally {
+      setIsSyncing(false);
     }
   };
 
@@ -225,10 +281,13 @@ export default function Overtime() {
 
   const handleExportCSV = () => {
     try {
+      const attMap = new Map<string, ProcessedAttendance>(processedData.map(p => [`${p.employeeId}_${p.date}`, p]));
+      const shiftMap = new Map<string, ShiftMaster>((settings.shifts || []).map(s => [s.id, s]));
+
       const data = filteredRecords.map(record => {
-        const emp = employees.find(e => e.id === record.employeeId);
-        const att = processedData.find(p => p.employeeId === record.employeeId && p.date === record.date);
-        const shift = settings.shifts?.find(s => s.id === record.shiftId);
+        const emp = empMap.get(record.employeeId);
+        const att = attMap.get(`${record.employeeId}_${record.date}`);
+        const shift = record.shiftId ? shiftMap.get(record.shiftId) : undefined;
 
         return {
           'Employee ID': record.employeeId,
@@ -237,8 +296,8 @@ export default function Overtime() {
           'Date': record.date,
           'Shift': shift?.name || '-',
           'Standard Duty Hours': record.standardDutyHours || 8,
-          'In Time': att?.firstPunch ? format(parseISO(att.firstPunch), 'HH:mm') : '-',
-          'Out Time': att?.lastPunch ? format(parseISO(att.lastPunch), 'HH:mm') : '-',
+          'In Time': att?.firstPunch ? att.firstPunch.substring(11, 16) || att.firstPunch : '-',
+          'Out Time': att?.lastPunch ? att.lastPunch.substring(11, 16) || att.lastPunch : '-',
           'Working Hours': att?.workingHours || 0,
           'Bio OT': record.bioOtHours,
           'Supervisor OT': record.supervisorOtHours,
@@ -247,7 +306,7 @@ export default function Overtime() {
           'OT Remarks': record.remarks || '',
           'Approval Status': record.status,
           'Reviewed By': record.reviewedBy || '-',
-          'Reviewed Date': record.reviewedDate ? format(parseISO(record.reviewedDate), 'dd MMM yyyy') : '-'
+          'Reviewed Date': record.reviewedDate ? record.reviewedDate.substring(0, 10) : '-'
         };
       });
 
@@ -316,9 +375,9 @@ export default function Overtime() {
                 className="w-[140px] h-9 text-[11px] pl-9 px-2"
               />
             </div>
-            <Button variant="outline" onClick={handleSyncAttendance} className="gap-2">
-              <RefreshCw size={16} />
-              Sync
+            <Button variant="outline" onClick={handleSyncAttendance} disabled={isSyncing} className="gap-2">
+              <RefreshCw size={16} className={cn(isSyncing && "animate-spin")} />
+              {isSyncing ? 'Syncing...' : 'Sync'}
             </Button>
             <Button onClick={() => setIsModalOpen(true)} className="gap-2">
               <Plus size={16} />
@@ -329,7 +388,7 @@ export default function Overtime() {
               Export
             </Button>
             {selectedIds.length > 0 && (
-              <Button variant="danger" onClick={handleBulkDelete} className="gap-2">
+              <Button type="button" variant="danger" onClick={() => setIsDeleteModalOpen(true)} className="gap-2">
                 <Trash2 size={16} />
                 Delete Selected ({selectedIds.length})
               </Button>
@@ -400,7 +459,7 @@ export default function Overtime() {
               className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
             >
               <option value="All">All Designations</option>
-              {[...new Set(employees.map(e => e.designation).filter(Boolean))].map(d => (
+              {designations.map(d => (
                 <option key={d} value={d}>{d}</option>
               ))}
             </select>
@@ -411,7 +470,7 @@ export default function Overtime() {
               className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
             >
               <option value="All">All Contractors</option>
-              {[...new Set(employees.map(e => e.contractorName).filter(Boolean))].map(c => (
+              {contractors.map(c => (
                 <option key={c} value={c}>{c}</option>
               ))}
             </select>
@@ -620,6 +679,57 @@ export default function Overtime() {
                   Save Manual OT
                 </Button>
               </form>
+            </motion.div>
+          </div>
+        )}
+
+        {/* Delete Confirmation Modal */}
+        {isDeleteModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsDeleteModalOpen(false)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="relative w-full max-w-md bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-100 dark:border-slate-800 overflow-hidden z-10 p-6 text-center space-y-4"
+            >
+              <div className="w-12 h-12 rounded-full bg-rose-100 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center mx-auto">
+                <Trash2 size={24} />
+              </div>
+
+              <div className="space-y-1">
+                <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                  Delete {selectedIds.length} Selected Record(s)?
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+                  Are you sure you want to permanently delete these {selectedIds.length} selected overtime records? This action cannot be undone.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-3 pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setIsDeleteModalOpen(false)}
+                  className="flex-1 h-10 text-xs font-bold"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="danger"
+                  onClick={handleBulkDelete}
+                  className="flex-1 h-10 text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white"
+                >
+                  Confirm Delete
+                </Button>
+              </div>
             </motion.div>
           </div>
         )}

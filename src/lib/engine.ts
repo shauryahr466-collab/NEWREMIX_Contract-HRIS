@@ -224,7 +224,26 @@ export function processPunches(
       const isWeeklyOff = empWO.includes(dateInfo.dayName);
 
       const assignment = assignmentMap.get(`${normId}_${dateStr}`);
-      const targetShiftId = assignment?.shiftId || emp.shiftId;
+      
+      let targetShiftId = '';
+      let shiftSource: 'Manual Override' | 'Approved Roster' | 'Imported Roster' | 'Employee Default' | 'Auto Detected' = 'Employee Default';
+
+      if (assignment) {
+        targetShiftId = assignment.shiftId;
+        if (assignment.source === 'Manual Override' || (assignment as any).isManual) {
+          shiftSource = 'Manual Override';
+        } else if (assignment.source === 'Approved Roster' || assignment.status === 'Approved') {
+          shiftSource = 'Approved Roster';
+        } else {
+          shiftSource = 'Imported Roster';
+        }
+      } else if (emp.shiftId) {
+        targetShiftId = emp.shiftId;
+        shiftSource = 'Employee Default';
+      } else {
+        shiftSource = 'Auto Detected';
+      }
+
       let shift = shiftMap.get(targetShiftId || '');
       if (!shift && targetShiftId) shift = shiftNameMap.get(targetShiftId.toLowerCase());
 
@@ -372,6 +391,9 @@ export function processPunches(
           lateMinutes,
           earlyMinutes,
           shiftId: shift?.id,
+          shiftCode: shift?.id || 'DS',
+          shiftName: shift?.name || 'Day Shift',
+          shiftSource,
           expectedHours: Number(shiftDuration.toFixed(2)),
           status,
           logs: validLogs,
@@ -390,6 +412,9 @@ export function processPunches(
           lateMinutes: 0,
           earlyMinutes: 0,
           shiftId: shift?.id,
+          shiftCode: shift?.id || 'DS',
+          shiftName: shift?.name || 'Day Shift',
+          shiftSource,
           expectedHours: Number(shiftDuration.toFixed(2)),
           status: isWeeklyOff ? 'Weekly Off' : 'Absent',
           logs: [],

@@ -8,22 +8,27 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAppStore } from '../store';
+import { saveLocalTable } from '../lib/localClient';
 import { PageHeader, Card, KPICard, Button, Input, Badge } from '../components/ui';
-import type { PayrollRun, PayrollRecord, DisbursementMethod, PayrollConfig, TaxSlabConfig } from '../types';
+import type { PayrollRun, PayrollRecord, DisbursementMethod, PayrollConfig, TaxSlabConfig, Employee } from '../types';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
-import { NEPALI_MONTHS, FY_NEPALI_MONTHS, getNepalFiscalYear, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
+import { NEPALI_MONTHS, FY_NEPALI_MONTHS, getNepalFiscalYear, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG, getPayrollPeriod } from '../lib/payrollEngine';
 
 export function Payroll() {
   const { 
     employees, 
+    setEmployees,
     payrollRuns, 
     createPayrollRun, 
+    recalculatePayrollRun,
     updatePayrollRecord, 
     approvePayrollRun, 
     disbursePayrollRun, 
     deletePayrollRun,
     updateEmployee,
+    addEmployee,
+    deleteEmployeesBatch,
     settings,
     setSettings
   } = useAppStore();
@@ -69,18 +74,38 @@ export function Payroll() {
   const [selectedBsMonth, setSelectedBsMonth] = useState<string>('04'); // Default Shrawan (Month 04)
   const currentFiscalYear = getNepalFiscalYear(selectedBsYear, selectedBsMonth);
 
+  // Date Range selector for calculation window
+  const [startDate, setStartDate] = useState<string>('2026-07-17');
+  const [endDate, setEndDate] = useState<string>('2026-08-16');
+
+  // Sync default AD Start & End Date based on Nepali BS Month selection
+  useEffect(() => {
+    const period = getPayrollPeriod(selectedBsYear, selectedBsMonth);
+    setStartDate(period.startDate);
+    setEndDate(period.endDate);
+  }, [selectedBsYear, selectedBsMonth]);
+
   // Date selector for new run creation
   const now = new Date();
   const defaultMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   const [selectedMonth, setSelectedMonth] = useState<string>(defaultMonthStr);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   
-  // Search & Filter
+  // Search & Filter for Payroll Runs
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDept, setSelectedDept] = useState('All');
   
+  // Employee Pay Setup Tab States
+  const [empPaySearch, setEmpPaySearch] = useState('');
+  const [empPayDept, setEmpPayDept] = useState('All');
+  const [selectedPayEmpIds, setSelectedPayEmpIds] = useState<string[]>([]);
+  const [deletingPayEmp, setDeletingPayEmp] = useState<Employee | null>(null);
+  const [isBulkDeletePayOpen, setIsBulkDeletePayOpen] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState({ active: false, current: 0, total: 0, percent: 0 });
+  
 
   // Modal States
+  const [runToDelete, setRunToDelete] = useState<PayrollRun | null>(null);
   const [activePayslipRecord, setActivePayslipRecord] = useState<PayrollRecord | null>(null);
   const [editingRecord, setEditingRecord] = useState<{ runId: string; record: PayrollRecord } | null>(null);
   const [editingEmployeeSalary, setEditingEmployeeSalary] = useState<any | null>(null);
@@ -106,11 +131,90 @@ export function Payroll() {
 
   const departments = ['All', ...Array.from(new Set(employees.map(e => e.department).filter(Boolean)))];
 
-  // Aggregated KPIs
-  const totalYTDNet = payrollRuns.reduce((sum, r) => sum + r.totalNetSalary, 0);
-  const totalYTDGross = payrollRuns.reduce((sum, r) => sum + r.totalGrossSalary, 0);
-  const totalYTDTax = payrollRuns.reduce((sum, r) => sum + r.totalTaxTDS, 0);
-  const totalYTDSocial = payrollRuns.reduce((sum, r) => sum + r.totalSocialSecurity, 0);
+  // Employee Pay Setup filtering & selection logic
+  const filteredPayEmployees = employees.filter(emp => {
+    const matchesSearch = emp.name.toLowerCase().includes(empPaySearch.toLowerCase()) ||
+                          emp.id.toLowerCase().includes(empPaySearch.toLowerCase()) ||
+                          (emp.panNumber && emp.panNumber.toLowerCase().includes(empPaySearch.toLowerCase())) ||
+                          (emp.bankName && emp.bankName.toLowerCase().includes(empPaySearch.toLowerCase()));
+    const matchesDept = empPayDept === 'All' || emp.department === empPayDept;
+    return matchesSearch && matchesDept;
+  });
+
+  const isAllPayEmpSelected = filteredPayEmployees.length > 0 && filteredPayEmployees.every(e => selectedPayEmpIds.includes(e.id));
+
+  const toggleSelectAllPayEmp = () => {
+    if (isAllPayEmpSelected) {
+      setSelectedPayEmpIds([]);
+    } else {
+      setSelectedPayEmpIds(filteredPayEmployees.map(e => e.id));
+    }
+  };
+
+  const toggleSelectPayEmp = (id: string) => {
+    setSelectedPayEmpIds(prev => 
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  };
+
+  const handleConfirmDeletePayEmp = async () => {
+    if (!deletingPayEmp) return;
+    try {
+      await deleteEmployeesBatch([deletingPayEmp.id]);
+      toast.success(`Deleted employee ${deletingPayEmp.name} (ID: ${deletingPayEmp.id}) from local SQLite database!`);
+      setSelectedPayEmpIds(prev => prev.filter(id => id !== deletingPayEmp.id));
+      setDeletingPayEmp(null);
+    } catch (err: any) {
+      toast.error(`Failed to delete employee: ${err.message}`);
+    }
+  };
+
+  const handleConfirmBulkDeletePayEmp = async () => {
+    if (selectedPayEmpIds.length === 0) return;
+    const count = selectedPayEmpIds.length;
+    setDeleteProgress({ active: true, current: 0, total: count, percent: 0 });
+    try {
+      const batchSize = 30;
+      for (let i = 0; i < selectedPayEmpIds.length; i += batchSize) {
+        const batch = selectedPayEmpIds.slice(i, i + batchSize);
+        await deleteEmployeesBatch(batch);
+        const currentCount = Math.min(i + batchSize, count);
+        const pct = Math.round((currentCount / count) * 100);
+        setDeleteProgress({ active: true, current: currentCount, total: count, percent: pct });
+        await new Promise(r => setTimeout(r, 10));
+      }
+      toast.success(`Deleted ${count} employee pay setup records from local SQLite database!`);
+      setSelectedPayEmpIds([]);
+      setIsBulkDeletePayOpen(false);
+    } catch (err: any) {
+      toast.error(`Failed to delete selected employees: ${err.message}`);
+    } finally {
+      setDeleteProgress({ active: false, current: 0, total: 0, percent: 0 });
+    }
+  };
+
+  const handleConfirmDeleteRun = async () => {
+    if (!runToDelete) return;
+    try {
+      const runId = runToDelete.id;
+      const monthName = runToDelete.monthName;
+      await deletePayrollRun(runId);
+      if (selectedRunId === runId) {
+        setSelectedRunId(null);
+      }
+      toast.success(`Permanently deleted draft payroll run for ${monthName}!`);
+      setRunToDelete(null);
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to delete payroll run');
+    }
+  };
+
+  // Aggregated YTD KPIs (Only counts finalized/disbursed or approved runs)
+  const disbursedRuns = payrollRuns.filter(r => r.status === 'Disbursed' || r.status === 'Approved');
+  const totalYTDNet = disbursedRuns.reduce((sum, r) => sum + r.totalNetSalary, 0);
+  const totalYTDGross = disbursedRuns.reduce((sum, r) => sum + r.totalGrossSalary, 0);
+  const totalYTDTax = disbursedRuns.reduce((sum, r) => sum + r.totalTaxTDS, 0);
+  const totalYTDSocial = disbursedRuns.reduce((sum, r) => sum + r.totalSocialSecurity, 0);
 
   // Handle Calculate Payroll (BS Month date system)
   const handleGeneratePayroll = async () => {
@@ -119,11 +223,27 @@ export function Payroll() {
       const monthObj = NEPALI_MONTHS.find(m => m.id === selectedBsMonth) || NEPALI_MONTHS[3];
       const monthKey = `BS-${selectedBsYear}-${selectedBsMonth}`;
       const bsDetails = { bsYear: selectedBsYear, monthObj };
-      const newRun = await createPayrollRun(monthKey, bsDetails);
+      const newRun = await createPayrollRun(monthKey, bsDetails, { startDate, endDate });
       setSelectedRunId(newRun.id);
-      toast.success(`Payroll run generated for ${newRun.monthName}!`);
+      toast.success(`Payroll run generated for ${newRun.monthName} (${startDate} to ${endDate})!`);
     } catch (e: any) {
       toast.error(e.message || 'Failed to generate payroll');
+    } finally {
+      setIsProcessingRun(false);
+    }
+  };
+
+  const handleRecalculateRun = async (runId: string) => {
+    try {
+      setIsProcessingRun(true);
+      const updated = await recalculatePayrollRun(runId);
+      if (updated) {
+        toast.success(`Payroll recalculated with latest reconciled attendance & tax rules for ${updated.monthName}!`);
+      } else {
+        toast.error('Unable to find payroll run to recalculate.');
+      }
+    } catch (err: any) {
+      toast.error(err.message || 'Failed to recalculate payroll run');
     } finally {
       setIsProcessingRun(false);
     }
@@ -133,8 +253,8 @@ export function Payroll() {
   const handleDownloadPayTemplate = () => {
     const templateRows = [
       {
-        'Employee ID': 'EMP-001',
-        'Employee Name': 'Suman Shrestha',
+        'Employee ID / Bio ID': 1256,
+        'Employee Name': 'Ram Sharma',
         'Basic Salary (NPR)': 55000,
         'Allowances (NPR)': 15000,
         'Marital Status (Single/Married)': 'Married',
@@ -144,8 +264,8 @@ export function Payroll() {
         'Account Number': '0192837465012'
       },
       {
-        'Employee ID': 'EMP-002',
-        'Employee Name': 'Aayush Maharjan',
+        'Employee ID / Bio ID': 2,
+        'Employee Name': 'Sita Devi',
         'Basic Salary (NPR)': 48000,
         'Allowances (NPR)': 12000,
         'Marital Status (Single/Married)': 'Single',
@@ -155,8 +275,8 @@ export function Payroll() {
         'Account Number': '0203948576101'
       },
       {
-        'Employee ID': 'EMP-003',
-        'Employee Name': 'Pooja Karki',
+        'Employee ID / Bio ID': 45,
+        'Employee Name': 'Hari Prasad',
         'Basic Salary (NPR)': 60000,
         'Allowances (NPR)': 16000,
         'Marital Status (Single/Married)': 'Single',
@@ -194,31 +314,58 @@ export function Payroll() {
         }
 
         const parsed = data.map((row: any, idx: number) => {
-          const empId = row['Employee ID'] || row['Emp ID'] || row['ID'] || `EMP-${idx + 1}`;
-          const name = row['Employee Name'] || row['Name'] || row['Full Name'] || 'Employee';
-          const basic = parseFloat(row['Basic Salary (NPR)'] || row['Basic Salary'] || row['Basic'] || 45000);
-          const allowances = parseFloat(row['Allowances (NPR)'] || row['Allowances'] || 10000);
-          
-          const rawMarital = (row['Marital Status (Single/Married)'] || row['Marital Status'] || row['Marital'] || 'Single').toString().trim();
-          const maritalStatus: 'Single' | 'Married' = rawMarital.toLowerCase().includes('mar') ? 'Married' : 'Single';
+          // Dynamic case-insensitive key extractor
+          const getValue = (keys: string[]) => {
+            for (const k of keys) {
+              const matchedKey = Object.keys(row).find(rk => rk.trim().toLowerCase() === k.toLowerCase());
+              if (matchedKey && row[matchedKey] !== undefined && row[matchedKey] !== null && row[matchedKey] !== '') {
+                return row[matchedKey];
+              }
+            }
+            return null;
+          };
 
-          const rawSSF = (row['SSF Enrolled (Yes/No)'] || row['SSF Enrolled'] || row['SSF'] || 'Yes').toString().trim();
-          const ssfEnrolled = !rawSSF.toLowerCase().includes('no') && !rawSSF.toLowerCase().includes('false') && rawSSF !== '0';
+          const rawEmpId = getValue(['Employee ID', 'Emp ID', 'ID', 'Emp Code', 'Employee Code', 'EmpNo', 'Code', 'Emp_ID', 'S.No']) || `EMP-${idx + 1}`;
+          const rawName = getValue(['Employee Name', 'Name', 'Full Name', 'Emp Name', 'Staff Name', 'Employee']) || `Employee ${idx + 1}`;
+          const rawBasic = getValue(['Basic Salary (NPR)', 'Basic Salary', 'Basic', 'Basic Pay', 'Base Salary', 'Salary']);
+          const rawAllowances = getValue(['Allowances (NPR)', 'Allowances', 'Allowance', 'Other Allowances', 'Allow']);
+          const rawMarital = getValue(['Marital Status (Single/Married)', 'Marital Status', 'Marital', 'MaritalStatus', 'Status (Marital)', 'Marital_Status']);
+          const rawSSF = getValue(['SSF Enrolled (Yes/No)', 'SSF Enrolled', 'SSF', 'SSF Status', 'Social Security', 'SSF_Enrolled']);
+          const rawPan = getValue(['PAN Number', 'PAN', 'Pan No', 'Tax ID', 'PAN ID', 'Pan_Number']);
+          const rawBank = getValue(['Bank Name', 'Bank', 'Bank Details', 'Bank_Name']);
+          const rawAcc = getValue(['Account Number', 'Account', 'Acc No', 'Account No', 'Bank Account', 'Account_Number']);
+          const rawDept = getValue(['Department', 'Dept', 'Division']);
+          const rawDesig = getValue(['Designation', 'Role', 'Position', 'Title']);
 
-          const pan = row['PAN Number'] || row['PAN'] || `10${Math.floor(1000000 + Math.random() * 9000000)}`;
-          const bank = row['Bank Name'] || row['Bank'] || 'Nabil Bank';
-          const acc = row['Account Number'] || row['Account'] || `ACC-${Math.floor(10000000 + Math.random() * 90000000)}`;
+          const empIdStr = rawEmpId.toString().trim();
+          const nameStr = rawName.toString().trim();
+          const basic = parseFloat(rawBasic) || 45000;
+          const allowances = parseFloat(rawAllowances) || 10000;
 
+          const maritalStr = (rawMarital || 'Single').toString().trim().toLowerCase();
+          const maritalStatus: 'Single' | 'Married' = maritalStr.includes('mar') ? 'Married' : 'Single';
+
+          const ssfStr = (rawSSF || 'Yes').toString().trim().toLowerCase();
+          const ssfEnrolled = !ssfStr.includes('no') && !ssfStr.includes('false') && ssfStr !== '0';
+
+          const pan = rawPan ? rawPan.toString().trim() : `10${Math.floor(1000000 + Math.random() * 9000000)}`;
+          const bank = rawBank ? rawBank.toString().trim() : 'Nabil Bank';
+          const acc = rawAcc ? rawAcc.toString().trim() : `ACC-${Math.floor(10000000 + Math.random() * 90000000)}`;
+
+          // Find match in current employee list
           const matchedEmp = employees.find(emp => 
-            emp.id.toLowerCase() === empId.toString().toLowerCase() ||
-            emp.name.toLowerCase().includes(name.toString().toLowerCase())
+            emp.id.trim().toLowerCase() === empIdStr.toLowerCase() ||
+            emp.id.replace(/[^a-zA-Z0-9]/g, '').toLowerCase() === empIdStr.replace(/[^a-zA-Z0-9]/g, '').toLowerCase() ||
+            emp.name.trim().toLowerCase() === nameStr.toLowerCase() ||
+            emp.name.toLowerCase().includes(nameStr.toLowerCase()) ||
+            nameStr.toLowerCase().includes(emp.name.toLowerCase())
           );
 
           return {
             rowId: idx,
-            empId: matchedEmp ? matchedEmp.id : empId,
+            empId: matchedEmp ? matchedEmp.id : empIdStr,
             matchedEmpId: matchedEmp?.id,
-            name: matchedEmp ? matchedEmp.name : name,
+            name: matchedEmp ? matchedEmp.name : nameStr,
             basicSalary: basic,
             allowances,
             maritalStatus,
@@ -226,12 +373,14 @@ export function Payroll() {
             panNumber: pan,
             bankName: bank,
             accountNumber: acc,
+            department: rawDept ? rawDept.toString().trim() : matchedEmp?.department,
+            designation: rawDesig ? rawDesig.toString().trim() : matchedEmp?.designation,
             isMatched: !!matchedEmp
           };
         });
 
         setImportPreviewData(parsed);
-        toast.success(`Parsed ${parsed.length} employee pay detail rows from Excel!`);
+        toast.success(`Parsed ${parsed.length} employee pay detail records from Excel!`);
       } catch (err: any) {
         toast.error(`Error parsing Excel file: ${err.message}`);
       }
@@ -239,34 +388,79 @@ export function Payroll() {
     reader.readAsBinaryString(file);
   };
 
-  // Apply imported pay details to system
+  // Apply imported pay details and persist directly to local SQLite database
   const handleApplyImportedPayDetails = async () => {
     if (importPreviewData.length === 0) return;
     setIsApplyingImport(true);
 
     try {
       let updatedCount = 0;
+      let createdCount = 0;
+
+      // Copy current employees array
+      const updatedEmployeesList = [...employees];
+
       for (const item of importPreviewData) {
-        const targetEmp = employees.find(e => e.id === item.empId || e.id === item.matchedEmpId);
-        if (targetEmp) {
-          await updateEmployee(targetEmp.id, {
+        const existingIdx = updatedEmployeesList.findIndex(e => 
+          (item.matchedEmpId && e.id === item.matchedEmpId) ||
+          e.id.trim().toLowerCase() === item.empId.trim().toLowerCase() ||
+          e.name.trim().toLowerCase() === item.name.trim().toLowerCase()
+        );
+
+        if (existingIdx >= 0) {
+          const target = updatedEmployeesList[existingIdx];
+          updatedEmployeesList[existingIdx] = {
+            ...target,
             basicSalary: item.basicSalary,
             allowances: item.allowances,
             maritalStatus: item.maritalStatus,
             ssfEnrolled: item.ssfEnrolled,
-            panNumber: item.panNumber,
-            bankName: item.bankName,
-            accountNumber: item.accountNumber
-          });
+            panNumber: item.panNumber || target.panNumber,
+            bankName: item.bankName || target.bankName,
+            accountNumber: item.accountNumber || target.accountNumber,
+            department: item.department || target.department,
+            designation: item.designation || target.designation
+          };
           updatedCount++;
+        } else {
+          const newEmp: Employee = {
+            id: item.empId || `EMP-${Date.now().toString().slice(-4)}`,
+            name: item.name,
+            department: item.department || 'General',
+            designation: item.designation || 'Staff',
+            joiningDate: new Date().toISOString().split('T')[0],
+            status: 'Active',
+            basicSalary: item.basicSalary,
+            allowances: item.allowances,
+            maritalStatus: item.maritalStatus,
+            ssfEnrolled: item.ssfEnrolled,
+            panNumber: item.panNumber || `10${Math.floor(1000000 + Math.random() * 9000000)}`,
+            bankName: item.bankName || 'Nabil Bank',
+            accountNumber: item.accountNumber || `ACC-${Math.floor(10000000 + Math.random() * 90000000)}`
+          };
+          updatedEmployeesList.push(newEmp);
+          createdCount++;
         }
       }
 
-      toast.success(`Successfully imported and updated pay details for ${updatedCount} employees!`);
+      // Update in-memory state in Zustand store
+      await setEmployees(updatedEmployeesList);
+
+      // Persist directly into local SQLite database via saveLocalTable
+      const savedToSqlite = await saveLocalTable('employees', updatedEmployeesList);
+
+      if (savedToSqlite) {
+        toast.success(
+          `Successfully imported and saved pay details to local SQLite! (${updatedCount} updated, ${createdCount} new created)`
+        );
+      } else {
+        toast.success(`Imported pay details for ${importPreviewData.length} employees into workspace!`);
+      }
+
       setIsImportModalOpen(false);
       setImportPreviewData([]);
     } catch (err: any) {
-      toast.error(`Import error: ${err.message}`);
+      toast.error(`Import failed: ${err.message}`);
     } finally {
       setIsApplyingImport(false);
     }
@@ -310,13 +504,13 @@ export function Payroll() {
     const ws = XLSX.utils.json_to_sheet(exportData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Nepal Bank Transfer File');
-    XLSX.writeFile(wb, `${settings.companyName}_Nepal_Bank_Disbursement_${run.month}.xlsx`);
+    XLSX.writeFile(wb, `${settings?.companyName || 'Company'}_Nepal_Bank_Disbursement_${run.month}.xlsx`);
     toast.success('Nepal Bank Transfer Direct Deposit file downloaded!');
   };
 
   // Handle Export Tax TDS Report
   const handleExportTaxReport = (run: PayrollRun) => {
-    const exportData = run.records.map((r, i) => ({
+    const exportData = (run.records || []).map((r, i) => ({
       'S.No': i + 1,
       'Employee ID': r.employeeId,
       'Employee Name': r.employeeName,
@@ -333,7 +527,7 @@ export function Payroll() {
     const ws = XLSX.utils.json_to_sheet(exportData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Nepal IRD Tax & SSF Report');
-    XLSX.writeFile(wb, `${settings.companyName}_Nepal_IRD_TDS_Report_${run.month}.xlsx`);
+    XLSX.writeFile(wb, `${settings?.companyName || 'Company'}_Nepal_IRD_TDS_Report_${run.month}.xlsx`);
     toast.success('Nepal IRD Tax TDS & SSF Statutory Report downloaded!');
   };
 
@@ -380,6 +574,26 @@ export function Payroll() {
                 {selectedBsMonth === '04' && <Sparkles size={11} className="text-emerald-300" />}
                 {currentFiscalYear} (M{FY_NEPALI_MONTHS.find(m => m.id === selectedBsMonth)?.fyMonth})
               </Badge>
+            </div>
+
+            {/* Attendance Calculation Date Range Selector */}
+            <div className="flex items-center gap-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl px-3 py-1.5 shadow-sm">
+              <span className="text-[10px] uppercase font-black tracking-wider text-slate-400">Date Range:</span>
+              <input
+                type="date"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+                className="bg-transparent text-xs font-bold text-slate-800 dark:text-slate-100 focus:outline-none cursor-pointer"
+                title="Start Date"
+              />
+              <span className="text-slate-400 text-xs font-bold">to</span>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+                className="bg-transparent text-xs font-bold text-slate-800 dark:text-slate-100 focus:outline-none cursor-pointer"
+                title="End Date"
+              />
             </div>
 
             {/* Import Pay Details via Excel Button */}
@@ -533,49 +747,71 @@ export function Payroll() {
           ) : (
             <>
               {/* Batch Overview Header */}
-              <Card className="p-5 bg-gradient-to-r from-slate-900 to-indigo-950 text-white border-none shadow-lg">
+              <Card className="p-5 bg-white dark:bg-slate-900 text-slate-900 dark:text-white border border-slate-200 dark:border-slate-800 shadow-sm transition-colors">
                 <div className="flex items-center justify-between flex-wrap gap-4">
                   <div className="space-y-1">
                     <div className="flex items-center gap-2">
                       <h2 className="text-lg font-black tracking-tight">{currentRun.monthName} Nepal Payroll Batch</h2>
                       <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
-                        currentRun.status === 'Disbursed' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' :
-                        currentRun.status === 'Approved' ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' :
-                        'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                        currentRun.status === 'Disbursed' ? 'bg-emerald-100 dark:bg-emerald-950/80 text-emerald-800 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800' :
+                        currentRun.status === 'Approved' ? 'bg-indigo-100 dark:bg-indigo-950/80 text-indigo-800 dark:text-indigo-300 border border-indigo-300 dark:border-indigo-800' :
+                        'bg-amber-100 dark:bg-amber-950/80 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-800'
                       }`}>
                         {currentRun.status}
                       </span>
                     </div>
-                    <p className="text-xs text-slate-300">
-                      Created on {new Date(currentRun.createdAt).toLocaleDateString()} by {currentRun.createdBy} • {currentRun.totalEmployees} Employees Processed
+                    <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-2 flex-wrap">
+                      <span>Created on {new Date(currentRun.createdAt).toLocaleDateString()} by {currentRun.createdBy}</span>
+                      <span>•</span>
+                      <span>{currentRun.totalEmployees} Employees Processed</span>
+                      {currentRun.startDate && currentRun.endDate && (
+                        <>
+                          <span>•</span>
+                          <span className="font-semibold text-indigo-600 dark:text-indigo-400">
+                            Range: {currentRun.startDate} to {currentRun.endDate}
+                          </span>
+                        </>
+                      )}
                     </p>
                   </div>
 
                   <div className="flex items-center gap-3 flex-wrap">
                     {currentRun.status === 'Draft' && (
-                      <Button 
-                        onClick={() => handleApprove(currentRun.id)}
-                        className="gap-2 bg-indigo-500 hover:bg-indigo-600 text-white text-xs font-bold"
-                      >
-                        <CheckCircle2 size={14} />
-                        Approve & Lock Run
-                      </Button>
-                    )}
+                      <>
+                        <Button 
+                          onClick={() => handleRecalculateRun(currentRun.id)}
+                          disabled={isProcessingRun}
+                          variant="outline"
+                          className="gap-2 text-xs font-bold border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/50 hover:bg-indigo-100 dark:hover:bg-indigo-900 text-indigo-700 dark:text-indigo-300"
+                        >
+                          <RotateCcw size={14} className={isProcessingRun ? 'animate-spin' : ''} />
+                          {isProcessingRun ? 'Recalculating...' : 'Recalculate Batch'}
+                        </Button>
+                        <Button 
+                          onClick={() => handleApprove(currentRun.id)}
+                          className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-sm"
+                        >
+                          <CheckCircle2 size={14} />
+                          Approve & Lock Run
+                        </Button>
+                      </>
+        
 
+                    )}
                     {currentRun.status === 'Approved' && (
                       <Button 
-                        onClick={() => handleDisburse(currentRun.id)}
-                        className="gap-2 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold"
+                        onClick={() => {
+                          setSelectedRunId(currentRun.id);
+                          setActiveTab('disbursement');
+                        }}
+                        className="gap-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-sm"
                       >
                         <Send size={14} />
-                        Disburse Salaries Now
+                        Go to Disbursement Center
                       </Button>
                     )}
-
-                    <Button 
-                      variant="outline"
-                      onClick={() => handleExportBankFile(currentRun)}
-                      className="gap-2 text-xs font-bold text-slate-800 dark:text-white bg-white/10 hover:bg-white/20 border-white/20"
+                    <Button variant="outline" onClick={() => handleExportBankFile(currentRun)}
+                      className="gap-2 text-xs font-bold text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800"
                     >
                       <FileSpreadsheet size={14} />
                       Nepal Bank Transfer CSV
@@ -584,43 +820,45 @@ export function Payroll() {
                     <Button 
                       variant="outline"
                       onClick={() => handleExportTaxReport(currentRun)}
-                      className="gap-2 text-xs font-bold text-slate-800 dark:text-white bg-white/10 hover:bg-white/20 border-white/20"
+                      className="gap-2 text-xs font-bold text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800"
                     >
                       <FileText size={14} />
                       Nepal IRD TDS Report
                     </Button>
 
-                    <button 
-                      onClick={() => deletePayrollRun(currentRun.id)}
-                      className="p-2 text-rose-300 hover:bg-rose-500/20 rounded-lg transition-colors"
-                      title="Delete Payroll Run"
-                    >
-                      <Trash2 size={16} />
-                    </button>
+                    {currentRun.status === 'Draft' && (
+                      <button 
+                        onClick={() => setRunToDelete(currentRun)}
+                        className="p-2 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/50 rounded-lg transition-colors"
+                        title="Delete Draft Payroll Run"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    )}
                   </div>
                 </div>
 
                 {/* Batch Metrics Grid */}
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6 pt-5 border-t border-white/10 text-center">
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6 pt-5 border-t border-slate-200 dark:border-slate-800 text-center">
                   <div>
-                    <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest">Total Gross</p>
-                    <p className="text-base font-black text-white mt-0.5">Rs. {currentRun.totalGrossSalary.toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-black tracking-widest">Total Gross</p>
+                    <p className="text-base font-black text-slate-900 dark:text-white mt-0.5">Rs. {currentRun.totalGrossSalary.toLocaleString()}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest">Tax (TDS) Withheld</p>
-                    <p className="text-base font-black text-amber-300 mt-0.5">Rs. {currentRun.totalTaxTDS.toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-black tracking-widest">Tax (TDS) Withheld</p>
+                    <p className="text-base font-black text-amber-600 dark:text-amber-400 mt-0.5">Rs. {currentRun.totalTaxTDS.toLocaleString()}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest">Social Security (SSF)</p>
-                    <p className="text-base font-black text-sky-300 mt-0.5">Rs. {currentRun.totalSocialSecurity.toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-black tracking-widest">Social Security (SSF)</p>
+                    <p className="text-base font-black text-sky-600 dark:text-sky-400 mt-0.5">Rs. {currentRun.totalSocialSecurity.toLocaleString()}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest">Total Deductions</p>
-                    <p className="text-base font-black text-rose-300 mt-0.5">Rs. {currentRun.totalDeductions.toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-black tracking-widest">Total Deductions</p>
+                    <p className="text-base font-black text-rose-600 dark:text-rose-400 mt-0.5">Rs. {currentRun.totalDeductions.toLocaleString()}</p>
                   </div>
                   <div>
-                    <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest">Total Net Disbursable</p>
-                    <p className="text-base font-black text-emerald-400 mt-0.5">Rs. {currentRun.totalNetSalary.toLocaleString()}</p>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-black tracking-widest">Total Net Disbursable</p>
+                    <p className="text-base font-black text-emerald-600 dark:text-emerald-400 mt-0.5">Rs. {currentRun.totalNetSalary.toLocaleString()}</p>
                   </div>
                 </div>
               </Card>
@@ -758,67 +996,175 @@ export function Payroll() {
                 </p>
               </div>
 
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-bold text-slate-500">Channel:</span>
-                <select
-                  value={disbursementMethod}
-                  onChange={(e) => setDisbursementMethod(e.target.value as DisbursementMethod)}
-                  className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs font-bold px-3 py-1.5 focus:ring-2 focus:ring-indigo-500/20"
-                >
-                  <option value="Bank Transfer">Bank Direct Deposit / ACH</option>
-                  <option value="Cheque">Corporate Cheque</option>
-                  <option value="Cash">Cash Pay Slip</option>
-                </select>
+              <div className="flex items-center gap-3 flex-wrap">
+                {payrollRuns.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-slate-500">Run:</span>
+                    <select
+                      value={selectedRunId || currentRun?.id || ''}
+                      onChange={(e) => setSelectedRunId(e.target.value)}
+                      className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs font-bold px-3 py-1.5 focus:ring-2 focus:ring-indigo-500/20"
+                    >
+                      {payrollRuns.map(run => (
+                        <option key={run.id} value={run.id}>
+                          {run.monthName} ({run.status}) - Rs. {run.totalNetSalary.toLocaleString()}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+    
+                )}
+
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-slate-500">Channel:</span>
+                  <select
+                    value={disbursementMethod}
+                    onChange={(e) => setDisbursementMethod(e.target.value as DisbursementMethod)}
+                    className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs font-bold px-3 py-1.5 focus:ring-2 focus:ring-indigo-500/20"
+                  >
+                    <option value="Bank Transfer">Bank Direct Deposit / ACH</option>
+                    <option value="Cheque">Corporate Cheque</option>
+                    <option value="Cash">Cash Pay Slip</option>
+                  </select>
+                </div>
+
+                {currentRun && (
+                  <Button 
+                    variant="outline"
+                    onClick={() => setActiveTab('processing')}
+                    className="gap-1.5 text-xs font-bold text-indigo-600 border-indigo-200 dark:border-indigo-900 hover:bg-indigo-50 dark:hover:bg-indigo-950"
+                  >
+                    <Eye size={14} />
+                    View Details in Tab 1
+                  </Button>
+    
+                )}
               </div>
             </div>
 
             {currentRun ? (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div className="p-5 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-500 uppercase">Target Batch</span>
-                    <Badge variant={currentRun.status === 'Disbursed' ? 'success' : 'warning'}>{currentRun.status}</Badge>
-                  </div>
-                  <p className="text-xl font-black text-slate-900 dark:text-white">{currentRun.monthName}</p>
-                  <p className="text-xs text-slate-500">{currentRun.totalEmployees} Employee Records</p>
-                </div>
-
-                <div className="p-5 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-3">
-                  <span className="text-xs font-bold text-slate-500 uppercase">Total Net Disbursement</span>
-                  <p className="text-2xl font-black text-emerald-600 dark:text-emerald-400">Rs. {currentRun.totalNetSalary.toLocaleString()}</p>
-                  <p className="text-xs text-slate-500">Method: {disbursementMethod}</p>
-                </div>
-
-                <div className="p-5 bg-indigo-50 dark:bg-indigo-950/40 rounded-2xl border border-indigo-100 dark:border-indigo-900 flex flex-col justify-between space-y-4">
-                  <div>
-                    <p className="text-xs font-bold text-indigo-900 dark:text-indigo-300">Execute Disbursement Action</p>
-                    <p className="text-[11px] text-indigo-700 dark:text-indigo-400 mt-0.5">
-                      {currentRun.status === 'Disbursed' 
-                        ? `Disbursed on ${new Date(currentRun.disbursedAt!).toLocaleDateString()} by ${currentRun.disbursedBy}` 
-                        : 'Approval required before executing final payout.'}
-                    </p>
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <div className="p-5 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-500 uppercase">Target Batch</span>
+                      <Badge variant={currentRun.status === 'Disbursed' ? 'success' : currentRun.status === 'Approved' ? 'info' : 'warning'}>
+                        {currentRun.status}
+                      </Badge>
+                    </div>
+                    <p className="text-xl font-black text-slate-900 dark:text-white">{currentRun.monthName}</p>
+                    <p className="text-xs text-slate-500">{currentRun.totalEmployees} Employee Records</p>
                   </div>
 
-                  {currentRun.status === 'Approved' ? (
-                    <Button onClick={() => handleDisburse(currentRun.id)} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white gap-2 font-bold">
-                      <Send size={16} />
-                      Disburse Rs. {currentRun.totalNetSalary.toLocaleString()}
-                    </Button>
-                  ) : currentRun.status === 'Draft' ? (
-                    <Button onClick={() => handleApprove(currentRun.id)} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white gap-2 font-bold">
-                      <CheckCircle2 size={16} />
-                      Approve Batch First
-                    </Button>
-                  ) : (
-                    <Button variant="outline" onClick={() => handleExportBankFile(currentRun)} className="w-full gap-2 font-bold">
-                      <Download size={16} />
-                      Re-download Bank Transfer CSV
-                    </Button>
-                  )}
+                  <div className="p-5 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-3">
+                    <span className="text-xs font-bold text-slate-500 uppercase">Total Net Disbursement</span>
+                    <p className="text-2xl font-black text-emerald-600 dark:text-emerald-400">Rs. {currentRun.totalNetSalary.toLocaleString()}</p>
+                    <p className="text-xs text-slate-500">Channel: {disbursementMethod}</p>
+                  </div>
+
+                  <div className="p-5 bg-indigo-50 dark:bg-indigo-950/40 rounded-2xl border border-indigo-100 dark:border-indigo-900 flex flex-col justify-between space-y-4">
+                    <div>
+                      <p className="text-xs font-bold text-indigo-900 dark:text-indigo-300">Execute Disbursement Action</p>
+                      <p className="text-[11px] text-indigo-700 dark:text-indigo-400 mt-0.5">
+                        {currentRun.status === 'Disbursed' 
+                          ? `Disbursed on ${currentRun.disbursedAt ? new Date(currentRun.disbursedAt).toLocaleDateString() : 'Today'} by ${currentRun.disbursedBy || 'HR Admin'}` 
+                          : currentRun.status === 'Approved'
+                          ? 'Ready for instant automated bank payout execution.'
+                          : 'Approval required before executing final payout.'}
+                      </p>
+                    </div>
+
+                    {currentRun.status === 'Approved' ? (
+                      <Button onClick={() => handleDisburse(currentRun.id)} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white gap-2 font-bold shadow-lg">
+                        <Send size={16} />
+                        Disburse Rs. {currentRun.totalNetSalary.toLocaleString()}
+                      </Button>
+                    ) : currentRun.status === 'Draft' ? (
+                      <Button onClick={() => handleApprove(currentRun.id)} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white gap-2 font-bold">
+                        <CheckCircle2 size={16} />
+                        Approve Batch First
+                      </Button>
+                    ) : (
+                      <Button variant="outline" onClick={() => handleExportBankFile(currentRun)} className="w-full gap-2 font-bold">
+                        <Download size={16} />
+                        Re-download Bank Transfer File
+                      </Button>
+        
+                    )}
+                  </div>
                 </div>
-              </div>
+
+                {/* Employee Disbursement Schedule Table */}
+                <div className="pt-4 border-t border-slate-100 dark:border-slate-800">
+                  <div className="flex items-center justify-between mb-3">
+                    <h4 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider">
+                      Employee Disbursement Pay Schedule ({currentRun.records.length} Employees)
+                    </h4>
+                    <Button 
+                      variant="outline" 
+                      onClick={() => handleExportBankFile(currentRun)}
+                      className="gap-1.5 text-xs text-slate-700 dark:text-slate-300"
+                    >
+                      <FileSpreadsheet size={14} />
+                      Export Bank File
+                    </Button>
+                  </div>
+
+                  <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-2xl">
+                    <table className="w-full text-left text-xs divide-y divide-slate-100 dark:divide-slate-800">
+                      <thead className="bg-slate-50 dark:bg-slate-900 font-bold text-slate-500 text-[10px] uppercase">
+                        <tr>
+                          <th className="py-2.5 px-3">Employee</th>
+                          <th className="py-2.5 px-3">Bank Details</th>
+                          <th className="py-2.5 px-3 text-right">Payable Days</th>
+                          <th className="py-2.5 px-3 text-right">Gross Salary</th>
+                          <th className="py-2.5 px-3 text-right">Tax TDS</th>
+                          <th className="py-2.5 px-3 text-right">Net Payable</th>
+                          <th className="py-2.5 px-3 text-center">Status</th>
+                          <th className="py-2.5 px-3">Transaction Ref</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                        {currentRun.records.map((rec) => (
+                          <tr key={rec.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                            <td className="py-2.5 px-3">
+                              <p className="font-bold text-slate-900 dark:text-white">{rec.employeeName}</p>
+                              <p className="text-[10px] font-mono text-slate-400">{rec.employeeId} • {rec.department}</p>
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <p className="font-semibold text-slate-800 dark:text-slate-200">{rec.bankName || 'Nabil Bank'}</p>
+                              <p className="text-[10px] font-mono text-slate-400">{rec.accountNumber || 'ACC-001'}</p>
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-700 dark:text-slate-300">
+                              {rec.payableDays} days
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono font-semibold text-slate-900 dark:text-white">
+                              Rs. {rec.grossSalary.toLocaleString()}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono text-amber-600 dark:text-amber-400">
+                              Rs. {rec.incomeTaxTDS.toLocaleString()}
+                            </td>
+                            <td className="py-2.5 px-3 text-right font-mono font-black text-emerald-600 dark:text-emerald-400">
+                              Rs. {rec.netSalary.toLocaleString()}
+                            </td>
+                            <td className="py-2.5 px-3 text-center">
+                              <Badge variant={rec.disbursementStatus === 'Disbursed' ? 'success' : 'warning'}>
+                                {rec.disbursementStatus}
+                              </Badge>
+                            </td>
+                            <td className="py-2.5 px-3 font-mono text-[10px] text-slate-500">
+                              {rec.transactionRef || 'Pending'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
             ) : (
               <p className="text-xs text-slate-400 italic">No payroll batch currently selected.</p>
+
             )}
           </Card>
         </div>
@@ -876,68 +1222,226 @@ export function Payroll() {
                     <span className="font-bold text-amber-700 dark:text-amber-300">Rs. {currentRun.totalTaxTDS.toLocaleString()}</span>
                   </div>
                 </div>
+  
               )}
             </Card>
           </div>
+              <Card className="p-6 space-y-4 md:col-span-2">
+                <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                    <ShieldCheck className="text-emerald-500" size={18} />
+                    Tax Reconciliation & Annual Tax Preview
+                  </h3>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs whitespace-nowrap">
+                    <thead>
+                      <tr className="border-b border-slate-200 dark:border-slate-700 text-slate-500 uppercase tracking-wider font-bold">
+                        <th className="py-2 px-2">Employee</th>
+                        <th className="py-2 px-2 text-right">Ann. Gross</th>
+                        <th className="py-2 px-2 text-right">Taxable Inc.</th>
+                        <th className="py-2 px-2 text-right">Ann. Tax</th>
+                        <th className="py-2 px-2 text-right">Current Month TDS</th>
+                        <th className="py-2 px-2 text-center">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800 font-medium">
+                      {currentRun && currentRun.records && currentRun.records.length > 0 ? (
+                        currentRun.records.map(r => {
+                          const annGross = (r.grossSalary || 0) * 12;
+                          return (
+                            <tr key={r.id}>
+                              <td className="py-2 px-2">
+                                <p className="text-slate-900 dark:text-white font-bold">{r.employeeName}</p>
+                                <p className="text-[10px] text-slate-400">{r.panNumber || 'No PAN'}</p>
+                              </td>
+                              <td className="py-2 px-2 text-right font-mono">Rs. {annGross.toLocaleString()}</td>
+                              <td className="py-2 px-2 text-right font-mono">Rs. {(r.annualizedTaxableIncome || 0).toLocaleString()}</td>
+                              <td className="py-2 px-2 text-right font-mono text-amber-600 font-bold">Rs. {(r.annualTaxLiability || 0).toLocaleString()}</td>
+                              <td className="py-2 px-2 text-right font-mono text-indigo-600 font-bold">Rs. {(r.incomeTaxTDS || 0).toLocaleString()}</td>
+                              <td className="py-2 px-2 text-center">
+                                <span className="px-2 py-0.5 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 rounded text-[10px] font-bold">Balanced</span>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      ) : (
+                        <tr>
+                          <td colSpan={6} className="py-8 text-center text-slate-400 italic font-normal">
+                            No payroll batch selected or records found. Run or select a payroll batch to preview tax reconciliation.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+
         </div>
       )}
 
-      {/* TAB 4: EMPLOYEE COMPENSATION SETUP */}
+      {/* TAB 4: EMPLOYEE COMPENSATION & PAY SETUP */}
       {activeTab === 'employees' && (
-        <Card className="p-6 space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
+        <Card className="p-6 space-y-5">
+          <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4 flex-wrap gap-4">
             <div>
-              <h3 className="text-base font-bold text-slate-900 dark:text-white">Employee Compensation & Bank Directory</h3>
-              <p className="text-xs text-slate-500">Set basic salary benchmarks, allowances, PAN tax identification numbers, and bank account details for each employee.</p>
+              <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                <User className="text-indigo-600 dark:text-indigo-400" size={18} />
+                Employee Pay Setup & Bank Directory
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Set basic salary benchmarks, allowances, PAN tax identification numbers, and bank account details for each employee.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {selectedPayEmpIds.length > 0 && (
+                <Button 
+                  onClick={() => setIsBulkDeletePayOpen(true)}
+                  className="gap-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold shadow-md shadow-rose-600/20"
+                >
+                  <Trash2 size={14} />
+                  Delete Selected ({selectedPayEmpIds.length})
+                </Button>
+  
+              )}
+              <Button 
+                variant="outline"
+                onClick={() => setIsImportModalOpen(true)}
+                className="gap-2 text-xs border-emerald-300 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
+              >
+                <FileUp size={14} />
+                Import Pay Details (Excel)
+              </Button>
             </div>
           </div>
 
-          <div className="overflow-x-auto custom-scrollbar">
-            <table className="w-full text-left border-collapse min-w-[800px]">
+          {/* Search & Department Filter Bar */}
+          <div className="flex items-center justify-between gap-4 flex-wrap">
+            <div className="flex items-center gap-3 flex-1 min-w-[280px]">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input 
+                  type="text" 
+                  placeholder="Search by Employee Name, ID, PAN, or Bank..."
+                  value={empPaySearch}
+                  onChange={(e) => setEmpPaySearch(e.target.value)}
+                  className="w-full pl-9 pr-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs font-medium focus:ring-2 focus:ring-indigo-500/20 transition-all outline-none"
+                />
+              </div>
+
+              <select
+                value={empPayDept}
+                onChange={(e) => setEmpPayDept(e.target.value)}
+                className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs font-bold px-3 py-2 focus:ring-2 focus:ring-indigo-500/20"
+              >
+                {departments.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
+
+            <span className="text-xs text-slate-400 font-medium">
+              Showing {filteredPayEmployees.length} of {employees.length} employees
+            </span>
+          </div>
+
+          {/* Employee Pay Setup Table */}
+          <div className="overflow-x-auto custom-scrollbar border border-slate-200 dark:border-slate-800 rounded-2xl">
+            <table className="w-full text-left border-collapse min-w-[850px]">
               <thead>
-                <tr className="bg-slate-50 dark:bg-slate-900 text-[10px] uppercase font-black text-slate-400 border-b border-slate-200 dark:border-slate-800">
+                <tr className="bg-slate-100 dark:bg-slate-900/80 text-[10px] uppercase font-black text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-800">
+                  <th className="py-3 px-4 w-10 text-center">
+                    <input 
+                      type="checkbox"
+                      checked={isAllPayEmpSelected}
+                      onChange={toggleSelectAllPayEmp}
+                      className="rounded border-slate-300 dark:border-slate-700 text-indigo-600 focus:ring-indigo-500"
+                    />
+                  </th>
                   <th className="py-3 px-4">Employee</th>
                   <th className="py-3 px-4">Department / Designation</th>
                   <th className="py-3 px-4 text-right">Basic Monthly Salary</th>
                   <th className="py-3 px-4 text-right">Allowances</th>
+                  <th className="py-3 px-4 text-center">Marital / SSF</th>
                   <th className="py-3 px-4">PAN Tax ID</th>
                   <th className="py-3 px-4">Bank Name & Account</th>
-                  <th className="py-3 px-4 text-center">Action</th>
+                  <th className="py-3 px-4 text-center">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-xs">
-                {employees.map(emp => (
-                  <tr key={emp.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/50">
-                    <td className="py-3 px-4 font-bold text-slate-900 dark:text-white">
-                      {emp.name}
-                      <span className="block text-[10px] font-mono text-slate-400">ID: {emp.id}</span>
-                    </td>
-                    <td className="py-3 px-4">
-                      {emp.department}
-                      <span className="block text-[10px] text-slate-400">{emp.designation}</span>
-                    </td>
-                    <td className="py-3 px-4 text-right font-bold text-slate-900 dark:text-white">
-                      Rs. {(emp.basicSalary || 45000).toLocaleString()}
-                    </td>
-                    <td className="py-3 px-4 text-right font-medium text-slate-600 dark:text-slate-300">
-                      Rs. {(emp.allowances || 10000).toLocaleString()}
-                    </td>
-                    <td className="py-3 px-4 font-mono">{emp.panNumber || `PAN-${emp.id}`}</td>
-                    <td className="py-3 px-4">
-                      <div className="font-semibold">{emp.bankName || 'Standard Chartered Bank'}</div>
-                      <div className="text-[10px] text-slate-400 font-mono">{emp.accountNumber || `ACC-${emp.id}982`}</div>
-                    </td>
-                    <td className="py-3 px-4 text-center">
-                      <button 
-                        onClick={() => setEditingEmployeeSalary(emp)}
-                        className="p-1.5 text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-950 rounded-lg transition-colors"
-                        title="Update Pay Profile"
-                      >
-                        <Edit2 size={14} />
-                      </button>
+                {filteredPayEmployees.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="py-8 text-center text-slate-400 italic">
+                      No employee pay setup records match your search query.
                     </td>
                   </tr>
-                ))}
+                ) : (
+                  filteredPayEmployees.map(emp => {
+                    const isSelected = selectedPayEmpIds.includes(emp.id);
+                    return (
+                      <tr key={emp.id} className={`hover:bg-slate-50/80 dark:hover:bg-slate-800/50 transition-colors ${isSelected ? 'bg-indigo-50/40 dark:bg-indigo-950/20' : ''}`}>
+                        <td className="py-3 px-4 text-center">
+                          <input 
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleSelectPayEmp(emp.id)}
+                            className="rounded border-slate-300 dark:border-slate-700 text-indigo-600 focus:ring-indigo-500"
+                          />
+                        </td>
+                        <td className="py-3 px-4 font-bold text-slate-900 dark:text-white">
+                          {emp.name}
+                          <span className="block text-[10px] font-mono text-slate-400">ID: {emp.id}</span>
+                        </td>
+                        <td className="py-3 px-4">
+                          {emp.department}
+                          <span className="block text-[10px] text-slate-400">{emp.designation}</span>
+                        </td>
+                        <td className="py-3 px-4 text-right font-bold text-slate-900 dark:text-white">
+                          Rs. {(emp.basicSalary || 45000).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-right font-medium text-slate-600 dark:text-slate-300">
+                          Rs. {(emp.allowances || 10000).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-center space-y-1">
+                          <div>
+                            <span className="px-1.5 py-0.5 rounded text-[10px] bg-purple-50 text-purple-700 dark:bg-purple-950 dark:text-purple-300 font-bold">
+                              {emp.maritalStatus || 'Single'}
+                            </span>
+                          </div>
+                          <div>
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${emp.ssfEnrolled !== false ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300' : 'bg-slate-100 text-slate-600'}`}>
+                              SSF: {emp.ssfEnrolled !== false ? 'Yes' : 'No'}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-mono">{emp.panNumber || `PAN-${emp.id}`}</td>
+                        <td className="py-3 px-4">
+                          <div className="font-semibold">{emp.bankName || 'Standard Chartered Bank'}</div>
+                          <div className="text-[10px] text-slate-400 font-mono">{emp.accountNumber || `ACC-${emp.id}982`}</div>
+                        </td>
+                        <td className="py-3 px-4 text-center">
+                          <div className="flex items-center justify-center gap-1">
+                            <button 
+                              onClick={() => setEditingEmployeeSalary(emp)}
+                              className="p-1.5 text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-950 rounded-lg transition-colors"
+                              title="Edit Pay Profile"
+                            >
+                              <Edit2 size={14} />
+                            </button>
+                            <button 
+                              onClick={() => setDeletingPayEmp(emp)}
+                              className="p-1.5 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/60 rounded-lg transition-colors"
+                              title="Delete Employee Pay Setup & Record"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                  </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+    
               </tbody>
             </table>
           </div>
@@ -1151,8 +1655,9 @@ export function Payroll() {
                 <table className="w-full text-left text-xs divide-y divide-slate-100 dark:divide-slate-800">
                   <thead className="bg-slate-100 dark:bg-slate-800 font-bold text-slate-500 text-[10px] uppercase">
                     <tr>
-                      <th className="py-2.5 px-3">Slab # & Descriptor</th>
-                      <th className="py-2.5 px-3">Income Threshold (NPR)</th>
+                      <th className="py-2.5 px-3">Slab Descriptor</th>
+                      <th className="py-2.5 px-3">Single Limit (NPR)</th>
+                      <th className="py-2.5 px-3">Married Limit (NPR)</th>
                       <th className="py-2.5 px-3 w-32">Tax Rate (%)</th>
                       <th className="py-2.5 px-3 text-center w-16">Remove</th>
                     </tr>
@@ -1179,6 +1684,18 @@ export function Payroll() {
                               const updated = [...setupConfig.singleSlabs];
                               const val = parseFloat(e.target.value) || 0;
                               updated[index].limitSingle = val;
+                              setSetupConfig({ ...setupConfig, singleSlabs: updated });
+                            }}
+                            className="text-xs h-8 font-mono"
+                          />
+                        </td>
+                        <td className="py-2 px-3 font-mono">
+                          <Input 
+                            type="number"
+                            value={slab.limitMarried !== undefined ? slab.limitMarried : slab.limitSingle}
+                            onChange={(e) => {
+                              const updated = [...setupConfig.singleSlabs];
+                              const val = parseFloat(e.target.value) || 0;
                               updated[index].limitMarried = val;
                               setSetupConfig({ ...setupConfig, singleSlabs: updated });
                             }}
@@ -1357,6 +1874,74 @@ export function Payroll() {
                 </div>
               </div>
 
+              {/* Diagnostic Mode: Annualized Tax & IRD Slab Breakdown */}
+              {activePayslipRecord.taxSlabBreakdown && activePayslipRecord.taxSlabBreakdown.length > 0 && (
+                <div className="bg-slate-50 dark:bg-slate-800/60 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck size={16} className="text-indigo-600 dark:text-indigo-400" />
+                      <h4 className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider">
+                        Diagnostic Mode: IRD Annual Tax Slab Calculation Breakdown (FY 2083/84)
+                      </h4>
+                    </div>
+                    <Badge variant="info" className="text-[10px]">
+                      {activePayslipRecord.taxStatus || 'Single'}
+                    </Badge>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] bg-white dark:bg-slate-900 p-2.5 rounded-xl border border-slate-200 dark:border-slate-800">
+                    <div>
+                      <span className="text-slate-400 text-[9px] uppercase font-bold">Monthly Taxable</span>
+                      <p className="font-black text-slate-800 dark:text-slate-200">Rs. {activePayslipRecord.annualizedTaxableIncome.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 text-[9px] uppercase font-bold">Annualized Taxable</span>
+                      <p className="font-black text-slate-800 dark:text-slate-200">Rs. {(activePayslipRecord.annualizedTaxableIncome * 12).toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 text-[9px] uppercase font-bold">Annual Total Tax</span>
+                      <p className="font-black text-amber-600">Rs. {(activePayslipRecord.incomeTaxTDS * 12).toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 text-[9px] uppercase font-bold">Monthly TDS (÷ 12)</span>
+                      <p className="font-black text-indigo-600">Rs. {activePayslipRecord.incomeTaxTDS.toLocaleString()}</p>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-[11px]">
+                      <thead>
+                        <tr className="border-b border-slate-200 dark:border-slate-700 text-slate-400 font-black uppercase text-[9px]">
+                          <th className="py-1 px-2">Tax Slab</th>
+                          <th className="py-1 px-2 text-right">Bracket Range</th>
+                          <th className="py-1 px-2 text-right">Taxable Amount</th>
+                          <th className="py-1 px-2 text-center">Rate</th>
+                          <th className="py-1 px-2 text-right">Tax Amount</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 dark:divide-slate-800 font-medium">
+                        {(activePayslipRecord.taxSlabBreakdown || []).map((s, idx) => (
+                          <tr key={idx} className={s.taxableAmount > 0 ? "text-slate-900 dark:text-white font-bold" : "text-slate-400"}>
+                            <td className="py-1.5 px-2">{s.slabName}</td>
+                            <td className="py-1.5 px-2 text-right font-mono">
+                              Rs. {s.minAmount.toLocaleString()} - {s.maxAmount === Infinity ? 'Above' : `Rs. ${s.maxAmount.toLocaleString()}`}
+                            </td>
+                            <td className="py-1.5 px-2 text-right font-mono">Rs. {s.taxableAmount.toLocaleString()}</td>
+                            <td className="py-1.5 px-2 text-center">
+                              <span className="px-1.5 py-0.5 bg-indigo-50 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-300 rounded font-black text-[10px]">
+                                {(s.rate * 100)}%
+                              </span>
+                            </td>
+                            <td className="py-1.5 px-2 text-right font-bold text-amber-600">Rs. {s.taxAmount.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+  
+
+                )}
               {/* Net Payable Highlight */}
               <div className="p-5 bg-gradient-to-r from-emerald-600 to-teal-700 text-white rounded-2xl flex items-center justify-between shadow-lg">
                 <div>
@@ -1370,6 +1955,7 @@ export function Payroll() {
                     <p className="text-[10px] font-mono mt-1 bg-white/10 px-2 py-0.5 rounded">
                       Ref: {activePayslipRecord.transactionRef}
                     </p>
+      
                   )}
                 </div>
               </div>
@@ -1715,8 +2301,9 @@ export function Payroll() {
                     </table>
                   </div>
                 </div>
-              )}
+  
 
+                )}
               {/* Modal Actions */}
               <div className="flex justify-between items-center pt-3 border-t border-slate-100 dark:border-slate-800">
                 <Button 
@@ -1741,6 +2328,206 @@ export function Payroll() {
           </div>
         )}
       </AnimatePresence>
+
+      {/* SINGLE EMPLOYEE DELETE CONFIRMATION MODAL */}
+      <AnimatePresence>
+        {deletingPayEmp && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white dark:bg-slate-900 rounded-3xl shadow-2xl max-w-md w-full p-6 border border-slate-200 dark:border-slate-800 space-y-4"
+            >
+              <div className="flex items-center gap-3 text-rose-600 dark:text-rose-400">
+                <div className="p-3 bg-rose-50 dark:bg-rose-950/60 rounded-2xl">
+                  <AlertCircle size={24} />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">Delete Employee Pay Setup?</h3>
+                  <p className="text-xs text-slate-500 font-medium">This operation will sync and delete from SQLite.</p>
+                </div>
+              </div>
+
+              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-2xl space-y-1.5 border border-slate-100 dark:border-slate-800 text-xs">
+                <div><span className="text-slate-400">Name:</span> <strong className="text-slate-900 dark:text-white">{deletingPayEmp.name}</strong></div>
+                <div><span className="text-slate-400">Employee ID:</span> <code className="font-mono bg-slate-200 dark:bg-slate-700 px-1 py-0.5 rounded">{deletingPayEmp.id}</code></div>
+                <div><span className="text-slate-400">Department:</span> <span className="font-semibold">{deletingPayEmp.department}</span></div>
+              </div>
+
+              <p className="text-xs text-slate-500 leading-relaxed">
+                Are you sure you want to delete this employee pay setup profile? This action will remove the record from your workspace and connected local SQLite database.
+              </p>
+
+              <div className="flex justify-end items-center gap-3 pt-2">
+                <Button 
+                  variant="outline" 
+                  onClick={() => setDeletingPayEmp(null)}
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  onClick={handleConfirmDeletePayEmp}
+                  className="bg-rose-600 hover:bg-rose-700 text-white font-bold gap-2"
+                >
+                  <Trash2 size={16} />
+                  Delete Employee Record
+                </Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* BULK EMPLOYEE DELETE CONFIRMATION MODAL */}
+      <AnimatePresence>
+        {isBulkDeletePayOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white dark:bg-slate-900 rounded-3xl shadow-2xl max-w-md w-full p-6 border border-slate-200 dark:border-slate-800 space-y-4"
+            >
+              <div className="flex items-center gap-3 text-rose-600 dark:text-rose-400">
+                <div className="p-3 bg-rose-50 dark:bg-rose-950/60 rounded-2xl">
+                  <AlertCircle size={24} />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">Delete {selectedPayEmpIds.length} Selected Employees?</h3>
+                  <p className="text-xs text-slate-500 font-medium">Batch removal from local SQLite database.</p>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-500 leading-relaxed">
+                You are about to permanently remove <strong>{selectedPayEmpIds.length} employee records</strong> and compensation profiles from the system and local SQLite database.
+              </p>
+
+              <div className="flex justify-end items-center gap-3 pt-2">
+                <Button 
+                  variant="outline" 
+                  onClick={() => setIsBulkDeletePayOpen(false)}
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  onClick={handleConfirmBulkDeletePayEmp}
+                  className="bg-rose-600 hover:bg-rose-700 text-white font-bold gap-2 shadow-lg shadow-rose-600/20"
+                >
+                  <Trash2 size={16} />
+                  Delete {selectedPayEmpIds.length} Employees
+                </Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* DRAFT PAYROLL RUN DELETE CONFIRMATION MODAL */}
+      <AnimatePresence>
+        {runToDelete && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+            <motion.div 
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white dark:bg-slate-900 rounded-3xl shadow-2xl max-w-lg w-full p-6 border border-slate-200 dark:border-slate-800 space-y-5"
+            >
+              <div className="flex items-center gap-3 text-rose-600 dark:text-rose-400 border-b border-slate-100 dark:border-slate-800 pb-4">
+                <div className="p-3 bg-rose-50 dark:bg-rose-950/60 rounded-2xl">
+                  <AlertCircle size={26} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-black tracking-tight text-slate-900 dark:text-white uppercase">DELETE PAYROLL RUN</h3>
+                  <p className="text-xs text-slate-500 font-medium">Permanent removal of draft payroll calculation batch.</p>
+                </div>
+              </div>
+
+              {/* Payroll Run Metadata Summary Grid */}
+              <div className="grid grid-cols-2 gap-3 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-2xl border border-slate-100 dark:border-slate-800 text-xs">
+                <div>
+                  <span className="text-slate-400 block text-[10px] uppercase font-bold">Fiscal Year</span>
+                  <strong className="text-slate-900 dark:text-white font-mono text-sm">{currentFiscalYear}</strong>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[10px] uppercase font-bold">Month</span>
+                  <strong className="text-slate-900 dark:text-white text-sm">{runToDelete.monthName}</strong>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[10px] uppercase font-bold">Payroll Period</span>
+                  <span className="font-mono text-slate-700 dark:text-slate-300 font-bold">{runToDelete.startDate || '2026-07-17'} → {runToDelete.endDate || '2026-08-16'}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-[10px] uppercase font-bold">Total Batch Employees</span>
+                  <span className="font-bold text-slate-900 dark:text-white text-sm">{runToDelete.records.length} Employees</span>
+                </div>
+                <div className="col-span-2 pt-2 border-t border-slate-200/60 dark:border-slate-700/60 flex justify-between items-center">
+                  <span className="text-slate-500 font-bold">Total Batch Net Payroll:</span>
+                  <span className="text-base font-black text-rose-600 dark:text-rose-400 font-mono">
+                    Rs. {runToDelete.totalNetSalary.toLocaleString()}
+                  </span>
+                </div>
+              </div>
+
+              {/* Explicit Data Preservation Warning Box */}
+              <div className="p-3.5 bg-amber-50/80 dark:bg-amber-950/40 border border-amber-200/80 dark:border-amber-800/60 rounded-2xl text-xs text-amber-900 dark:text-amber-200 leading-relaxed flex gap-2.5">
+                <AlertCircle size={18} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-bold">Source Data Is Preserved</p>
+                  <p className="text-[11px] mt-0.5 text-amber-800 dark:text-amber-300">
+                    This action will delete the draft payroll calculation record. <strong>Employee Master, Attendance, Leave and Overtime (OT) source data will NOT be deleted</strong> and can be recalculated at any time.
+                  </p>
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex justify-end items-center gap-3 pt-2">
+                <Button 
+                  variant="outline" 
+                  onClick={() => setRunToDelete(null)}
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  onClick={handleConfirmDeleteRun}
+                  className="bg-rose-600 hover:bg-rose-700 text-white font-bold gap-2 shadow-lg shadow-rose-600/20"
+                >
+                  <Trash2 size={16} />
+                  Delete Payroll Run
+                </Button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* BULK DELETE PROGRESS MODAL */}
+      {deleteProgress.active && (
+        <div className="fixed inset-0 bg-slate-900/70 flex items-center justify-center p-4 z-[110] backdrop-blur-md">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-4 text-center">
+            <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center mx-auto text-red-600">
+              <Trash2 className="w-6 h-6 animate-pulse" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-slate-900">Deleting Pay Setup Records</h3>
+              <p className="text-xs text-slate-500 font-medium mt-1">Please do not close browser</p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs font-mono font-bold">
+                <span className="text-slate-600">{deleteProgress.current} / {deleteProgress.total}</span>
+                <span className="text-red-600">{deleteProgress.percent}%</span>
+              </div>
+              <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-red-600 transition-all duration-150 rounded-full"
+                  style={{ width: `${deleteProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

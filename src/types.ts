@@ -16,6 +16,24 @@ export interface ShiftMaster {
   lateThreshold?: number; // minutes
 }
 
+
+export interface EmployeeTaxProfile {
+  taxpayerType: 'Resident' | 'Non-Resident';
+  femaleRebateEligible: boolean;
+  disabilityStatus: boolean;
+  incomeFromPension: boolean;
+  retirementFundContributor: boolean;
+  lifeInsurancePremium: number; // Actual premium paid
+  healthInsurancePremium: number; // Actual premium paid
+  privateBuildingInsurance: number; // Actual premium paid
+  educationFee: number; // Eligible education fee
+  remoteAreaCategory?: 'A' | 'B' | 'C' | 'D' | 'E' | 'None';
+  approvedMedicalExpense: number; // Actual approved medical expense
+  previousEmployerIncome: number;
+  previousEmployerTDS: number;
+  otherEligibleDeductions: number;
+}
+
 export interface Employee {
   id: string; // Employee ID
   name: string;
@@ -34,21 +52,125 @@ export interface Employee {
   email?: string;
   phone?: string;
   aadharNumber?: string;
+  // Personal Information
+  gender?: 'Male' | 'Female' | 'Other';
+  dobBS?: string;
+  dobAD?: string;
+  address?: string;
+  emergencyContact?: string;
+
+  // Employment Information
+  section?: string;
+  location?: string;
+  employmentType?: 'Permanent' | 'Contract' | 'Probation' | 'Temporary';
+  grade?: string;
+  level?: string;
+  reportingManager?: string;
+
   // Payroll & Salary extensions
   basicSalary?: number;
+  dearnessAllowance?: number;
+  otherAllowance?: number;
+  grossSalary?: number;
+  employeeSSF?: number;
+  employerSSF?: number;
+  monthlyCTC?: number;
   allowances?: number;
   panNumber?: string;
+  ssfNumber?: string;
+  citNumber?: string;
   bankName?: string;
   accountNumber?: string;
+  branchName?: string;
   ifscCode?: string;
+  paymentMethod?: 'Bank Transfer' | 'Cheque' | 'Cash';
   taxExemptionLimit?: number;
   maritalStatus?: 'Single' | 'Married';
   ssfEnrolled?: boolean;
+  taxProfile?: EmployeeTaxProfile;
+  companyType?: 'SCIL' | 'ISTS';
+
+  // Complete HR Master Data Fields
+  nationality?: string;
+  citizenshipNumber?: string;
+  currentAddress?: string;
+  taxCategory?: string;
+
+  // Exit & Movement Information
+  statusEffectiveDate?: string;
+  separationDate?: string;
+  exitType?: 'Voluntary' | 'Involuntary' | 'Retirement' | 'Contract End' | 'Other';
+  exitReason?: string;
+  resignationDate?: string;
+  noticePeriod?: string;
+  lastWorkingDate?: string;
+  transferDate?: string;
+  previousDepartment?: string;
+  previousSection?: string;
+  previousDesignation?: string;
+  previousGrade?: string;
+  newDepartment?: string;
+  newSection?: string;
+  newDesignation?: string;
+  newGrade?: string;
 }
 
-export type PayrollStatus = 'Draft' | 'Calculated' | 'Approved' | 'Disbursed';
+export type MovementType = 
+  | 'New Joiner'
+  | 'Promotion'
+  | 'Transfer'
+  | 'Department Change'
+  | 'Section Change'
+  | 'Designation Change'
+  | 'Grade Change'
+  | 'Salary Change'
+  | 'Shift Change'
+  | 'Location Change'
+  | 'Resignation'
+  | 'Termination'
+  | 'Retirement'
+  | 'Contract End'
+  | 'Other Separation'
+  | 'Demotion'
+  | 'Status Change';
+
+export interface EmployeeMovement {
+  id: string;
+  employeeId: string; // Numeric Bio ID / Employee ID
+  effectiveDate: string; // YYYY-MM-DD
+  movementType: MovementType;
+  previousValue?: string;
+  newValue?: string;
+  previousDepartment?: string;
+  newDepartment?: string;
+  previousSection?: string;
+  newSection?: string;
+  previousDesignation?: string;
+  newDesignation?: string;
+  previousGrade?: string;
+  newGrade?: string;
+  previousSalary?: number;
+  newSalary?: number;
+  reason?: string;
+  changedBy?: string;
+  changedAt?: string;
+  exitType?: 'Voluntary' | 'Involuntary' | 'Retirement' | 'Contract End' | 'Other';
+  exitReason?: string;
+  noticePeriod?: string;
+  lastWorkingDate?: string;
+  resignationDate?: string;
+}
+
+export type PayrollStatus = 'Draft' | 'Calculated' | 'Review' | 'Approved' | 'Finalized' | 'Locked' | 'Disbursed';
 export type DisbursementMethod = 'Bank Transfer' | 'Cheque' | 'Cash' | 'Direct Deposit';
 export type RecordDisbursementStatus = 'Pending' | 'Processing' | 'Disbursed' | 'Failed';
+
+export interface TaxSlabDetail {
+  slabName: string;
+  taxableAmount: number;
+  rate: number;
+  taxAmount: number;
+}
 
 export interface PayrollRecord {
   id: string;
@@ -61,6 +183,7 @@ export interface PayrollRecord {
   accountNumber?: string;
   ifscCode?: string;
   maritalStatus?: 'Single' | 'Married';
+  taxStatus?: 'Single' | 'Married';
   ssfEnrolled?: boolean;
   
   // Attendance & Time metrics
@@ -81,8 +204,15 @@ export interface PayrollRecord {
   bonus: number;
   grossSalary: number;
   
+  // Statutory & Employer contributions
+  employerSSF?: number;
+  monthlyCTC?: number;
+
   // Statutory & Tax deductions
   taxableIncome: number;
+  annualizedTaxableIncome?: number;
+  annualTaxLiability?: number;
+  taxSlabBreakdown?: TaxSlabDetail[];
   incomeTaxTDS: number; // Income tax / TDS
   socialSecurity: number; // SSF / PF employee contribution
   healthInsurance: number;
@@ -107,6 +237,8 @@ export interface PayrollRun {
   monthName: string; // e.g. "August 2026"
   nepaliMonth?: string; // e.g. "Shrawan (श्रावण)"
   fiscalYear?: string; // e.g. "FY 2083/84"
+  startDate?: string;
+  endDate?: string;
   status: PayrollStatus;
   
   totalEmployees: number;
@@ -115,6 +247,8 @@ export interface PayrollRun {
   totalSocialSecurity: number;
   totalDeductions: number;
   totalNetSalary: number;
+  totalEmployerSSF?: number;
+  totalCTC?: number;
   
   createdAt: string;
   createdBy: string;
@@ -211,17 +345,76 @@ export interface ProcessedAttendance {
   overtime: number; // in hours
   shiftId?: string; // Assigned or default shift ID
   expectedHours?: number; // Duration of the shift in hours
-  status: 'Present' | 'Absent' | 'Late' | 'SPF' | 'Weekly Off' | 'Early' | 'On Time' | 'Overtime' | 'PWO'; // SPF = Single Punch Found, PWO = Present on Weekly Off
+  status: 'Present' | 'Absent' | 'Late' | 'SPF' | 'Weekly Off' | 'Early' | 'On Time' | 'Overtime' | 'PWO' | 'Half Day' | 'Paid Leave' | 'Leave' | 'On Leave' | 'Forced' | 'On Duty' | 'Regularized';
+  employeeName?: string;
+  department?: string;
+  inTime?: string;
+  outTime?: string;
+  workHours?: number;
+  remarks?: string;
+  shiftSource?: 'Manual Override' | 'Approved Roster' | 'Imported Roster' | 'Employee Default' | 'Auto Detected';
+  shiftCode?: string;
+  shiftName?: string;
   lateMinutes: number;
   earlyMinutes: number;
   logs: string[]; // Array of ISO strings (filtered punches)
   rawLogs: string[]; // Array of ISO strings (unfiltered punches)
 }
 
+export type ShiftSource = 'Manual Override' | 'Approved Roster' | 'Imported Roster' | 'Employee Default' | 'Auto Detected';
+
 export interface ShiftAssignment {
+  id?: string;
   employeeId: string;
   date: string; // YYYY-MM-DD
   shiftId: string;
+  shiftCode?: string;
+  source?: ShiftSource;
+  rosterBatchId?: string;
+  status?: string;
+  changedBy?: string;
+  changedAt?: string;
+  reason?: string;
+}
+
+export interface RosterBatch {
+  id: string;
+  rosterName: string;
+  periodStart: string;
+  periodEnd: string;
+  totalDays: number;
+  importedAt: string;
+  importedBy?: string;
+  sourceFileName?: string;
+  status: 'Active' | 'Archived' | 'Draft';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RosterAssignment {
+  id: string;
+  rosterBatchId: string;
+  employeeId: string;
+  rosterDate: string;
+  shiftCode: string;
+  shiftStart?: string;
+  shiftEnd?: string;
+  source: ShiftSource;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShiftAuditLog {
+  id: string;
+  employeeId: string;
+  date: string;
+  oldShift?: string;
+  newShift: string;
+  changedBy: string;
+  changedAt: string;
+  reason?: string;
+  source: ShiftSource;
 }
 
 export type ExceptionType = 
@@ -285,11 +478,17 @@ export interface SBLRecord {
   id: string;
   employeeId: string;
   date: string;
-  leaveType: 'SBL' | 'Short Break';
-  duration: string; // e.g., "2 hours"
+  leaveType: 'SBL' | 'Short Break' | 'PWO' | 'Comp Leave';
+  duration: string; // e.g., "Full Day" | "Half Day" | "2 hours"
   reason: string;
   status: 'Pending' | 'Approved' | 'Rejected' | 'Final Confirmed' | 'Not Approved';
   approvedBy?: string;
+  workingHours?: number;
+  source?: string;
+  inTime?: string;
+  outTime?: string;
+  dayName?: string;
+  weeklyOffName?: string;
 }
 
 export interface ForceAttendanceRecord {

@@ -95,7 +95,10 @@ localRouter.get('/data/:table', async (req, res) => {
     leave_records: 'leave_records',
     departments: 'departments',
     sections: 'sections',
-    designations: 'designations'
+    designations: 'designations',
+    roster_batches: 'roster_batches',
+    roster_assignments: 'roster_assignments',
+    shift_audit_logs: 'shift_audit_logs'
   };
 
   const sqlTable = validTables[table];
@@ -156,7 +159,10 @@ localRouter.post('/data/:table', async (req, res) => {
     leave_records: 'leave_records',
     departments: 'departments',
     sections: 'sections',
-    designations: 'designations'
+    designations: 'designations',
+    roster_batches: 'roster_batches',
+    roster_assignments: 'roster_assignments',
+    shift_audit_logs: 'shift_audit_logs'
   };
 
   const sqlTable = validTables[table];
@@ -167,7 +173,7 @@ localRouter.post('/data/:table', async (req, res) => {
   try {
     const db = await getSqliteDb();
     const now = new Date().toISOString();
-
+    try { db.run('ROLLBACK'); } catch(e) {}
     db.run('BEGIN TRANSACTION');
 
     if (sqlTable === 'employees') {
@@ -227,6 +233,176 @@ localRouter.post('/data/:table', async (req, res) => {
         stmt.run([id, JSON.stringify(item), now]);
       }
       stmt.free();
+    } else if (sqlTable === 'roster_batches') {
+      const stmt = db.prepare(`
+        INSERT INTO roster_batches (id, roster_name, period_start, period_end, total_days, imported_at, imported_by, source_file_name, status, created_at, updated_at, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          roster_name=excluded.roster_name,
+          period_start=excluded.period_start,
+          period_end=excluded.period_end,
+          total_days=excluded.total_days,
+          status=excluded.status,
+          updated_at=excluded.updated_at,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.rosterName || 'Roster Batch',
+          item.periodStart || '',
+          item.periodEnd || '',
+          item.totalDays || 0,
+          item.importedAt || now,
+          item.importedBy || 'Admin',
+          item.sourceFileName || '',
+          item.status || 'Active',
+          item.createdAt || now,
+          now,
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'roster_assignments') {
+      const stmt = db.prepare(`
+        INSERT INTO roster_assignments (id, roster_batch_id, employee_id, roster_date, shift_code, shift_start, shift_end, source, status, created_at, updated_at, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          shift_code=excluded.shift_code,
+          shift_start=excluded.shift_start,
+          shift_end=excluded.shift_end,
+          source=excluded.source,
+          status=excluded.status,
+          updated_at=excluded.updated_at,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.rosterBatchId || '',
+          item.employeeId || '',
+          item.rosterDate || item.date || '',
+          item.shiftCode || '',
+          item.shiftStart || '',
+          item.shiftEnd || '',
+          item.source || 'Imported Roster',
+          item.status || 'Active',
+          item.createdAt || now,
+          now,
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'shift_audit_logs') {
+      const stmt = db.prepare(`
+        INSERT INTO shift_audit_logs (id, employee_id, date, old_shift, new_shift, changed_by, changed_at, reason, source, data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || '',
+          item.date || '',
+          item.oldShift || '',
+          item.newShift || '',
+          item.changedBy || 'Admin',
+          item.changedAt || now,
+          item.reason || '',
+          item.source || 'Manual Override',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'overtime') {
+      const stmt = db.prepare(`
+        INSERT INTO overtime (id, employee_id, date, hours, status, data)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          date=excluded.date,
+          hours=excluded.hours,
+          status=excluded.status,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || '',
+          item.date || '',
+          item.hours || 0,
+          item.status || 'Pending',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'exceptions') {
+      const stmt = db.prepare(`
+        INSERT INTO exceptions (id, employee_id, date, type, status, data)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          date=excluded.date,
+          type=excluded.type,
+          status=excluded.status,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || '',
+          item.date || '',
+          item.type || 'General',
+          item.status || 'pending',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'sbl') {
+      const stmt = db.prepare(`
+        INSERT INTO sbl (id, employee_id, date, status, data)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          date=excluded.date,
+          status=excluded.status,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || '',
+          item.date || '',
+          item.status || 'Pending',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'force_attendance') {
+      const stmt = db.prepare(`
+        INSERT INTO force_attendance (id, employee_id, date, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          date=excluded.date,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || '',
+          item.date || '',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
     } else {
       const stmt = db.prepare(`
         INSERT INTO ${sqlTable} (id, data)
@@ -282,17 +458,74 @@ localRouter.post('/data/:table/delete', async (req, res) => {
 
   try {
     const db = await getSqliteDb();
+    try { db.run('ROLLBACK'); } catch (e) {}
     db.run('BEGIN TRANSACTION');
     const stmt = db.prepare(`DELETE FROM ${sqlTable} WHERE id = ?`);
+    let deletedCount = 0;
     for (const id of idList) {
-      if (id) stmt.run([id]);
+      if (id) {
+        stmt.run([id]);
+        deletedCount++;
+      }
     }
     stmt.free();
     db.run('COMMIT');
     saveSqliteDb();
 
-    res.json({ success: true, deleted: idList.length });
+    console.log(`[SQLite DELETE] Deleted ${deletedCount} record(s) from ${sqlTable}`);
+    res.json({ success: true, deleted: deletedCount });
   } catch (error: any) {
+    console.error(`[SQLite DELETE Error] Failed to delete from ${table}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Dedicated Payroll Run Delete Endpoint
+localRouter.delete('/payroll/runs/:id', async (req, res) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ error: 'Missing payroll run ID' });
+
+  try {
+    const db = await getSqliteDb();
+    try { db.run('ROLLBACK'); } catch (e) {}
+    db.run('BEGIN TRANSACTION');
+
+    // Check if run exists and check status
+    const checkStmt = db.prepare('SELECT data FROM payroll_runs WHERE id = ?');
+    checkStmt.bind([id]);
+    let existingRun: any = null;
+    if (checkStmt.step()) {
+      const row = checkStmt.getAsObject();
+      if (row.data) {
+        try {
+          existingRun = JSON.parse(row.data as string);
+        } catch (e) {
+          existingRun = null;
+        }
+      }
+    }
+    checkStmt.free();
+
+    if (existingRun && (existingRun.status === 'Finalized' || existingRun.status === 'Locked')) {
+      db.run('ROLLBACK');
+      return res.status(400).json({ error: 'This payroll run is finalized/locked and cannot be deleted.' });
+    }
+
+    const delStmt = db.prepare('DELETE FROM payroll_runs WHERE id = ?');
+    delStmt.run([id]);
+    delStmt.free();
+
+    db.run('COMMIT');
+    saveSqliteDb();
+
+    console.log(`[SQLite DELETE] Deleted payroll run ${id} successfully`);
+    res.json({ success: true, deleted: 1, message: `Successfully deleted draft payroll run ${id}` });
+  } catch (error: any) {
+    try {
+      const db = await getSqliteDb();
+      db.run('ROLLBACK');
+    } catch (e) { /* ignore rollback error */ }
+    console.error(`[SQLite DELETE Error] Failed to delete payroll run ${id}:`, error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -535,6 +768,7 @@ localRouter.post('/migrate-from-firestore', async (req, res) => {
 
   try {
     const db = await getSqliteDb();
+    try { db.run('ROLLBACK'); } catch (e) {}
     db.run('BEGIN TRANSACTION');
 
     if (Array.isArray(employees) && employees.length > 0) {
@@ -591,7 +825,7 @@ localRouter.post('/import-excel', async (req, res) => {
     const db = await getSqliteDb();
     const now = new Date().toISOString();
     let importedCount = 0;
-
+    try { db.run('ROLLBACK'); } catch(e) {}
     db.run('BEGIN TRANSACTION');
 
     if (type === 'employees') {
@@ -793,6 +1027,7 @@ localRouter.get('/diagnostics', async (req, res) => {
     // 2c. Transaction Test
     const tStart = Date.now();
     try {
+      try { db.run('ROLLBACK'); } catch(e) {}
       db.run('BEGIN TRANSACTION;');
       const txId = `_tx_${Date.now()}`;
       db.run(`INSERT INTO departments (id, name, data) VALUES ('${txId}', 'DiagDept', '{"tx":true}');`);

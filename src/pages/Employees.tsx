@@ -133,17 +133,31 @@ export function Employees() {
     }
     if (selectedEmployees.length === 0) return;
     
-    if (!confirm(`Are you sure you want to delete ${selectedEmployees.length} selected employees? This action cannot be undone.`)) {
-      return;
-    }
+    const count = selectedEmployees.length;
+    const choice = confirm(
+      `Delete Employee Records?\n\nYou are about to modify ${count} employee records.\n\n` +
+      `Click OK to Permanently Delete, or Cancel to keep records unchanged.`
+    );
 
-    const tId = toast.loading(`Deleting ${selectedEmployees.length} employees...`);
+    if (!choice) return;
+
+    setDeleteProgress({ active: true, current: 0, total: count, percent: 0 });
     try {
-      await deleteEmployeesBatch(selectedEmployees);
-      toast.success('Employees deleted successfully', { id: tId });
+      const batchSize = 30;
+      for (let i = 0; i < selectedEmployees.length; i += batchSize) {
+        const batch = selectedEmployees.slice(i, i + batchSize);
+        await deleteEmployeesBatch(batch);
+        const currentCount = Math.min(i + batchSize, count);
+        const pct = Math.round((currentCount / count) * 100);
+        setDeleteProgress({ active: true, current: currentCount, total: count, percent: pct });
+        await new Promise(r => setTimeout(r, 10));
+      }
+      toast.success(`Successfully deleted ${count} employee records.`);
       setSelectedEmployees([]);
     } catch (e: any) {
-      toast.error(e.message || 'Failed to delete employees', { id: tId });
+      toast.error(e.message || 'Failed to delete employees');
+    } finally {
+      setDeleteProgress({ active: false, current: 0, total: 0, percent: 0 });
     }
   };
 
@@ -151,22 +165,34 @@ export function Employees() {
     const count = employees.length;
     if (count === 0) return;
 
-    if (!confirm(`CRITICAL: This will permanently delete ALL ${count} employees from the directory. Are you sure you want to proceed?`)) {
+    if (!confirm(`CRITICAL WARNING:\n\nYou are about to delete ALL ${count} employees from the directory.\nThis affects historical attendance, payroll, leave, and tax references.`)) {
       return;
     }
 
-    const confirmation = prompt(`FINAL WARNING: This is irreversible. Type "PURGE" to confirm.`);
-    if (confirmation !== 'PURGE') {
+    const confirmation = prompt(`FINAL CONFIRMATION: Type "DELETE" to confirm permanent purge of all ${count} employees.`);
+    if (confirmation !== 'DELETE') {
+      toast.info("Purge cancelled.");
       return;
     }
 
-    const tId = toast.loading(`Purging all ${count} records...`);
+    setDeleteProgress({ active: true, current: 0, total: count, percent: 0 });
     try {
-      await deleteEmployeesBatch(employees.map(e => e.id));
-      toast.success('Directory purged successfully. You can now re-import.', { id: tId });
+      const allIds = employees.map(e => e.id);
+      const batchSize = 30;
+      for (let i = 0; i < allIds.length; i += batchSize) {
+        const batch = allIds.slice(i, i + batchSize);
+        await deleteEmployeesBatch(batch);
+        const currentCount = Math.min(i + batchSize, count);
+        const pct = Math.round((currentCount / count) * 100);
+        setDeleteProgress({ active: true, current: currentCount, total: count, percent: pct });
+        await new Promise(r => setTimeout(r, 10));
+      }
+      toast.success('Directory purged successfully.');
       setSelectedEmployees([]);
     } catch (e: any) {
-      toast.error(e.message || 'Purge failed', { id: tId });
+      toast.error(e.message || 'Purge failed');
+    } finally {
+      setDeleteProgress({ active: false, current: 0, total: 0, percent: 0 });
     }
   };
 
@@ -301,129 +327,297 @@ export function Employees() {
     );
   };
 
+  // Import preview & progress state
+  interface ImportPreview {
+    totalRows: number;
+    validCount: number;
+    newCount: number;
+    existingCount: number;
+    duplicateBioInFile: number;
+    errors: string[];
+    parsedEmps: Employee[];
+  }
+  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
+  const [duplicateMode, setDuplicateMode] = useState<'skip' | 'update'>('skip');
+  const [importProgress, setImportProgress] = useState<{ active: boolean; current: number; total: number; percent: number; currentName: string }>({
+    active: false,
+    current: 0,
+    total: 0,
+    percent: 0,
+    currentName: ''
+  });
+  const [deleteProgress, setDeleteProgress] = useState<{ active: boolean; current: number; total: number; percent: number }>({
+    active: false,
+    current: 0,
+    total: 0,
+    percent: 0
+  });
+
   const downloadTemplate = () => {
     const template = [
       {
-        'Employee ID': 'EMP001',
-        'Name': 'John Doe',
-        'Department': 'Operations',
+        'Employee ID / Bio ID': 1256,
+        'Employee Name': 'Ram Sharma',
+        'Gender': 'Male',
+        'Marital Status (Single/Married)': 'Single',
+        'Date of Joining (YYYY-MM-DD)': '2024-01-15',
+        'Department': 'Production',
+        'Section': 'Assembly',
         'Designation': 'Machine Operator',
-        'Contractor': 'ABC Manpower',
-        'Shift': 'Day Shift',
+        'Employment Type (Permanent/Contract/Probation)': 'Permanent',
+        'Grade': 'G1',
+        'Level': 'L1',
+        'Reporting Manager': 'Hari Prasad',
         'Weekly Off': 'Sunday',
-        'OT Eligible (Yes/No)': 'Yes',
-        'Target Working Hours': 8
+        'Shift': 'Day Shift',
+        'Status (Active/Inactive)': 'Active',
+        'Basic Salary': 30000,
+        'Dearness Allowance': 5000,
+        'Other Allowance': 5000,
+        'PAN Number': '123456789',
+        'SSF Number': 'SSF100234',
+        'CIT Number': 'CIT200567',
+        'Tax Status (Single/Married)': 'Single',
+        'Bank Name': 'Nabil Bank',
+        'Bank Account Number': '0123456789012',
+        'Branch': 'Kathmandu',
+        'Phone': '9841234567',
+        'Email': 'ram@example.com',
+        'Address': 'Kathmandu, Nepal',
+        'Emergency Contact': '9801234567'
+      },
+      {
+        'Employee ID / Bio ID': 2,
+        'Employee Name': 'Sita Devi',
+        'Gender': 'Female',
+        'Marital Status (Single/Married)': 'Married',
+        'Date of Joining (YYYY-MM-DD)': '2023-05-10',
+        'Department': 'Operations',
+        'Section': 'Quality Control',
+        'Designation': 'Quality Inspector',
+        'Employment Type (Permanent/Contract/Probation)': 'Permanent',
+        'Grade': 'G2',
+        'Level': 'L2',
+        'Reporting Manager': 'Gita Karki',
+        'Weekly Off': 'Saturday',
+        'Shift': 'Day Shift',
+        'Status (Active/Inactive)': 'Active',
+        'Basic Salary': 35000,
+        'Dearness Allowance': 6000,
+        'Other Allowance': 4000,
+        'PAN Number': '987654321',
+        'SSF Number': 'SSF100888',
+        'CIT Number': 'CIT200999',
+        'Tax Status (Single/Married)': 'Married',
+        'Bank Name': 'Global IME Bank',
+        'Bank Account Number': '9876543210987',
+        'Branch': 'Lalitpur',
+        'Phone': '9851234567',
+        'Email': 'sita@example.com',
+        'Address': 'Lalitpur, Nepal',
+        'Emergency Contact': '9811234567'
       }
     ];
     const ws = XLSX.utils.json_to_sheet(template);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Employees");
-    XLSX.writeFile(wb, "Employee_Import_Template.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, "Employee_Master");
+    XLSX.writeFile(wb, "HRIS_Employee_Import_Template.xlsx");
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       setImportFile(file);
+      setImportPreview(null);
+      parseAndPreviewFile(file);
     }
   };
 
-  const handleUpload = async () => {
-    if (!importFile) {
-      toast.error("Please select a file first");
-      return;
-    }
-    
-    if (quotaExceeded) {
-      toast.error('Cannot import: Database write limit reached.');
-      return;
-    }
-
+  const parseAndPreviewFile = (file: File) => {
     setIsUploading(true);
-    const tId = toast.loading('Processing employee data...');
-
     const reader = new FileReader();
-    reader.onload = async (event) => {
+    reader.onload = (event) => {
       try {
         const data = new Uint8Array(event.target?.result as ArrayBuffer);
         const workbook = XLSX.read(data, { type: 'array' });
         const worksheet = workbook.Sheets[workbook.SheetNames[0]];
         const json = XLSX.utils.sheet_to_json(worksheet) as any[];
 
-        const importedEmps: Employee[] = json.map(row => {
-          const rawId = row['Employee ID'] || row['Emp ID'] || row['EMP ID'] || row['ID'] || row['Employee No'] || row['AC-No.'] || row['Employee No.'] || generateId();
+        const existingMap = new Map(employees.map(e => [e.id.trim(), e]));
+        const existingNormMap = new Map(employees.map(e => [normalizeEmployeeId(e.id), e]));
+
+        const fileBioIds = new Set<string>();
+        let duplicateInFileCount = 0;
+        let validCount = 0;
+        let existingCount = 0;
+        let newCount = 0;
+        const errors: string[] = [];
+        const parsedEmps: Employee[] = [];
+
+        json.forEach((row, idx) => {
+          const rowNum = idx + 2; // header line 1
+          const rawId = row['Employee ID / Bio ID'] || row['Employee ID'] || row['Bio ID'] || row['Emp ID'] || row['EMP ID'] || row['ID'] || row['AC-No.'] || row['Employee No.'];
+          if (!rawId) {
+            errors.push(`Row ${rowNum}: Missing Employee ID / Bio ID`);
+            return;
+          }
           const id = String(rawId).trim();
+          const name = String(row['Employee Name'] || row['Name'] || row['Emp Name'] || '').trim();
+
+          if (!name) {
+            errors.push(`Row ${rowNum} (Bio ID ${id}): Missing Employee Name`);
+            return;
+          }
+
+          if (fileBioIds.has(id)) {
+            duplicateInFileCount++;
+            errors.push(`Row ${rowNum}: Duplicate Bio ID ${id} within file`);
+          } else {
+            fileBioIds.add(id);
+          }
+
+          const normId = normalizeEmployeeId(id);
+          const isExisting = existingMap.has(id) || (normId && existingNormMap.has(normId));
+          if (isExisting) {
+            existingCount++;
+          } else {
+            newCount++;
+          }
+          validCount++;
+
+          const basicSalary = Number(row['Basic Salary'] || row['Basic'] || 0);
+          const dearnessAllowance = Number(row['Dearness Allowance'] || row['DA'] || 0);
+          const otherAllowance = Number(row['Other Allowance'] || row['Allowances'] || 0);
+          const grossSalary = basicSalary + dearnessAllowance + otherAllowance;
+          const employerSSF = Math.round(basicSalary * 0.20);
+          const monthlyCTC = grossSalary + employerSSF;
+
           const shiftName = String(row['Shift'] || row['Shift Name'] || 'Day Shift').trim();
           const shift = settings.shifts?.find(s => s.name.toLowerCase() === shiftName.toLowerCase());
-          
-          return {
+
+          const empRecord: Employee = {
             id,
-            name: String(row['Name'] || row['Employee Name'] || row['Emp Name'] || 'Unknown').trim(),
-            department: String(row['Department'] || row['Dept'] || '').trim(),
-            designation: String(row['Designation'] || row['Desig'] || '').trim(),
-            contractorName: String(row['Contractor'] || row['Contractor Name'] || row['Contract'] || '').trim(),
-            shiftId: shift?.id || settings.shifts?.[0]?.id || '',
-            status: 'Active',
-            joiningDate: new Date().toISOString().split('T')[0],
+            name,
+            gender: row['Gender'] as any || 'Male',
+            maritalStatus: String(row['Marital Status (Single/Married)'] || row['Marital Status'] || row['Tax Status'] || 'Single').toLowerCase().includes('marr') ? 'Married' : 'Single',
+            joiningDate: row['Date of Joining (YYYY-MM-DD)'] || row['Joining Date'] || new Date().toISOString().split('T')[0],
+            department: String(row['Department'] || row['Dept'] || 'General').trim(),
+            section: String(row['Section'] || '').trim(),
+            designation: String(row['Designation'] || row['Desig'] || 'Staff').trim(),
+            employmentType: (row['Employment Type (Permanent/Contract/Probation)'] || row['Employment Type'] || 'Permanent') as any,
+            grade: String(row['Grade'] || '').trim(),
+            level: String(row['Level'] || '').trim(),
+            reportingManager: String(row['Reporting Manager'] || '').trim(),
             weeklyOff: row['Weekly Off'] || 'Sunday',
-            otEligible: String(row['OT Eligible (Yes/No)'] || row['OT Eligible'] || 'No').toLowerCase().includes('yes'),
-            targetWorkingHours: Number(row['Target Working Hours'] || row['Target Hours']) || 8
-          } as Employee;
+            shiftId: shift?.id || settings.shifts?.[0]?.id || '',
+            status: String(row['Status (Active/Inactive)'] || row['Status'] || 'Active').toLowerCase().includes('inact') ? 'Inactive' : 'Active',
+            basicSalary,
+            dearnessAllowance,
+            otherAllowance,
+            grossSalary,
+            employerSSF,
+            monthlyCTC,
+            panNumber: String(row['PAN Number'] || row['PAN'] || '').trim(),
+            ssfNumber: String(row['SSF Number'] || row['SSF No'] || '').trim(),
+            citNumber: String(row['CIT Number'] || row['CIT No'] || '').trim(),
+            bankName: String(row['Bank Name'] || row['Bank'] || '').trim(),
+            accountNumber: String(row['Bank Account Number'] || row['Account No'] || '').trim(),
+            branchName: String(row['Branch'] || '').trim(),
+            phone: String(row['Phone'] || row['Contact'] || '').trim(),
+            email: String(row['Email'] || '').trim(),
+            address: String(row['Address'] || '').trim(),
+            emergencyContact: String(row['Emergency Contact'] || '').trim(),
+            otEligible: true,
+            targetWorkingHours: 8
+          };
+
+          parsedEmps.push(empRecord);
         });
 
-        // Build quick lookup map for raw JSON rows by employee ID
-        const jsonMap = new Map(json.map(r => [
-          String(r['Employee ID'] || r['Emp ID'] || r['ID'] || r['Employee No'] || r['AC-No.'] || r['Employee No.'] || '').trim(),
-          r
-        ]));
-
-        // Try to handle shift name mapping more robustly if initial mapping failed
-        importedEmps.forEach(emp => {
-          if (!emp.shiftId || emp.shiftId === settings.shifts?.[0]?.id) {
-            const rawRow = jsonMap.get(emp.id);
-            if (rawRow) {
-              const sName = String(rawRow['Shift'] || rawRow['Shift Name'] || '').trim().toLowerCase();
-              if (sName) {
-                // If user says "Day" but we have "Day Shift", let's try to match
-                const match = settings.shifts?.find(s => 
-                  s.name.toLowerCase().includes(sName) || 
-                  sName.includes(s.name.toLowerCase())
-                );
-                if (match) emp.shiftId = match.id;
-              }
-            }
-          }
+        setImportPreview({
+          totalRows: json.length,
+          validCount,
+          newCount,
+          existingCount,
+          duplicateBioInFile: duplicateInFileCount,
+          errors,
+          parsedEmps
         });
-
-        const existingIds = new Set(employees.map(e => e.id.trim()));
-        const existingNormIds = new Set(employees.map(e => normalizeEmployeeId(e.id)).filter(Boolean));
-
-        const newUniqueEmps = importedEmps.filter(e => {
-          if (!e.id) return false;
-          const trimmedId = e.id.trim();
-          const normId = normalizeEmployeeId(trimmedId);
-          
-          // Avoid duplicates by exact ID OR by normalized similarity
-          return !existingIds.has(trimmedId) && (!normId || !existingNormIds.has(normId));
-        });
-        
-        if (newUniqueEmps.length === 0) {
-          toast.info("No new unique employees found in file", { id: tId });
-          setIsUploading(false);
-          return;
-        }
-
-        await setEmployees([...employees, ...newUniqueEmps]);
-        toast.success(`Successfully imported ${newUniqueEmps.length} new employees.`, { id: tId });
-        setIsImportModalOpen(false);
-        setImportFile(null);
-      } catch (err) {
-        toast.error("Failed to parse Excel file. Please ensure it follows the template format.", { id: tId });
+      } catch (e: any) {
+        toast.error("Failed to parse Excel file. Please ensure it follows standard format.");
       } finally {
         setIsUploading(false);
       }
     };
-    reader.readAsArrayBuffer(importFile);
+    reader.readAsArrayBuffer(file);
+  };
+
+  const handleExecuteImport = async () => {
+    if (!importPreview || importPreview.parsedEmps.length === 0) {
+      toast.error("No valid employee records to import");
+      return;
+    }
+
+    if (quotaExceeded) {
+      toast.error('Cannot import: Database write limit reached.');
+      return;
+    }
+
+    const totalToProcess = importPreview.parsedEmps.length;
+    setImportProgress({
+      active: true,
+      current: 0,
+      total: totalToProcess,
+      percent: 0,
+      currentName: 'Preparing transaction...'
+    });
+
+    try {
+      const existingMap = new Map(employees.map(e => [e.id.trim(), e]));
+      const updatedList = [...employees];
+
+      const batchSize = 25;
+      for (let i = 0; i < importPreview.parsedEmps.length; i += batchSize) {
+        const batch = importPreview.parsedEmps.slice(i, i + batchSize);
+
+        for (const newEmp of batch) {
+          const idx = updatedList.findIndex(e => e.id.trim() === newEmp.id.trim() || normalizeEmployeeId(e.id) === normalizeEmployeeId(newEmp.id));
+          if (idx >= 0) {
+            if (duplicateMode === 'update') {
+              updatedList[idx] = { ...updatedList[idx], ...newEmp };
+            }
+            // skip if duplicateMode === 'skip'
+          } else {
+            updatedList.push(newEmp);
+          }
+        }
+
+        const processedCount = Math.min(i + batchSize, totalToProcess);
+        const pct = Math.round((processedCount / totalToProcess) * 100);
+        const lastEmpName = batch[batch.length - 1]?.name || 'Importing...';
+
+        setImportProgress({
+          active: true,
+          current: processedCount,
+          total: totalToProcess,
+          percent: pct,
+          currentName: `Updating Bio ID ${batch[batch.length - 1]?.id} (${lastEmpName})`
+        });
+
+        // Small pause to yield main thread for React UI progress render
+        await new Promise(r => setTimeout(r, 15));
+      }
+
+      await setEmployees(updatedList);
+      toast.success(`Import complete! Processed ${totalToProcess} employee records.`);
+      setIsImportModalOpen(false);
+      setImportFile(null);
+      setImportPreview(null);
+    } catch (err: any) {
+      toast.error(`Import failed: ${err.message || 'Unknown error'}`);
+    } finally {
+      setImportProgress({ active: false, current: 0, total: 0, percent: 0, currentName: '' });
+    }
   };
 
 
@@ -802,6 +996,83 @@ export function Employees() {
                 </div>
               </div>
 
+              {/* Salary & Statutory Setup */}
+              <div className="border-t border-slate-200 pt-4 space-y-4">
+                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Salary Master & Statutory Tax Configuration</h4>
+                
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Basic Salary (NPR)</label>
+                    <input 
+                      type="number" 
+                      value={formData.basicSalary ?? ''} 
+                      onChange={e => setFormData({...formData, basicSalary: Number(e.target.value)})} 
+                      placeholder="e.g. 35000"
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono font-bold" 
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Allowances (NPR)</label>
+                    <input 
+                      type="number" 
+                      value={formData.allowances ?? ''} 
+                      onChange={e => setFormData({...formData, allowances: Number(e.target.value)})} 
+                      placeholder="e.g. 8750"
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono font-bold" 
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Tax Status (IRD Nepal)</label>
+                    <select 
+                      value={formData.maritalStatus || 'Single'} 
+                      onChange={e => setFormData({...formData, maritalStatus: e.target.value as 'Single' | 'Married'})} 
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-bold"
+                    >
+                      <option value="Single">Single (Slab 1 Limit Rs. 5,00,000)</option>
+                      <option value="Married">Married (Slab 1 Limit Rs. 6,00,000)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">SSF Enrollment</label>
+                    <select 
+                      value={formData.ssfEnrolled === false ? 'No' : 'Yes'} 
+                      onChange={e => setFormData({...formData, ssfEnrolled: e.target.value === 'Yes'})} 
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-bold"
+                    >
+                      <option value="Yes">Enrolled (11% Employee, 20% Employer)</option>
+                      <option value="No">Non-SSF (10% PF, No 1% SST Waiver)</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Auto Calculated Gross & CTC Breakdown Box */}
+                {Boolean(formData.basicSalary) && (
+                  <div className="bg-indigo-50/60 dark:bg-slate-800 p-3.5 rounded-xl border border-indigo-100 grid grid-cols-3 gap-2 text-xs">
+                    <div>
+                      <span className="text-slate-400 text-[10px] uppercase font-bold block">Gross Salary</span>
+                      <strong className="text-slate-900 dark:text-white font-mono text-sm">
+                        Rs. {((formData.basicSalary || 0) + (formData.allowances || 0)).toLocaleString()}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 text-[10px] uppercase font-bold block">Employer SSF (20%)</span>
+                      <strong className="text-indigo-600 font-mono text-sm">
+                        Rs. {Math.round((formData.basicSalary || 0) * 0.20).toLocaleString()}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-400 text-[10px] uppercase font-bold block">Total Monthly CTC</span>
+                      <strong className="text-emerald-600 font-mono text-sm font-black">
+                        Rs. {(((formData.basicSalary || 0) + (formData.allowances || 0)) + Math.round((formData.basicSalary || 0) * 0.20)).toLocaleString()}
+                      </strong>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div className="flex justify-end gap-3 mt-8">
                 <button type="button" onClick={() => setIsModalOpen(false)} className="px-6 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100 rounded-lg transition-colors">Cancel</button>
                 <button type="submit" className="px-6 py-2 bg-indigo-600 text-white rounded-lg text-sm font-bold shadow-lg hover:bg-indigo-700 transition-colors">Save Employee</button>
@@ -813,37 +1084,42 @@ export function Employees() {
 
       {/* IMPORT Modal */}
       {isImportModalOpen && (
-        <div className="fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-[100] backdrop-blur-sm">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8">
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-xl font-bold text-slate-900">Bulk Import Employees</h3>
+        <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center p-4 z-[100] backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-6 space-y-6 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+              <div>
+                <h3 className="text-lg font-bold text-slate-900">Bulk Import Employees</h3>
+                <p className="text-xs text-slate-500">Import Master Data via standard Excel template</p>
+              </div>
               <button 
                 onClick={() => {
                   setIsImportModalOpen(false);
                   setImportFile(null);
+                  setImportPreview(null);
                 }} 
                 className="p-2 hover:bg-slate-100 rounded-lg text-slate-400"
               >
-                <X />
+                <X className="w-5 h-5" />
               </button>
             </div>
             
-            <div className="space-y-6">
+            <div className="space-y-4">
+              {/* File Upload Drop Zone */}
               <div className={cn(
-                "p-6 border-2 border-dashed rounded-xl text-center space-y-4 transition-all",
-                importFile ? "border-indigo-500 bg-indigo-50/30" : "border-slate-200"
+                "p-5 border-2 border-dashed rounded-xl text-center space-y-3 transition-all",
+                importFile ? "border-indigo-500 bg-indigo-50/20" : "border-slate-200"
               )}>
                 <div className="flex justify-center">
-                  <FileUp className={cn("w-10 h-10 transition-colors", importFile ? "text-indigo-600" : "text-indigo-400")} />
+                  <FileUp className={cn("w-8 h-8 transition-colors", importFile ? "text-indigo-600" : "text-slate-400")} />
                 </div>
-                <div className="text-sm text-slate-500 font-medium">
+                <div className="text-xs text-slate-600 font-medium">
                   {importFile ? (
                     <div className="space-y-1">
-                      <p className="text-slate-900 font-bold">{importFile.name}</p>
-                      <p className="text-[10px] uppercase tracking-widest text-slate-400">File Loaded Successfully</p>
+                      <p className="text-slate-900 font-bold text-sm">{importFile.name}</p>
+                      <p className="text-[10px] uppercase tracking-widest text-emerald-600 font-bold">File Loaded & Parsed</p>
                     </div>
                   ) : (
-                    "Select an Excel file to import employee master data."
+                    "Select an Excel workbook (.xlsx) containing employee records."
                   )}
                 </div>
                 <input 
@@ -854,45 +1130,173 @@ export function Employees() {
                   className="hidden" 
                 />
                 
-                <div className="flex flex-col gap-2 pt-2">
+                <div className="flex items-center justify-center gap-2 pt-1">
                   <button 
                     onClick={() => fileInputRef.current?.click()}
-                    className={cn(
-                      "px-4 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest transition-all",
-                      importFile 
-                        ? "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50" 
-                        : "bg-indigo-600 text-white shadow-lg shadow-indigo-200 hover:bg-indigo-700"
-                    )}
+                    className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-all"
                   >
-                    {importFile ? "Change File (Load)" : "Choose File (Load)"}
+                    {importFile ? "Change File" : "Choose Excel File"}
                   </button>
-                  
-                  {importFile && (
-                    <button 
-                      onClick={handleUpload}
-                      disabled={isUploading}
-                      className="px-4 py-2.5 bg-emerald-600 text-white rounded-xl text-xs font-black uppercase tracking-widest shadow-lg shadow-emerald-200 hover:bg-emerald-700 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
-                    >
-                      {isUploading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <FileUp className="w-4 h-4" />}
-                      {isUploading ? "Uploading..." : "Upload & Process"}
-                    </button>
-                  )}
+                  <button 
+                    onClick={downloadTemplate}
+                    className="px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-600 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5"
+                  >
+                    <Download className="w-3.5 h-3.5" /> Download Template
+                  </button>
                 </div>
               </div>
 
-              <div className="bg-slate-50 p-4 rounded-xl space-y-3">
-                <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Instructions</h4>
-                <p className="text-xs text-slate-600 leading-relaxed font-medium">
-                  1. Use our standard template for best results.<br/>
-                  2. Required fields: Employee ID (unique), Name.<br/>
-                  3. Existing IDs in directory will be skipped.
-                </p>
-                <button 
-                  onClick={downloadTemplate}
-                  className="flex items-center gap-2 text-indigo-600 text-xs font-black hover:underline uppercase tracking-tighter"
-                >
-                  <Download className="w-3 h-3" /> Download Template
-                </button>
+              {/* Validation & Preview Summary Box */}
+              {importPreview && (
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-black uppercase tracking-wider text-slate-700">Import Validation Summary</h4>
+                    <span className="text-xs font-mono font-bold text-slate-500">{importPreview.totalRows} Total Rows</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center font-mono">
+                    <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                      <span className="text-[10px] text-slate-400 uppercase font-bold block">Valid Rows</span>
+                      <strong className="text-emerald-600 text-base">{importPreview.validCount}</strong>
+                    </div>
+                    <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                      <span className="text-[10px] text-slate-400 uppercase font-bold block">New Bio IDs</span>
+                      <strong className="text-indigo-600 text-base">{importPreview.newCount}</strong>
+                    </div>
+                    <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                      <span className="text-[10px] text-slate-400 uppercase font-bold block">Existing IDs</span>
+                      <strong className="text-amber-600 text-base">{importPreview.existingCount}</strong>
+                    </div>
+                    <div className="bg-white p-2.5 rounded-lg border border-slate-200">
+                      <span className="text-[10px] text-slate-400 uppercase font-bold block">In-File Dupes</span>
+                      <strong className="text-red-500 text-base">{importPreview.duplicateBioInFile}</strong>
+                    </div>
+                  </div>
+
+                  {/* Duplicate Strategy Option */}
+                  {importPreview.existingCount > 0 && (
+                    <div className="bg-amber-50/80 border border-amber-200 rounded-lg p-3 space-y-2 text-xs">
+                      <p className="font-bold text-amber-900">Handling Existing Employee Records ({importPreview.existingCount} matches found):</p>
+                      <div className="flex items-center gap-4 text-slate-700 font-medium">
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input 
+                            type="radio" 
+                            name="duplicateMode" 
+                            value="skip" 
+                            checked={duplicateMode === 'skip'} 
+                            onChange={() => setDuplicateMode('skip')}
+                            className="text-indigo-600 focus:ring-indigo-500"
+                          />
+                          <span>Skip Existing (Safe Default)</span>
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input 
+                            type="radio" 
+                            name="duplicateMode" 
+                            value="update" 
+                            checked={duplicateMode === 'update'} 
+                            onChange={() => setDuplicateMode('update')}
+                            className="text-indigo-600 focus:ring-indigo-500"
+                          />
+                          <span>Update Existing Master Data</span>
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Validation Error Logs */}
+                  {importPreview.errors.length > 0 && (
+                    <div className="bg-red-50 border border-red-200 rounded-lg p-3 space-y-1.5 text-xs">
+                      <p className="font-bold text-red-800">Validation Warnings ({importPreview.errors.length}):</p>
+                      <ul className="max-h-24 overflow-y-auto space-y-1 text-red-700 font-mono text-[11px] list-disc pl-4">
+                        {importPreview.errors.slice(0, 5).map((err, i) => (
+                          <li key={i}>{err}</li>
+                        ))}
+                        {importPreview.errors.length > 5 && (
+                          <li className="font-bold text-red-900">+ {importPreview.errors.length - 5} more row warnings</li>
+                        )}
+                      </ul>
+                    </div>
+                  )}
+
+                  <div className="flex justify-end gap-3 pt-2 border-t border-slate-200">
+                    <button 
+                      type="button" 
+                      onClick={() => {
+                        setIsImportModalOpen(false);
+                        setImportFile(null);
+                        setImportPreview(null);
+                      }} 
+                      className="px-4 py-2 text-xs font-bold text-slate-600 hover:bg-slate-200 rounded-lg transition-colors"
+                    >
+                      Cancel Import
+                    </button>
+                    <button 
+                      type="button" 
+                      onClick={handleExecuteImport}
+                      disabled={importPreview.validCount === 0 || importProgress.active}
+                      className="px-5 py-2 bg-emerald-600 text-white rounded-lg text-xs font-bold shadow-md hover:bg-emerald-700 transition-colors disabled:opacity-50 flex items-center gap-2"
+                    >
+                      <FileUp className="w-4 h-4" />
+                      Import {importPreview.validCount} Valid Records
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* IMPORT PROGRESS MODAL */}
+      {importProgress.active && (
+        <div className="fixed inset-0 bg-slate-900/70 flex items-center justify-center p-4 z-[110] backdrop-blur-md">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-4 text-center">
+            <div className="w-12 h-12 bg-indigo-50 rounded-2xl flex items-center justify-center mx-auto text-indigo-600">
+              <RefreshCw className="w-6 h-6 animate-spin" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-slate-900">Importing Employee Master Data</h3>
+              <p className="text-xs text-slate-500 font-medium mt-1">{importProgress.currentName}</p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs font-mono font-bold">
+                <span className="text-slate-600">{importProgress.current} / {importProgress.total}</span>
+                <span className="text-indigo-600">{importProgress.percent}%</span>
+              </div>
+              <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-indigo-600 transition-all duration-150 rounded-full"
+                  style={{ width: `${importProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* DELETE PROGRESS MODAL */}
+      {deleteProgress.active && (
+        <div className="fixed inset-0 bg-slate-900/70 flex items-center justify-center p-4 z-[110] backdrop-blur-md">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 space-y-4 text-center">
+            <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center mx-auto text-red-600">
+              <Trash2 className="w-6 h-6 animate-pulse" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-slate-900">Deleting Employee Records</h3>
+              <p className="text-xs text-slate-500 font-medium mt-1">Please do not close browser</p>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs font-mono font-bold">
+                <span className="text-slate-600">{deleteProgress.current} / {deleteProgress.total}</span>
+                <span className="text-red-600">{deleteProgress.percent}%</span>
+              </div>
+              <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-red-600 transition-all duration-150 rounded-full"
+                  style={{ width: `${deleteProgress.percent}%` }}
+                />
               </div>
             </div>
           </div>

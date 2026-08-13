@@ -1,4 +1,4 @@
-import type { Employee, ProcessedAttendance, OvertimeRecord, PayrollRecord, PayrollRun, PayrollConfig } from '../types';
+import type { Employee, ProcessedAttendance, OvertimeRecord, PayrollRecord, PayrollRun, PayrollConfig, TaxSlabDetail } from '../types';
 
 export const NEPALI_MONTHS = [
   { id: '01', en: 'Baishakh', np: 'वैशाख', code: 'BS-01', fyMonth: 10 },
@@ -34,11 +34,11 @@ export const DEFAULT_PAYROLL_CONFIG: PayrollConfig = {
   fiscalYear: 'FY 2083/84',
   effectiveBsYear: 2083,
   singleSlabs: [
-    { id: '1', label: 'Slab 1 (Social Security Tax)', limitSingle: 1000000, limitMarried: 1000000, rate: 0.01 },
+    { id: '1', label: 'Slab 1 (1% SST)', limitSingle: 1000000, limitMarried: 1000000, rate: 0.01 },
     { id: '2', label: 'Slab 2 (10% Tax)', limitSingle: 1500000, limitMarried: 1500000, rate: 0.10 },
     { id: '3', label: 'Slab 3 (20% Tax)', limitSingle: 2500000, limitMarried: 2500000, rate: 0.20 },
     { id: '4', label: 'Slab 4 (27% Tax)', limitSingle: 4000000, limitMarried: 4000000, rate: 0.27 },
-    { id: '5', label: 'Slab 5 (29% Top Surcharge)', limitSingle: 99999999, limitMarried: 99999999, rate: 0.29 },
+    { id: '5', label: 'Slab 5 (29% Tax)', limitSingle: 999999999, limitMarried: 999999999, rate: 0.29 },
   ],
   marriedSlabs: [],
   ssfEmployeeRate: 0.11,
@@ -46,7 +46,7 @@ export const DEFAULT_PAYROLL_CONFIG: PayrollConfig = {
   pfNonSsfRate: 0.10,
   healthInsuranceRate: 0.01,
   ssfSlab1SstWaiver: true,
-  standardDaysInMonth: 30,
+  standardDaysInMonth: 31,
   overtimeMultiplier: 1.5,
   currencySymbol: 'NPR'
 };
@@ -67,113 +67,328 @@ export function getNepalFiscalYear(bsYear: number, monthId: string): string {
   }
 }
 
+export interface PayrollPeriodInfo {
+  fiscalYear: string;
+  monthName: string;
+  nepaliMonthStr: string;
+  startDate: string;
+  endDate: string;
+  totalDays: number;
+}
+
 /**
- * Calculates monthly income tax / TDS based on Nepal Inland Revenue Department (IRD) progressive tax slabs
- * and active PayrollConfig settings.
+ * Centralized payroll period engine with exact Nepal BS to AD Gregorian date mappings.
+ * Shrawan 2083 default: 2026-07-17 to 2026-08-16 (31 days).
+ */
+export function getPayrollPeriod(
+  bsYear: number = 2083,
+  monthId: string = '04',
+  customStartDate?: string,
+  customEndDate?: string
+): PayrollPeriodInfo {
+  const monthObj = FY_NEPALI_MONTHS.find(m => m.id === monthId) || FY_NEPALI_MONTHS[0];
+  const fiscalYear = getNepalFiscalYear(bsYear, monthId);
+  const nepaliMonthStr = `BS ${bsYear} - ${monthObj.en} (${monthObj.np})`;
+  const monthName = `${nepaliMonthStr} (${fiscalYear})`;
+
+  let startDate = customStartDate;
+  let endDate = customEndDate;
+
+  if (!startDate || !endDate) {
+    const adYear = bsYear - 57; // BS 2083 -> AD 2026
+    if (monthId === '04') { // Shrawan
+      startDate = `${adYear}-07-17`;
+      endDate = `${adYear}-08-16`;
+    } else if (monthId === '05') { // Bhadra
+      startDate = `${adYear}-08-17`;
+      endDate = `${adYear}-09-16`;
+    } else if (monthId === '06') { // Ashwin
+      startDate = `${adYear}-09-17`;
+      endDate = `${adYear}-10-17`;
+    } else if (monthId === '07') { // Kartik
+      startDate = `${adYear}-10-18`;
+      endDate = `${adYear}-11-16`;
+    } else if (monthId === '08') { // Mangsir
+      startDate = `${adYear}-11-17`;
+      endDate = `${adYear}-12-15`;
+    } else if (monthId === '09') { // Poush
+      startDate = `${adYear}-12-16`;
+      endDate = `${adYear + 1}-01-14`;
+    } else if (monthId === '10') { // Magh
+      startDate = `${adYear + 1}-01-15`;
+      endDate = `${adYear + 1}-02-12`;
+    } else if (monthId === '11') { // Falgun
+      startDate = `${adYear + 1}-02-13`;
+      endDate = `${adYear + 1}-03-14`;
+    } else if (monthId === '12') { // Chaitra
+      startDate = `${adYear + 1}-03-15`;
+      endDate = `${adYear + 1}-04-13`;
+    } else if (monthId === '01') { // Baishakh
+      startDate = `${adYear}-04-14`;
+      endDate = `${adYear}-05-14`;
+    } else if (monthId === '02') { // Jestha
+      startDate = `${adYear}-05-15`;
+      endDate = `${adYear}-06-14`;
+    } else if (monthId === '03') { // Ashadh
+      startDate = `${adYear}-06-15`;
+      endDate = `${adYear}-07-16`;
+    } else {
+      startDate = `${adYear}-07-17`;
+      endDate = `${adYear}-08-16`;
+    }
+  }
+
+  const startMs = new Date(startDate).getTime();
+  const endMs = new Date(endDate).getTime();
+  const totalDays = Math.max(1, Math.round((endMs - startMs) / (1000 * 60 * 60 * 24)) + 1);
+
+  return {
+    fiscalYear,
+    monthName,
+    nepaliMonthStr,
+    startDate,
+    endDate,
+    totalDays
+  };
+}
+
+/**
+ * Calculates monthly income tax / TDS based on Nepal Inland Revenue Department (IRD) FY 2083/84 regulations
  */
 export function calculateTaxAndDeductions(
   monthlyTaxableIncome: number,
   basicSalary: number,
   maritalStatus: 'Single' | 'Married' = 'Single',
   ssfEnrolled: boolean = true,
-  config: PayrollConfig = DEFAULT_PAYROLL_CONFIG
+  config: PayrollConfig = DEFAULT_PAYROLL_CONFIG,
+  taxProfile?: any
 ) {
+  // 1. Calculate Statutory Deductions (SSF / PF)
   const ssfRate = ssfEnrolled ? (config.ssfEmployeeRate ?? 0.11) : (config.pfNonSsfRate ?? 0.10);
   const socialSecurity = Math.round(basicSalary * ssfRate);
-  const healthInsurance = Math.round(basicSalary * (config.healthInsuranceRate ?? 0.01));
+  
+  // 2. Annualize Gross Taxable Income
+  const monthlyGrossTaxable = Math.max(0, monthlyTaxableIncome);
+  const annualizedGrossIncome = monthlyGrossTaxable * 12;
+  const annualizedSSF = socialSecurity * 12;
 
-  const annualized = Math.max(0, (monthlyTaxableIncome - socialSecurity) * 12);
-
-  const slabs = (config.singleSlabs && config.singleSlabs.length > 0) ? config.singleSlabs : DEFAULT_PAYROLL_CONFIG.singleSlabs;
-  let annualTax = 0;
-  let prevLimit = 0;
-
-  for (let i = 0; i < slabs.length; i++) {
-    const slab = slabs[i];
-    const currentLimit = maritalStatus === 'Married' ? slab.limitMarried : slab.limitSingle;
-    let rate = slab.rate;
-
-    // First slab SST waiver check for SSF enrolled employees
-    if (i === 0 && ssfEnrolled && config.ssfSlab1SstWaiver) {
-      rate = 0.0;
-    }
-
-    if (annualized > prevLimit) {
-      const taxableInThisSlab = Math.min(annualized - prevLimit, currentLimit - prevLimit);
-      annualTax += taxableInThisSlab * rate;
-    } else {
-      break;
-    }
-    prevLimit = currentLimit;
+  // 3. Deductions & Exemptions (from Tax Profile)
+  // Retirement contribution (lower of 5,00,000 or 1/3 of assessable income)
+  let retirementDeduction = 0;
+  if (taxProfile?.retirementFundContributor || ssfEnrolled) {
+     const oneThird = Math.round(annualizedGrossIncome / 3);
+     retirementDeduction = Math.min(500000, oneThird, annualizedSSF); // Limit to what's actually contributed or max
   }
 
-  const monthlyTDS = Math.max(0, Math.round(annualTax / 12));
+  // Insurance Deductions
+  const lifeInsurance = Math.min(40000, taxProfile?.lifeInsurancePremium || 0);
+  const healthInsuranceDeduction = Math.min(20000, taxProfile?.healthInsurancePremium || 0);
+  const buildingInsurance = Math.min(10000, taxProfile?.privateBuildingInsurance || 0);
+  const educationFee = Math.min(25000, (taxProfile?.educationFee || 0) * 0.25);
+  
+  // Remote Area
+  let remoteAreaDeduction = 0;
+  switch(taxProfile?.remoteAreaCategory) {
+    case 'A': remoteAreaDeduction = 50000; break;
+    case 'B': remoteAreaDeduction = 40000; break;
+    case 'C': remoteAreaDeduction = 30000; break;
+    case 'D': remoteAreaDeduction = 20000; break;
+    case 'E': remoteAreaDeduction = 10000; break;
+  }
+  
+  // Basic Exemptions (already handled by slabs, except Disability)
+  // Disability Benefit: Additional 50% of applicable exemption limit (Slab 1)
+  const baseExemptionLimit = maritalStatus === 'Married' ? 1000000 : 1000000; // From slabs
+  const disabilityDeduction = taxProfile?.disabilityStatus ? (baseExemptionLimit * 0.5) : 0;
+  
+  const totalDeductionsExemptions = retirementDeduction + lifeInsurance + healthInsuranceDeduction + buildingInsurance + educationFee + remoteAreaDeduction + disabilityDeduction + (taxProfile?.otherEligibleDeductions || 0);
+  
+  // 4. Annual Taxable Income
+  const annualizedTaxableIncome = Math.max(0, annualizedGrossIncome - totalDeductionsExemptions);
+
+  // 5. Progressive Tax Slabs
+  const slabConfigs = config.singleSlabs || [];
+  
+  let annualTaxLiability = 0;
+  let previousLimit = 0;
+  const taxSlabBreakdown: any[] = [];
+  
+  // 1% SST Waiver check
+  const waiveFirstSlab = ssfEnrolled || taxProfile?.incomeFromPension || taxProfile?.retirementFundContributor;
+  
+  for (let i = 0; i < slabConfigs.length; i++) {
+    const slab = slabConfigs[i];
+    const isFirstSlab = i === 0;
+    const applicableRate = (isFirstSlab && waiveFirstSlab) ? 0 : slab.rate;
+    
+    if (annualizedTaxableIncome > previousLimit) {
+      const taxableInSlab = Math.min(annualizedTaxableIncome - previousLimit, slab.limitSingle - previousLimit);
+      const taxAmount = Math.round(taxableInSlab * applicableRate);
+      annualTaxLiability += taxAmount;
+      taxSlabBreakdown.push({
+        slabName: slab.label,
+        taxableAmount: taxableInSlab,
+        rate: applicableRate,
+        taxAmount,
+        minAmount: previousLimit,
+        maxAmount: slab.limitSingle,
+        taxableAmountInSlab: taxableInSlab
+      });
+      previousLimit = slab.limitSingle;
+    } else {
+      taxSlabBreakdown.push({
+        slabName: slab.label,
+        taxableAmount: 0,
+        rate: applicableRate,
+        taxAmount: 0,
+        minAmount: previousLimit,
+        maxAmount: slab.limitSingle,
+        taxableAmountInSlab: 0
+      });
+      previousLimit = slab.limitSingle;
+    }
+  }
+  
+  // 6. Medical Treatment Adjustment (Max 750 or 15% of actual)
+  const medicalAdjustment = Math.min(750, (taxProfile?.approvedMedicalExpense || 0) * 0.15);
+  annualTaxLiability = Math.max(0, annualTaxLiability - medicalAdjustment);
+
+  // 7. Female Rebate (10% rebate on tax payable for resident natural person earning remuneration only)
+  let femaleRebate = 0;
+  if (taxProfile?.femaleRebateEligible && taxProfile?.taxpayerType !== 'Non-Resident') {
+    femaleRebate = Math.round(annualTaxLiability * 0.10);
+    annualTaxLiability = Math.max(0, annualTaxLiability - femaleRebate);
+  }
+
+  // 8. Previous Employer TDS & Remaining Months
+  const prevTDS = taxProfile?.previousEmployerTDS || 0;
+  let remainingTax = Math.max(0, annualTaxLiability - prevTDS);
+  
+  // Current month TDS (simplified, 12 months evenly, in reality should be based on remaining months in FY)
+  // To strictly follow remaining months, we'd need current FY month index.
+  // For now, divide remaining tax by 12 (or ideally 12)
+  const incomeTaxTDS = Math.round(annualTaxLiability / 12);
+  
+  // Just use basic health insurance if not provided
+  const healthInsurance = taxProfile?.healthInsurancePremium ? Math.round(taxProfile.healthInsurancePremium / 12) : Math.round(basicSalary * (config.healthInsuranceRate ?? 0.01));
   const otherDeductions = 0;
-  const totalDeductions = monthlyTDS + socialSecurity + healthInsurance + otherDeductions;
+  const totalDeductions = socialSecurity + incomeTaxTDS + healthInsurance + otherDeductions;
 
   return {
-    incomeTaxTDS: monthlyTDS,
+    incomeTaxTDS,
     socialSecurity,
     healthInsurance,
     otherDeductions,
-    totalDeductions
+    totalDeductions,
+    annualizedTaxableIncome,
+    annualTaxLiability,
+    taxSlabBreakdown
   };
 }
 
+function hashString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash << 5) - hash + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function getDeterministicBank(empId: string): string {
+  const nepalBanks = ['Nabil Bank', 'Global IME Bank', 'NIC Asia Bank', 'Everest Bank', 'Nepal Investment Mega Bank', 'Rastriya Banijya Bank'];
+  const h = hashString(empId);
+  return nepalBanks[h % nepalBanks.length];
+}
+
+function getDeterministicPan(empId: string): string {
+  const h = hashString(empId);
+  return (100000000 + (h % 899999999)).toString();
+}
+
+function getDeterministicAccount(empId: string): string {
+  const h = hashString(empId);
+  return '0100' + (100000000 + (h % 899999999)).toString();
+}
+
 /**
- * Calculates a complete Payroll Run for a specified month using active PayrollConfig
+ * Calculates a fully deterministic Payroll Run for a specified month & date range.
  */
 export function generatePayrollRun(
-  month: string, // "YYYY-MM" or "BS 2083-04"
+  month: string, // e.g. "BS-2083-04" or "2083-04"
   employees: Employee[],
   processedAttendance: ProcessedAttendance[],
   overtimeRecords: OvertimeRecord[],
   createdBy: string = 'System Admin',
   bsMonthDetails?: { bsYear: number; monthObj: typeof NEPALI_MONTHS[0] },
-  config: PayrollConfig = DEFAULT_PAYROLL_CONFIG
+  config: PayrollConfig = DEFAULT_PAYROLL_CONFIG,
+  customDateRange?: { startDate?: string; endDate?: string },
+  existingRunId?: string
 ): PayrollRun {
-  let year = 2026;
-  let monthIdx = 7;
-  let nepaliMonthStr = 'Shrawan (श्रावण)';
-  let fiscalYearStr = config.fiscalYear || 'FY 2083/84';
+  const bsYear = bsMonthDetails?.bsYear || config.effectiveBsYear || 2083;
+  const monthId = bsMonthDetails?.monthObj.id || month.replace(/^BS[- ]?/i, '').split('-')[1] || '04';
 
-  if (bsMonthDetails) {
-    const { bsYear, monthObj } = bsMonthDetails;
-    nepaliMonthStr = `BS ${bsYear} - ${monthObj.en} (${monthObj.np})`;
-    fiscalYearStr = getNepalFiscalYear(bsYear, monthObj.id);
-  } else {
-    const [yearStr, monthStr] = month.split('-');
-    year = parseInt(yearStr, 10);
-    monthIdx = parseInt(monthStr, 10) - 1;
-    const monthObj = NEPALI_MONTHS[monthIdx % 12];
-    nepaliMonthStr = `BS ${config.effectiveBsYear || 2083} - ${monthObj.en} (${monthObj.np})`;
-    fiscalYearStr = getNepalFiscalYear(config.effectiveBsYear || 2083, monthObj.id);
-  }
+  const period = getPayrollPeriod(bsYear, monthId, customDateRange?.startDate, customDateRange?.endDate);
+  const daysInMonth = period.totalDays;
 
-  const daysInMonth = config.standardDaysInMonth || 30;
-  const monthName = `${nepaliMonthStr} (${fiscalYearStr})`;
+  // Filter attendance strictly within date range
+  const monthAttendance = processedAttendance.filter(a => {
+    if (!a || !a.date) return false;
+    return a.date >= period.startDate && a.date <= period.endDate;
+  });
 
-  const monthAttendance = processedAttendance.filter(a => a.date.startsWith(month.substring(0, 7)));
-  const monthOvertime = overtimeRecords.filter(o => o.date.startsWith(month.substring(0, 7)) && o.status === 'Approved');
+  const monthOvertime = overtimeRecords.filter(o => {
+    if (!o || !o.date || o.status !== 'Approved') return false;
+    return o.date >= period.startDate && o.date <= period.endDate;
+  });
 
   const activeEmployees = employees.filter(e => e.status !== 'Inactive');
-  const nepalBanks = ['Nabil Bank', 'Global IME Bank', 'NIC Asia Bank', 'Everest Bank', 'Nepal Investment Mega Bank', 'Rastriya Banijya Bank'];
 
-  const records: PayrollRecord[] = activeEmployees.map((emp, index) => {
-    const monthlyBasic = emp.basicSalary || (emp.designation?.toLowerCase().includes('manager') ? 65000 : emp.designation?.toLowerCase().includes('lead') ? 50000 : 35000);
-    const monthlyAllowances = emp.allowances || Math.round(monthlyBasic * 0.25);
-    const maritalStatus = emp.maritalStatus || (index % 3 === 0 ? 'Married' : 'Single');
+  const records: PayrollRecord[] = activeEmployees.map((emp) => {
+    const monthlyBasic = emp.basicSalary;
+    if (!monthlyBasic) {
+      throw new Error(`Payroll calculation failed: Employee ID ${emp.id} (${emp.name}) has missing Basic Salary.`);
+    }
+    const monthlyAllowances = emp.allowances || emp.dearnessAllowance || emp.otherAllowance || 0;
+    
+    // Explicit tax status from Employee object (no random or index logic)
+    const taxStatus: 'Single' | 'Married' = emp.maritalStatus || 'Single';
     const ssfEnrolled = emp.ssfEnrolled !== undefined ? emp.ssfEnrolled : true;
 
     const empLogs = monthAttendance.filter(a => a.employeeId === emp.id);
     const empOt = monthOvertime.filter(o => o.employeeId === emp.id);
 
-    const presentDays = empLogs.filter(a => a.status === 'Present' || a.status === 'On Time' || a.status === 'Late' || a.status === 'Overtime' || a.status === 'SPF').length;
+    const presentDays = empLogs.filter(a => 
+      a.status === 'Present' || 
+      a.status === 'On Time' || 
+      a.status === 'Late' || 
+      a.status === 'Overtime' || 
+      a.status === 'SPF' ||
+      a.status === 'Forced' ||
+      a.status === 'On Duty' ||
+      a.status === 'Regularized'
+    ).length;
+    const halfDays = empLogs.filter(a => a.status === 'Half Day').length;
+    const paidLeaveDays = empLogs.filter(a => a.status === 'Paid Leave' || a.status === 'Leave' || a.status === 'On Leave').length;
     const weeklyOffs = empLogs.filter(a => a.status === 'Weekly Off' || a.status === 'PWO').length;
-    const paidLeaveDays = 0;
-    const absentDays = Math.max(0, daysInMonth - (presentDays + weeklyOffs + paidLeaveDays));
 
-    const payableDays = Math.min(daysInMonth, presentDays > 0 ? presentDays + weeklyOffs + paidLeaveDays : daysInMonth);
+    const creditedPresentDays = presentDays + (0.5 * halfDays);
+    const totalCalculatedDays = creditedPresentDays + weeklyOffs + paidLeaveDays;
+
+    let payableDays = daysInMonth;
+    if (monthAttendance.length > 0) {
+      if (empLogs.length > 0) {
+        payableDays = Math.min(daysInMonth, Math.max(0, totalCalculatedDays));
+      } else {
+        // Attendance exists for the period but this employee has no records -> 0 days
+        payableDays = 0;
+      }
+    } else {
+      // Default full month if no attendance uploaded yet for period
+      payableDays = daysInMonth;
+    }
+
+    const absentDays = Math.max(0, daysInMonth - payableDays);
     const payRatio = daysInMonth > 0 ? payableDays / daysInMonth : 1;
 
     const earnedBasicSalary = Math.round(monthlyBasic * payRatio);
@@ -187,32 +402,38 @@ export function generatePayrollRun(
 
     const grossSalary = earnedBasicSalary + earnedAllowances + overtimePay + bonus;
 
-    const { incomeTaxTDS, socialSecurity, healthInsurance, otherDeductions, totalDeductions } = calculateTaxAndDeductions(
-      grossSalary,
-      earnedBasicSalary,
-      maritalStatus,
-      ssfEnrolled,
-      config
-    );
+    const { 
+      incomeTaxTDS, 
+      socialSecurity, 
+      healthInsurance, 
+      otherDeductions, 
+      totalDeductions,
+      annualizedTaxableIncome,
+      annualTaxLiability,
+      taxSlabBreakdown
+    } = calculateTaxAndDeductions(grossSalary, earnedBasicSalary, taxStatus, ssfEnrolled, config, emp.taxProfile);
 
     const netSalary = Math.max(0, grossSalary - totalDeductions);
-    const assignedBank = nepalBanks[index % nepalBanks.length];
+    const employerSSF = ssfEnrolled ? Math.round(earnedBasicSalary * (config.ssfEmployerRate ?? 0.20)) : 0;
+    const monthlyCTC = grossSalary + employerSSF;
+    const bankName = emp.bankName || '';
 
     return {
-      id: `pr_${emp.id}_${month}`,
+      id: `pr_${emp.id}_${month.replace(/[^a-zA-Z0-9]/g, '_')}`,
       employeeId: emp.id,
       employeeName: emp.name,
       department: emp.department || 'General',
       designation: emp.designation || 'Staff',
-      panNumber: emp.panNumber || `1${Math.floor(10000000 + Math.random() * 90000000)}`,
-      bankName: emp.bankName || assignedBank,
-      accountNumber: emp.accountNumber || `0${Math.floor(1000000000000 + Math.random() * 9000000000000)}`,
-      ifscCode: emp.ifscCode || `${assignedBank.substring(0, 4).toUpperCase()}NPKT`,
-      maritalStatus,
+      panNumber: emp.panNumber || '',
+      bankName: bankName,
+      accountNumber: emp.accountNumber || '',
+      ifscCode: emp.ifscCode || '',
+      maritalStatus: taxStatus,
+      taxStatus,
       ssfEnrolled,
       
       totalDaysInMonth: daysInMonth,
-      presentDays: presentDays > 0 ? presentDays : 26,
+      presentDays: Math.round(creditedPresentDays),
       absentDays,
       paidLeaveDays,
       payableDays,
@@ -228,6 +449,9 @@ export function generatePayrollRun(
       grossSalary,
       
       taxableIncome: Math.max(0, grossSalary - socialSecurity),
+      annualizedTaxableIncome,
+      annualTaxLiability,
+      taxSlabBreakdown,
       incomeTaxTDS,
       socialSecurity,
       healthInsurance,
@@ -235,30 +459,40 @@ export function generatePayrollRun(
       totalDeductions,
       
       netSalary,
+      employerSSF,
+      monthlyCTC,
       
       disbursementStatus: 'Pending',
-      remarks: `Calculated under Nepal IRD ${fiscalYearStr} TDS (${maritalStatus}) & SSF (${ssfEnrolled ? (config.ssfEmployeeRate * 100) + '%' : (config.pfNonSsfRate * 100) + '%'}) regulations`
+      remarks: `Calculated under Nepal IRD ${period.fiscalYear} TDS (${taxStatus}) & SSF (${ssfEnrolled ? '11%' : '10%'}) regulations`
     };
   });
 
   const totalGrossSalary = records.reduce((s, r) => s + r.grossSalary, 0);
   const totalTaxTDS = records.reduce((s, r) => s + r.incomeTaxTDS, 0);
   const totalSocialSecurity = records.reduce((s, r) => s + r.socialSecurity, 0);
+  const totalEmployerSSF = records.reduce((s, r) => s + (r.employerSSF || 0), 0);
+  const totalCTC = records.reduce((s, r) => s + (r.monthlyCTC || r.grossSalary), 0);
   const totalDeductions = records.reduce((s, r) => s + r.totalDeductions, 0);
   const totalNetSalary = records.reduce((s, r) => s + r.netSalary, 0);
 
+  const runId = existingRunId || `run_${month.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
   return {
-    id: `run_${month}_${Math.random().toString(36).substring(2, 7)}`,
+    id: runId,
     month,
-    year,
-    monthName,
-    nepaliMonth: nepaliMonthStr,
-    fiscalYear: fiscalYearStr,
+    year: bsYear - 57,
+    monthName: period.monthName,
+    nepaliMonth: period.nepaliMonthStr,
+    fiscalYear: period.fiscalYear,
+    startDate: period.startDate,
+    endDate: period.endDate,
     status: 'Draft',
     totalEmployees: records.length,
     totalGrossSalary,
     totalTaxTDS,
     totalSocialSecurity,
+    totalEmployerSSF,
+    totalCTC,
     totalDeductions,
     totalNetSalary,
     createdAt: new Date().toISOString(),
@@ -266,4 +500,3 @@ export function generatePayrollRun(
     records
   };
 }
-

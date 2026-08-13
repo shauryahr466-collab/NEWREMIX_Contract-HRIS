@@ -48,6 +48,16 @@ export interface AuditRecordComparison {
   bioOutTime?: string;
   bioRawLogsCount: number;
   
+  dayName?: string;
+  weeklyOffDay?: string;
+  shiftDetails?: string;
+  expectedHours?: number;
+  workingHours?: number;
+  lateMinutes?: number;
+  earlyMinutes?: number;
+  rawPunchesStr?: string;
+  compiledPunchesStr?: string;
+  
   isWeeklyOff: boolean;
   isPublicHoliday: boolean;
   

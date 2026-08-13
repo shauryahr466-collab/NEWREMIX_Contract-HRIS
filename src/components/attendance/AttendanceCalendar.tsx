@@ -156,6 +156,22 @@ export function AttendanceCalendar() {
     const isHoliday = settings.holidays?.some(h => h.date === day.adDateStr);
     const isWeeklyOff = day.isSaturday || selectedEmp.weeklyOff?.toLowerCase() === day.dayOfWeek.toLowerCase();
 
+    // Find shift assigned for this employee on this date
+    const assignment = shiftAssignments.find(a => a.employeeId === selectedEmp.id && a.date === day.adDateStr);
+    const assignedShift = settings.shifts?.find(s => s.id === (assignment?.shiftId || selectedEmp.shiftId)) || settings.shifts?.[0];
+    
+    // Derive concise shift code
+    const shiftCode = assignedShift ? (
+      assignedShift.name === 'Day Shift' || assignedShift.name === 'Day' ? 'DS' :
+      assignedShift.name === 'Night Shift' || assignedShift.name === 'Night' ? 'NS' :
+      assignedShift.name === 'Morning Shift' || assignedShift.name === 'Morning' ? 'MS' :
+      assignedShift.name === 'General Shift' || assignedShift.name === 'General' ? 'GS' :
+      assignedShift.name.length <= 4 ? assignedShift.name :
+      assignedShift.name.split(/\s+/).map(w => w[0]).join('').toUpperCase() || 'DS'
+    ) : 'DS';
+
+    const isOverrideShift = !!assignment?.shiftId;
+
     const inTimeStr = record?.firstPunch ? formatAMPM(record.firstPunch) : null;
     const outTimeStr = (record?.lastPunch && record.lastPunch !== record.firstPunch)
       ? formatAMPM(record.lastPunch)
@@ -170,7 +186,9 @@ export function AttendanceCalendar() {
           statusBadge: 'bg-slate-300 dark:bg-slate-700 text-slate-800 dark:text-slate-200',
           timeBadge: null,
           lateBadge: null,
-          shiftBadge: 'DS',
+          shiftBadge: shiftCode,
+          assignedShift,
+          isOverrideShift,
           record: null
         };
       }
@@ -182,7 +200,9 @@ export function AttendanceCalendar() {
           statusBadge: 'bg-sky-500 text-white',
           timeBadge: null,
           lateBadge: null,
-          shiftBadge: 'DS',
+          shiftBadge: shiftCode,
+          assignedShift,
+          isOverrideShift,
           record: null
         };
       }
@@ -194,7 +214,9 @@ export function AttendanceCalendar() {
         timeBadge: 'Missed',
         timeBadgeStyle: 'bg-cyan-500 text-white',
         lateBadge: null,
-        shiftBadge: 'DS',
+        shiftBadge: shiftCode,
+        assignedShift,
+        isOverrideShift,
         record: null
       };
     }
@@ -208,7 +230,9 @@ export function AttendanceCalendar() {
         timeBadge: inTimeStr ? `In-${inTimeStr},Out-${outTimeStr || ''}` : 'In-10:00,Out-18:30',
         timeBadgeStyle: 'bg-emerald-800 text-white',
         lateBadge: null,
-        shiftBadge: 'DS',
+        shiftBadge: shiftCode,
+        assignedShift,
+        isOverrideShift,
         record
       };
     }
@@ -221,7 +245,9 @@ export function AttendanceCalendar() {
         statusBadge: 'bg-slate-400 dark:bg-slate-600 text-white',
         timeBadge: null,
         lateBadge: null,
-        shiftBadge: 'DS',
+        shiftBadge: shiftCode,
+        assignedShift,
+        isOverrideShift,
         record
       };
     }
@@ -239,7 +265,9 @@ export function AttendanceCalendar() {
         timeBadge: 'Missed',
         timeBadgeStyle: 'bg-cyan-500 text-white',
         lateBadge: isLate ? 'LateBy' : null,
-        shiftBadge: 'DS',
+        shiftBadge: shiftCode,
+        assignedShift,
+        isOverrideShift,
         record
       };
     }
@@ -252,7 +280,9 @@ export function AttendanceCalendar() {
       timeBadge: timeText,
       timeBadgeStyle: 'bg-emerald-700 text-white',
       lateBadge: isLate ? 'LateBy' : null,
-      shiftBadge: 'DS',
+      shiftBadge: shiftCode,
+      assignedShift,
+      isOverrideShift,
       record
     };
   };
@@ -553,8 +583,19 @@ export function AttendanceCalendar() {
 
                       {/* Shift Badge */}
                       {details?.shiftBadge && (
-                        <div className="px-1 py-0.5 rounded text-[9px] font-bold text-center bg-emerald-400 text-slate-900 dark:bg-emerald-600 dark:text-white truncate">
-                          {details.shiftBadge}
+                        <div 
+                          title={`Shift: ${details.assignedShift?.name || 'Day Shift'} (${details.assignedShift?.startTime || '09:00'} - ${details.assignedShift?.endTime || '18:00'})${details.isOverrideShift ? ' • Custom Shift Assigned' : ''}`}
+                          className={cn(
+                            "px-1 py-0.5 rounded text-[9px] font-bold text-center transition-all truncate flex items-center justify-center gap-1",
+                            details.isOverrideShift
+                              ? "bg-indigo-600 text-white shadow-2xs font-extrabold"
+                              : "bg-emerald-400 text-slate-900 dark:bg-emerald-600 dark:text-white"
+                          )}
+                        >
+                          <span>{details.shiftBadge}</span>
+                          {details.isOverrideShift && (
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-300 animate-pulse shrink-0" title="Custom Shift Override Assigned" />
+                          )}
                         </div>
                       )}
 

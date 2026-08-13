@@ -338,6 +338,49 @@ export async function getSqliteDb(): Promise<Database> {
       data TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS roster_batches (
+      id TEXT PRIMARY KEY,
+      roster_name TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      total_days INTEGER NOT NULL,
+      imported_at TEXT NOT NULL,
+      imported_by TEXT,
+      source_file_name TEXT,
+      status TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      data TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS roster_assignments (
+      id TEXT PRIMARY KEY,
+      roster_batch_id TEXT,
+      employee_id TEXT NOT NULL,
+      roster_date TEXT NOT NULL,
+      shift_code TEXT NOT NULL,
+      shift_start TEXT,
+      shift_end TEXT,
+      source TEXT,
+      status TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      data TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS shift_audit_logs (
+      id TEXT PRIMARY KEY,
+      employee_id TEXT NOT NULL,
+      date TEXT NOT NULL,
+      old_shift TEXT,
+      new_shift TEXT NOT NULL,
+      changed_by TEXT,
+      changed_at TEXT NOT NULL,
+      reason TEXT,
+      source TEXT NOT NULL,
+      data TEXT
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_punch_dedup ON attendance_punches (employee_id, punch_datetime, device_id);
   `;
 

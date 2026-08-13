@@ -190,3 +190,15 @@ export function Skeleton({ className }: { className?: string }) {
     <div className={cn("animate-pulse bg-slate-200 dark:bg-slate-800 rounded", className)} />
   );
 }
+
+export function NepaliRupeeIcon({ size = 20, className = '' }: { size?: number; className?: string }) {
+  return (
+    <span 
+      className={cn("font-black inline-flex items-center justify-center select-none leading-none tracking-tighter shrink-0", className)} 
+      style={{ fontSize: `${size}px` }}
+      title="Nepali Currency (रु)"
+    >
+      रु
+    </span>
+  );
+}

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, DollarSign, Cpu } from 'lucide-react';
+import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, DollarSign, Cpu, TrendingUp } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { useAppStore } from '../store';
 import { useZkSync } from '../hooks/useZkSync';
@@ -59,6 +59,8 @@ export function Layout() {
   const navItems = [
     { to: '/', icon: LayoutDashboard, label: 'Enterprise Dashboard' },
     { to: '/employees', icon: Users, label: 'Employee Directory' },
+    { to: '/movement-attrition', icon: UserCheck, label: 'Movement & Attrition' },
+    { to: '/salary-analysis', icon: TrendingUp, label: 'SALARY ANALYSIS' },
     { to: '/devices', icon: Cpu, label: 'Device Setup' },
     { to: '/import', icon: FileUp, label: 'Punch Import' },
     { to: '/attendance', icon: Fingerprint, label: 'Attendance logs' },

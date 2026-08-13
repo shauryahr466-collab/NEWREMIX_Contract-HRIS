@@ -50,6 +50,7 @@ async function startServer() {
 
   // Mount Local SQLite & Local Disk Storage API Routes
   app.use('/api/local', localRouter);
+  app.use('/api/payroll', localRouter);
 
   // Middleware to verify Admin token
   const verifyAdmin = async (req: express.Request, res: express.Response, next: express.NextFunction) => {

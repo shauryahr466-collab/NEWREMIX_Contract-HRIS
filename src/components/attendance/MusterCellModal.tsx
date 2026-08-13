@@ -35,6 +35,16 @@ export function MusterCellModal({
 
   const currentAssignment = shiftAssignments.find(a => a.employeeId === employee.id && a.date === adDateStr);
 
+  const activeShift = settings.shifts?.find(s => s.id === (currentAssignment?.shiftId || employee.shiftId)) || shift;
+  const activeShiftCode = activeShift ? (
+    activeShift.name === 'Day Shift' || activeShift.name === 'Day' ? 'DS' :
+    activeShift.name === 'Night Shift' || activeShift.name === 'Night' ? 'NS' :
+    activeShift.name === 'Morning Shift' || activeShift.name === 'Morning' ? 'MS' :
+    activeShift.name === 'General Shift' || activeShift.name === 'General' ? 'GS' :
+    activeShift.name.length <= 4 ? activeShift.name :
+    activeShift.name.split(/\s+/).map(w => w[0]).join('').toUpperCase() || 'DS'
+  ) : 'DS';
+
   const handleShiftChangeInModal = async (newShiftId: string) => {
     if (quotaExceeded) return;
 
@@ -66,8 +76,8 @@ export function MusterCellModal({
 
     toast.success(
       newShiftId 
-        ? `Shift updated to "${shiftObj?.name}" for ${employee.name} on ${adDateStr}`
-        : `Shift reset to default for ${employee.name} on ${adDateStr}`
+        ? `Shift updated to "${shiftObj?.name}" for ${employee.name} on ${adDateStr} — synced to Attendance Reconciliation!`
+        : `Shift reset to default for ${employee.name} on ${adDateStr} — synced to Attendance Reconciliation!`
     );
   };
 
@@ -131,7 +141,7 @@ export function MusterCellModal({
               <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5 mb-1">
                 <Clock size={12} className="text-indigo-500" /> Assigned Shift
               </p>
-              <div className="flex items-center gap-1.5 mt-0.5">
+              <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
                 <select
                   value={currentAssignment?.shiftId || ''}
                   onChange={(e) => handleShiftChangeInModal(e.target.value)}
@@ -146,14 +156,20 @@ export function MusterCellModal({
                     </option>
                   ))}
                 </select>
+                <span className="text-[10px] font-black px-2 py-0.5 bg-emerald-500 text-white rounded font-mono shadow-2xs" title="Shift code shown on Attendance Calendar">
+                  Code: {activeShiftCode}
+                </span>
                 {currentAssignment?.shiftId && (
                   <span className="text-[10px] font-bold px-1.5 py-0.5 bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 rounded font-mono">
-                    Assigned
+                    Custom Shift
                   </span>
                 )}
               </div>
               <p className="text-xs text-slate-500 font-mono mt-1">
-                {shift ? `${shift.startTime} - ${shift.endTime}` : '09:00 - 18:00'}
+                {activeShift ? `${activeShift.name} (${activeShift.startTime} - ${activeShift.endTime})` : '09:00 - 18:00'}
+              </p>
+              <p className="text-[10px] text-indigo-600 dark:text-indigo-400 font-medium mt-1">
+                ⚡ Changes sync instantly with Attendance Reconciliation & Audit.
               </p>
             </div>
           </div>

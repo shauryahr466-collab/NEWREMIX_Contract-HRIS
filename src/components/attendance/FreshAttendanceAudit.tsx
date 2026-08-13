@@ -9,7 +9,8 @@ import {
 import { 
   Upload, FileSpreadsheet, CheckCircle2, AlertOctagon, HelpCircle, ShieldAlert, 
   Filter, Search, Download, Printer, Eye, Check, X, RefreshCw, MessageSquare, 
-  UserCheck, ShieldCheck, Flag, AlertTriangle, Calendar, Grid, List, Edit3, Save, Layers
+  UserCheck, ShieldCheck, Flag, AlertTriangle, Calendar, Grid, List, Edit3, Save, Layers,
+  Trash2, CheckCheck
 } from 'lucide-react';
 import { Card, Button, Input, Modal } from '../ui';
 import { 
@@ -24,7 +25,24 @@ import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 
 export function FreshAttendanceAudit() {
-  const { employees, processedData, settings, shiftAssignments, addForceAttendance, addAuditLog } = useAppStore();
+  const { 
+    employees, 
+    processedData, 
+    settings, 
+    shiftAssignments, 
+    addForceAttendance, 
+    addAuditLog,
+    fieldRecords,
+    fieldMusterFileName: fileName,
+    fieldImportType: storeImportType,
+    auditDecisions,
+    setFieldRecords,
+    saveAuditDecision,
+    saveAuditDecisionsBatch,
+    clearFieldMusterData,
+    auditDateRange,
+    setAuditDateRange
+  } = useAppStore();
 
   // Selected Month/Year for matrix parsing context
   const [calendarType, setCalendarType] = useState<'BS' | 'AD'>('BS');
@@ -35,22 +53,21 @@ export function FreshAttendanceAudit() {
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   });
 
-  // State for Field Attendance records uploaded
-  const [fieldRecords, setFieldRecords] = useState<FieldAttendanceRecord[]>([]);
-  const [fileName, setFileName] = useState<string>('');
-  const [importType, setImportType] = useState<'matrix' | 'flat' | 'sample'>('matrix');
+  const [importType, setImportType] = useState<'matrix' | 'flat' | 'sample'>(storeImportType || 'matrix');
 
   // View mode toggle: Matrix Grid vs Flat List
   const [viewMode, setViewMode] = useState<'matrix' | 'list'>('matrix');
 
-  // State for HR Audit Decisions map: recordId -> { decision: 'Accepted' | 'Rejected', remarks: string, auditedBy: string, auditedAt: string, overrideStatus?: string }
-  const [auditDecisions, setAuditDecisions] = useState<Record<string, {
-    decision: 'Accepted' | 'Rejected';
-    remarks: string;
-    auditedBy: string;
-    auditedAt: string;
-    overrideStatus?: string;
-  }>>({});
+  // Date Range state for filtering
+  const [startDate, setStartDate] = useState<string>(auditDateRange?.startDate || '');
+  const [endDate, setEndDate] = useState<string>(auditDateRange?.endDate || '');
+
+  // Keep date range updated in store
+  const handleDateRangeChange = (start: string, end: string) => {
+    setStartDate(start);
+    setEndDate(end);
+    setAuditDateRange({ startDate: start, endDate: end });
+  };
 
   // Filter states
   const [groupFilter, setGroupFilter] = useState<string>('All');
@@ -86,10 +103,11 @@ export function FreshAttendanceAudit() {
     return map;
   }, [processedData]);
 
-  // Fast map for Employees with flexible numeric ID matching
+  // Fast map for Employees
   const employeeMap = useMemo(() => {
     const map = new Map<string, typeof employees[0]>();
     employees.forEach(e => {
+      if (!e || !e.id) return;
       map.set(e.id, e);
       map.set(e.id.toLowerCase(), e);
       const numOnly = e.id.replace(/\D/g, '');
@@ -99,6 +117,24 @@ export function FreshAttendanceAudit() {
     });
     return map;
   }, [employees]);
+
+  // Fast map for Field Records
+  const fieldRecordsMap = useMemo(() => {
+    const map = new Map<string, FieldAttendanceRecord>();
+    fieldRecords.forEach(fr => {
+      map.set(`${fr.employeeId}_${fr.date}`, fr);
+    });
+    return map;
+  }, [fieldRecords]);
+
+  // Fast map for Shift Assignments
+  const shiftAssignmentsMap = useMemo(() => {
+    const map = new Map<string, typeof shiftAssignments[0]>();
+    (shiftAssignments || []).forEach(a => {
+      map.set(`${a.employeeId}_${a.date}`, a);
+    });
+    return map;
+  }, [shiftAssignments]);
 
   // Helper function to format arbitrary date string/number to YYYY-MM-DD
   const parseHeaderDateToISO = (dhStr: string, year: number, month: number, bsDays: ReturnType<typeof getNepaliMonthDays>): string => {
@@ -152,10 +188,9 @@ export function FreshAttendanceAudit() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setFileName(file.name);
     const reader = new FileReader();
 
-    reader.onload = (evt) => {
+    reader.onload = async (evt) => {
       try {
         const bstr = evt.target?.result;
         const workbook = XLSX.read(bstr, { type: 'binary' });
@@ -225,6 +260,8 @@ export function FreshAttendanceAudit() {
           });
 
           toast.success(`Parsed Matrix Muster: ${parsed.length} records imported across ${dateHeaders.length} date columns!`);
+          await setFieldRecords(parsed, file.name, 'matrix');
+          setImportType('matrix');
         } else {
           // --- FLAT LIST FORMAT PARSING ---
           setImportType('flat');
@@ -261,9 +298,8 @@ export function FreshAttendanceAudit() {
           });
 
           toast.success(`Successfully imported ${parsed.length} Field Attendance records from ${file.name}`);
+          await setFieldRecords(parsed, file.name, 'flat');
         }
-
-        setFieldRecords(parsed);
       } catch (err) {
         toast.error('Failed to parse uploaded Excel/CSV file.');
       }
@@ -360,14 +396,26 @@ export function FreshAttendanceAudit() {
 
     // Build unique list of employee-date keys
     const allKeysSet = new Set<string>();
-    fieldRecords.forEach(fr => allKeysSet.add(`${fr.employeeId}_${fr.date}`));
+    fieldRecords.forEach(fr => {
+      if (!startDate || fr.date >= startDate) {
+        if (!endDate || fr.date <= endDate) {
+          allKeysSet.add(`${fr.employeeId}_${fr.date}`);
+        }
+      }
+    });
 
     // Also include Bio records to cross-check vice-versa (Bio exists, but Muster missing)
-    processedData.forEach(p => allKeysSet.add(`${p.employeeId}_${p.date}`));
+    processedData.forEach(p => {
+      if (!startDate || p.date >= startDate) {
+        if (!endDate || p.date <= endDate) {
+          allKeysSet.add(`${p.employeeId}_${p.date}`);
+        }
+      }
+    });
 
     allKeysSet.forEach(key => {
       const [empId, date] = key.split('_');
-      const fieldRec = fieldRecords.find(f => f.employeeId === empId && f.date === date);
+      const fieldRec = fieldRecordsMap.get(key) || null;
       const emp = employeeMap.get(empId) || employeeMap.get(empId.toLowerCase());
       const canonicalEmpId = emp ? emp.id : empId;
       const bioRec = processedDataMap.get(key) || processedDataMap.get(`${canonicalEmpId}_${date}`) || null;
@@ -375,7 +423,7 @@ export function FreshAttendanceAudit() {
       const bsDate = formatADToBS(date) || date;
       const isHoliday = settings.holidays?.some(h => h.date === date) || false;
       const dayName = new Date(date).toLocaleDateString('en-US', { weekday: 'long' });
-      const assignment = shiftAssignments?.find(a => a.employeeId === canonicalEmpId && a.date === date);
+      const assignment = shiftAssignmentsMap.get(`${canonicalEmpId}_${date}`);
       const assignedShift = settings.shifts?.find(s => s.id === (assignment?.shiftId || emp?.shiftId));
       const effectiveWeeklyOff = (assignedShift as any)?.weeklyOff || emp?.weeklyOff;
       const isWeeklyOff = bioRec?.status === 'Weekly Off' || bioRec?.status === 'PWO' || (
@@ -482,6 +530,39 @@ export function FreshAttendanceAudit() {
 
       const prevDecision = auditDecisions[key];
 
+      const formatIsoToTimeStr = (iso: string) => {
+        if (!iso) return '';
+        try {
+          const d = new Date(iso);
+          if (isNaN(d.getTime())) return iso;
+          return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+        } catch {
+          return iso;
+        }
+      };
+
+      const rawLogsList = bioRec?.rawLogs && bioRec.rawLogs.length > 0
+        ? bioRec.rawLogs
+        : (bioRec?.logs && bioRec.logs.length > 0 ? bioRec.logs : []);
+
+      const rawPunchesStr = rawLogsList.length > 0
+        ? rawLogsList.map(formatIsoToTimeStr).join(', ')
+        : ([bioRec?.firstPunch, bioRec?.lastPunch].filter(Boolean) as string[]).map(formatIsoToTimeStr).join(', ');
+
+      const compiledLogsList = bioRec?.logs && bioRec.logs.length > 0
+        ? bioRec.logs
+        : ([bioRec?.firstPunch, bioRec?.lastPunch].filter(Boolean) as string[]);
+
+      const compiledPunchesStr = compiledLogsList.length > 0
+        ? compiledLogsList.map(formatIsoToTimeStr).join(' -> ')
+        : '-';
+
+      const woDayName = emp?.weeklyOff || (assignedShift as any)?.weeklyOff || 'Sunday';
+      const targetHours = emp?.targetWorkingHours || (assignedShift as any)?.expectedHours || bioRec?.expectedHours || 9;
+      const shiftTiming = assignedShift 
+        ? `${assignedShift.name} (${assignedShift.startTime} - ${assignedShift.endTime})` 
+        : (bioRec?.shiftName ? `${bioRec.shiftName} (09:00 - 18:00)` : 'General Shift (09:00 - 18:00)');
+
       comparisons.push({
         id: key,
         employeeId: empId,
@@ -490,7 +571,16 @@ export function FreshAttendanceAudit() {
         designation: emp?.designation || '-',
         date,
         bsDate,
+        dayName,
+        weeklyOffDay: woDayName,
         shiftName: assignedShift?.name || 'General Shift',
+        shiftDetails: shiftTiming,
+        expectedHours: targetHours,
+        workingHours: bioRec?.workingHours || 0,
+        lateMinutes: bioRec?.lateMinutes || 0,
+        earlyMinutes: bioRec?.earlyMinutes || 0,
+        rawPunchesStr: rawPunchesStr || '-',
+        compiledPunchesStr: compiledPunchesStr || '-',
         fieldStatus: prevDecision?.overrideStatus || fieldRec?.fieldStatus || 'N/A',
         fieldInTime: fieldRec?.inTime,
         fieldOutTime: fieldRec?.outTime,
@@ -512,7 +602,17 @@ export function FreshAttendanceAudit() {
     });
 
     return comparisons;
-  }, [fieldRecords, processedData, processedDataMap, employeeMap, settings.holidays, auditDecisions]);
+  }, [fieldRecords, fieldRecordsMap, processedData, processedDataMap, employeeMap, shiftAssignmentsMap, settings.holidays, auditDecisions, startDate, endDate]);
+
+  // Fast map for audit comparisons
+  const auditComparisonsMap = useMemo(() => {
+    const map = new Map<string, AuditRecordComparison>();
+    auditComparisons.forEach(c => {
+      map.set(c.id, c);
+      map.set(`${c.employeeId}_${c.date}`, c);
+    });
+    return map;
+  }, [auditComparisons]);
 
   // KPI Metrics calculation
   const kpiMetrics = useMemo(() => {
@@ -610,17 +710,14 @@ export function FreshAttendanceAudit() {
     const key = rec.id;
 
     try {
-      // 1. Update audit decision state
-      setAuditDecisions(prev => ({
-        ...prev,
-        [key]: {
-          decision: 'Accepted',
-          remarks: editModal.remarks,
-          auditedBy: editModal.auditedBy,
-          auditedAt: new Date().toISOString(),
-          overrideStatus: editModal.customStatus
-        }
-      }));
+      // 1. Update audit decision state in store & local SQLite database
+      await saveAuditDecision(key, {
+        decision: 'Accepted',
+        remarks: editModal.remarks,
+        auditedBy: editModal.auditedBy,
+        auditedAt: new Date().toISOString(),
+        overrideStatus: editModal.customStatus
+      });
 
       // 2. Automatically save into System Attendance field in Store
       await addForceAttendance({
@@ -686,25 +783,71 @@ export function FreshAttendanceAudit() {
       'Emp ID': rec.employeeId,
       'Employee Name': rec.employeeName,
       'Department': rec.department,
+      'Designation': rec.designation || '-',
       'Date (A.D.)': rec.date,
       'Date (B.S.)': rec.bsDate,
+      'Day Name': rec.dayName || new Date(rec.date).toLocaleDateString('en-US', { weekday: 'long' }),
+      'Weekly Off': rec.weeklyOffDay || 'Sunday',
+      'Shift': rec.shiftDetails || rec.shiftName || 'General Shift',
       'Muster Status': rec.fieldStatus || 'N/A',
       'Bio Status': rec.bioStatus || 'N/A',
+      'Actual Bio Punch (Raw Logs)': rec.rawPunchesStr || '-',
       'Bio In': rec.bioInTime || '-',
       'Bio Out': rec.bioOutTime || '-',
+      'TWH (Shift Total Hours)': rec.expectedHours !== undefined ? Number(rec.expectedHours).toFixed(2) : '9.00',
+      'Working Hours': rec.workingHours !== undefined ? Number(rec.workingHours).toFixed(2) : '0.00',
+      'Late (Mins)': rec.lateMinutes || 0,
+      'Early (Mins)': rec.earlyMinutes || 0,
       'Audit Classification': rec.auditResult,
       'Audit Group': rec.auditGroup,
       'Issue Reason': rec.issueReason,
       'HR Decision': rec.decision,
       'HR Remarks': rec.hrRemarks || '-',
-      'Audited By': rec.auditedBy || '-'
+      'Audited By': rec.auditedBy || '-',
+      'Audited At': rec.auditedAt ? new Date(rec.auditedAt).toLocaleString() : '-'
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(rows);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Attendance Audit');
-    XLSX.writeFile(workbook, `Fresh_Attendance_Audit_${new Date().toISOString().slice(0, 10)}.xlsx`);
-    toast.success('Exported Audit Report Excel!');
+    XLSX.writeFile(workbook, `Fresh_Attendance_Audit_Report_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    toast.success('Exported Comprehensive Audit Report Excel!');
+  };
+
+  // Bulk accept all valid matches and interconnect with Attendance Reconciliation
+  const handleBulkAcceptValidMatches = async () => {
+    const validPending = auditComparisons.filter(c => c.auditGroup === 'VALID' && c.decision === 'Pending');
+    if (validPending.length === 0) {
+      toast.info('No pending valid matches to accept.');
+      return;
+    }
+
+    const newDecisions: Record<string, any> = {};
+    const nowIso = new Date().toISOString();
+
+    for (const c of validPending) {
+      newDecisions[c.id] = {
+        decision: 'Accepted',
+        remarks: 'Bulk Approved Valid Match',
+        auditedBy: 'HR Manager',
+        auditedAt: nowIso,
+        overrideStatus: c.fieldStatus || 'P'
+      };
+
+      // Interconnect directly into System Attendance Reconciliation Force Logs
+      await addForceAttendance({
+        employeeId: c.employeeId,
+        date: c.date,
+        inTime: c.bioInTime || '09:00',
+        outTime: c.bioOutTime || '18:00',
+        reason: 'Bulk HR Muster Audit Approval',
+        approvedBy: 'HR Manager',
+        remarks: 'Bulk Approved Valid Match'
+      }).catch(() => {});
+    }
+
+    await saveAuditDecisionsBatch(newDecisions);
+    toast.success(`Bulk approved & reconciled ${validPending.length} valid attendance records!`);
   };
 
   return (
@@ -885,6 +1028,114 @@ export function FreshAttendanceAudit() {
         </div>
       </Card>
 
+      {/* Date Range Filter & Actions Bar */}
+      <Card className="p-4 bg-slate-900 text-white border border-slate-800 shadow-sm">
+        <div className="flex flex-col xl:flex-row items-start xl:items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <Calendar size={20} className="text-indigo-400 shrink-0" />
+            <div>
+              <p className="text-xs font-bold text-slate-100 flex items-center gap-2">
+                Date Range Filter 
+                {(startDate || endDate) && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/30 text-indigo-300 font-mono border border-indigo-400/30">
+                    Active: {startDate || 'Beginning'} to {endDate || 'Latest'}
+                  </span>
+                )}
+              </p>
+              <p className="text-[10px] text-slate-400">Filter Muster records, audit comparisons & matrix grid by date range</p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 w-full xl:w-auto">
+            <div className="flex items-center gap-1.5 bg-slate-800/90 p-1.5 rounded-xl border border-slate-700 text-xs">
+              <span className="text-[11px] text-slate-400 font-bold px-1">From:</span>
+              <input
+                type="date"
+                value={startDate}
+                onChange={(e) => handleDateRangeChange(e.target.value, endDate)}
+                className="bg-slate-900 text-white px-2 py-1 rounded-lg border border-slate-700 font-mono text-xs outline-none focus:border-indigo-500"
+              />
+              <span className="text-[11px] text-slate-400 font-bold px-1">To:</span>
+              <input
+                type="date"
+                value={endDate}
+                onChange={(e) => handleDateRangeChange(startDate, e.target.value)}
+                className="bg-slate-900 text-white px-2 py-1 rounded-lg border border-slate-700 font-mono text-xs outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            {/* Quick Preset Buttons */}
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => {
+                  const todayStr = new Date().toISOString().slice(0, 10);
+                  handleDateRangeChange(todayStr, todayStr);
+                  toast.success(`Filter set to Today (${todayStr})`);
+                }}
+                className="px-2.5 py-1.5 text-[11px] font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 transition"
+              >
+                Today
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const todayObj = new Date();
+                  const weekAgo = new Date();
+                  weekAgo.setDate(todayObj.getDate() - 7);
+                  const startStr = weekAgo.toISOString().slice(0, 10);
+                  const endStr = todayObj.toISOString().slice(0, 10);
+                  handleDateRangeChange(startStr, endStr);
+                  toast.success(`Filter set to Last 7 Days`);
+                }}
+                className="px-2.5 py-1.5 text-[11px] font-bold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 transition"
+              >
+                Last 7 Days
+              </button>
+              {(startDate || endDate) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleDateRangeChange('', '');
+                    toast.info('Cleared date range filter');
+                  }}
+                  className="px-2.5 py-1.5 text-[11px] font-bold text-rose-400 hover:text-rose-300 bg-rose-950/60 hover:bg-rose-900/60 rounded-xl border border-rose-800/80 transition flex items-center gap-1"
+                >
+                  <X size={12} /> Clear Dates
+                </button>
+              )}
+            </div>
+
+            {/* Bulk Actions */}
+            <div className="flex items-center gap-1.5 pl-2 border-l border-slate-800">
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleBulkAcceptValidMatches}
+                className="h-8 text-[11px] font-bold bg-emerald-600 hover:bg-emerald-500 text-white border-none gap-1"
+              >
+                <CheckCheck size={14} /> Bulk Accept Valid
+              </Button>
+
+              {fieldRecords.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    if (window.confirm('Are you sure you want to clear all uploaded Field Muster data? This will clear local database records and reset the audit grid.')) {
+                      clearFieldMusterData();
+                    }
+                  }}
+                  className="h-8 text-[11px] font-bold text-rose-400 border-rose-800/80 hover:bg-rose-950/80 gap-1"
+                >
+                  <Trash2 size={13} /> Clear Muster
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </Card>
+
       {/* KPI Audit Metrics */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
         <div 
@@ -1050,7 +1301,7 @@ export function FreshAttendanceAudit() {
 
                     {matrixDates.map(d => {
                       const key = `${emp.id}_${d.dateStr}`;
-                      const comp = auditComparisons.find(c => c.id === key);
+                      const comp = auditComparisonsMap.get(key);
 
                       if (!comp) {
                         return (
@@ -1242,7 +1493,7 @@ export function FreshAttendanceAudit() {
                 <span className="font-mono text-indigo-600 dark:text-indigo-400">{editModal.record.date} (BS: {editModal.record.bsDate})</span>
               </div>
               
-              <div className="grid grid-cols-2 gap-2 text-[11px] pt-1">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2 text-[11px] pt-1">
                 <div className="bg-white dark:bg-slate-900 p-2 rounded-xl border border-slate-100 dark:border-slate-800">
                   <span className="text-slate-400 font-semibold block">Uploaded Muster Status:</span>
                   <span className="font-bold text-slate-800 dark:text-slate-200 font-mono text-sm">{editModal.record.fieldStatus || 'N/A'}</span>
@@ -1252,7 +1503,30 @@ export function FreshAttendanceAudit() {
                   <span className="font-bold text-indigo-600 dark:text-indigo-400 font-mono text-sm">{editModal.record.bioStatus || 'No Log'}</span>
                   <span className="text-[10px] text-slate-400 block mt-0.5 font-mono">In: {editModal.record.bioInTime || '--'} | Out: {editModal.record.bioOutTime || '--'}</span>
                 </div>
+                <div className="bg-white dark:bg-slate-900 p-2 rounded-xl border border-slate-100 dark:border-slate-800">
+                  <span className="text-slate-400 font-semibold block">Day / Weekly Off / Shift:</span>
+                  <span className="font-bold text-slate-800 dark:text-slate-200 font-mono text-xs block">{editModal.record.dayName || 'N/A'} • {editModal.record.shiftName}</span>
+                  <span className="text-[10px] text-slate-400 font-mono">Weekly Off: {editModal.record.isWeeklyOff ? 'Yes' : 'No'}</span>
+                </div>
+                <div className="bg-white dark:bg-slate-900 p-2 rounded-xl border border-slate-100 dark:border-slate-800">
+                  <span className="text-slate-400 font-semibold block">Hours & Punctuality:</span>
+                  <span className="font-bold text-emerald-600 dark:text-emerald-400 font-mono text-xs block">Work: {editModal.record.workingHours?.toFixed(2) || '0.00'}h / TWH: {editModal.record.expectedHours?.toFixed(2) || '9.00'}h</span>
+                  <span className="text-[10px] text-slate-400 font-mono">Late: {editModal.record.lateMinutes || 0}m | Early: {editModal.record.earlyMinutes || 0}m</span>
+                </div>
               </div>
+
+              {editModal.record.rawPunchesStr && editModal.record.rawPunchesStr !== '-' && (
+                <div className="bg-white dark:bg-slate-900 p-2.5 rounded-xl border border-slate-100 dark:border-slate-800 text-[11px] font-mono mt-1 space-y-1">
+                  <div className="flex items-start justify-between">
+                    <span className="text-slate-400 font-semibold">Actual Raw Bio Punches:</span>
+                    <span className="text-slate-700 dark:text-slate-300 font-mono break-all text-[11px]">{editModal.record.rawPunchesStr}</span>
+                  </div>
+                  <div className="flex items-start justify-between pt-1 border-t border-slate-100 dark:border-slate-800">
+                    <span className="text-indigo-600 dark:text-indigo-400 font-semibold">Compiled Bio Timing (30m Duplicate Filter):</span>
+                    <span className="text-slate-800 dark:text-slate-200 font-mono break-all text-[11px]">{editModal.record.compiledPunchesStr}</span>
+                  </div>
+                </div>
+              )}
 
               <div className="p-2 bg-amber-50 dark:bg-amber-950/50 rounded-xl border border-amber-200/60 dark:border-amber-900/50 text-amber-800 dark:text-amber-200 font-medium text-[11px] flex items-start gap-2 mt-2">
                 <AlertTriangle size={14} className="shrink-0 mt-0.5 text-amber-600" />

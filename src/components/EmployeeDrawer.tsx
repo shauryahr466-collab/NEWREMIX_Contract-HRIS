@@ -18,13 +18,14 @@ interface EmployeeDrawerProps {
 }
 
 export function EmployeeDrawer({ employee, isOpen, onClose }: EmployeeDrawerProps) {
-  const { processedData, overtimeRecords, sblRecords, settings } = useAppStore();
+  const { processedData, overtimeRecords, sblRecords, settings, movements } = useAppStore();
 
   if (!employee) return null;
 
   const attendance = processedData.filter(d => d.employeeId === employee.id);
   const overtime = overtimeRecords.filter(r => r.employeeId === employee.id);
   const leaves = sblRecords.filter(r => r.employeeId === employee.id);
+  const empMovements = movements.filter(m => m.employeeId === employee.id);
   
   const stats = {
     avgWork: attendance.length ? (attendance.reduce((acc, curr) => acc + curr.workingHours, 0) / attendance.length).toFixed(1) : 0,
@@ -125,6 +126,65 @@ export function EmployeeDrawer({ employee, isOpen, onClose }: EmployeeDrawerProp
                   <InfoItem icon={Phone} label="Contact Number" value={employee.phone || 'N/A'} />
                   <InfoItem icon={Fingerprint} label="Aadhar/ID" value={employee.aadharNumber || 'N/A'} />
                   <InfoItem icon={FileText} label="Account Type" value="Contractual" />
+                </div>
+              </section>
+
+              {/* Movement History Timeline */}
+              <section className="p-5 bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3">
+                  <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-widest flex items-center gap-2">
+                    <TrendingUp className="w-4 h-4 text-emerald-500" />
+                    Movement & Career History
+                  </h3>
+                  <span className="text-xs font-bold text-slate-400">
+                    {empMovements.length > 0 ? `${empMovements.length} Record(s)` : 'Initial Joiner'}
+                  </span>
+                </div>
+
+                <div className="space-y-3">
+                  {empMovements.length > 0 ? (
+                    empMovements.map(m => (
+                      <div key={m.id} className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800 flex items-start justify-between gap-3 text-xs">
+                        <div>
+                          <div className="flex items-center gap-2 font-bold text-slate-900 dark:text-white">
+                            <span className="px-2 py-0.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 rounded text-[10px] uppercase">
+                              {m.movementType}
+                            </span>
+                            <span>{m.effectiveDate}</span>
+                          </div>
+                          <p className="text-slate-500 mt-1">
+                            {m.previousDepartment || m.previousDesignation ? `${m.previousDepartment || ''} (${m.previousDesignation || ''}) → ` : ''}
+                            <strong className="text-slate-800 dark:text-slate-200">{m.newDepartment || employee.department} ({m.newDesignation || employee.designation})</strong>
+                          </p>
+                          {m.reason && <p className="text-[11px] text-slate-400 mt-0.5 italic">Reason: {m.reason}</p>}
+                        </div>
+                        {m.newSalary && (
+                          <div className="text-right shrink-0">
+                            <p className="text-[10px] text-slate-400 uppercase">New Salary</p>
+                            <p className="font-bold text-emerald-600">NPR {m.newSalary.toLocaleString()}</p>
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800 flex items-start justify-between gap-3 text-xs">
+                      <div>
+                        <div className="flex items-center gap-2 font-bold text-slate-900 dark:text-white">
+                          <span className="px-2 py-0.5 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 rounded text-[10px] uppercase">
+                            New Joiner
+                          </span>
+                          <span>{employee.joiningDate || 'System Start'}</span>
+                        </div>
+                        <p className="text-slate-500 mt-1">
+                          Joined as <strong className="text-slate-800 dark:text-slate-200">{employee.designation || 'Staff'}</strong> in <strong className="text-slate-800 dark:text-slate-200">{employee.department}</strong>
+                        </p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className="text-[10px] text-slate-400 uppercase">Status</p>
+                        <p className="font-bold text-emerald-600">{employee.status || 'Active'}</p>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </section>
 

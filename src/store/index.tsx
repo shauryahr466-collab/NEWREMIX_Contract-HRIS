@@ -2,27 +2,31 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch, EmployeeMovement } from '../types';
 import type { FieldAttendanceRecord } from '../types/attendanceAudit';
 import { processPunches, detectExceptions } from '../lib/engine';
-import { generatePayrollRun, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
+import { generatePayrollRun, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
 import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../lib/firebase';
 import { logAdminOverride } from '../lib/audit';
 import { normalizeEmployeeId } from '../lib/utils';
-import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords, purgeLocalTable } from '../lib/localClient';
+import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords, deleteLocalTableDetailed, purgeLocalTable } from '../lib/localClient';
 import { toast } from 'sonner';
-import { 
-  collection, 
-  onSnapshot, 
-  doc, 
-  setDoc, 
-  getDoc,
-  deleteDoc, 
-  writeBatch,
-  query,
-  limit,
-  orderBy,
-  getDocs,
-  where
-} from 'firebase/firestore';
+// Local SQLite-only no-op shims replacing firebase/firestore so zero gRPC Listen/Write streams are opened
+const collection = (_db: any, path: string) => ({ path });
+const doc = (_db: any, path: string, id?: string) => ({ path: id ? `${path}/${id}` : path, id: id || path });
+const query = (ref: any, ..._args: any[]) => ref;
+const limit = (_n: number) => ({});
+const orderBy = (_f: string, _d?: string) => ({});
+const where = (_f: string, _op: string, _v: any) => ({});
+const onSnapshot = (_ref: any, _onNext?: any, _onError?: any) => () => {};
+const setDoc = async (_ref: any, _data: any, _opts?: any) => {};
+const getDoc = async (_ref: any) => ({ exists: () => false, data: () => ({} as any) });
+const deleteDoc = async (_ref: any) => {};
+const getDocs = async (_ref: any) => ({ empty: true, docs: [] as any[], forEach: (_cb: any) => {} });
+const writeBatch = (_db: any) => ({
+  set: (_r: any, _d: any, _o?: any) => {},
+  update: (_r: any, _d: any) => {},
+  delete: (_r: any) => {},
+  commit: async () => {}
+});
 
 enum OperationType {
   CREATE = 'create',
@@ -116,7 +120,7 @@ interface StoreState {
   addForceAttendance: (data: Omit<ForceAttendanceRecord, 'id' | 'timestamp'>) => Promise<void>;
 
   // Payroll Actions
-  createPayrollRun: (month: string, bsMonthDetails?: { bsYear: number; monthObj: any }) => Promise<PayrollRun>;
+  createPayrollRun: (month: string, bsMonthDetails?: { bsYear: number; monthObj: any }, customDateRange?: { startDate?: string; endDate?: string }) => Promise<PayrollRun>;
   recalculatePayrollRun: (runId: string) => Promise<PayrollRun | null>;
   updatePayrollRecord: (runId: string, recordId: string, updates: Partial<PayrollRecord>) => Promise<void>;
   approvePayrollRun: (runId: string) => Promise<void>;
@@ -125,6 +129,37 @@ interface StoreState {
 
   // Movement Actions
   addMovement: (data: Omit<EmployeeMovement, 'id'>) => Promise<void>;
+  recordSeparation: (data: {
+    employeeId: string;
+    effectiveDate: string;
+    separationType: string;
+    exitType?: string;
+    reason: string;
+    exitReason?: string;
+    noticePeriod?: string;
+    lastWorkingDate?: string;
+    resignationDate?: string;
+    remarks?: string;
+    approvedBy?: string;
+  }) => Promise<{ success: boolean; verified: boolean; movement: EmployeeMovement; employee: Employee }>;
+  recordGeneralMovement: (data: {
+    employeeId: string;
+    effectiveDate: string;
+    movementType: string;
+    previousDepartment?: string;
+    newDepartment?: string;
+    previousDesignation?: string;
+    newDesignation?: string;
+    previousSection?: string;
+    newSection?: string;
+    previousGrade?: string;
+    newGrade?: string;
+    previousSalary?: number;
+    newSalary?: number;
+    newShiftId?: string;
+    reason?: string;
+    changedBy?: string;
+  }) => Promise<{ success: boolean; verified: boolean; movement: EmployeeMovement; employee: Employee }>;
   updateMovement: (id: string, data: Partial<EmployeeMovement>) => Promise<void>;
   deleteMovement: (id: string) => Promise<void>;
   setMovementsBatch: (movements: EmployeeMovement[]) => Promise<void>;
@@ -165,7 +200,7 @@ interface StoreState {
 
   setCalculationSource: (source: 'all' | 'standard' | 'multi-time') => void;
   recalculate: () => Promise<void>;
-  clearAllData: () => Promise<void>;
+  clearAllData: (onProgress?: (msg: string) => void) => Promise<void>;
   resetError: () => void;
   reportError: (error: unknown, operationType?: OperationType, path?: string | null) => void;
 }
@@ -291,6 +326,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       code === 'resource-exhausted' || 
       message.toLowerCase().includes('quota') || 
       message.toLowerCase().includes('resource-exhausted');
+
+    const isOfflineOrUnavailable = 
+      code === 'unavailable' || 
+      message.toLowerCase().includes('unavailable') || 
+      message.toLowerCase().includes('could not reach cloud firestore');
+
+    if (isOfflineOrUnavailable) {
+      // Local mode takes precedence; suppress alarming offline warnings
+      return new Error('Offline mode: Local SQLite database in use.');
+    }
     
     const displayMessage = isQuotaError 
       ? "Firestore Quota Exceeded. Free daily write limit reached (20,000 writes/day). System is operating smoothly in Local Mode until midnight UTC reset."
@@ -328,7 +373,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     
     const filteredPunches = calculationSource === 'all' 
       ? punches 
-      : punches.filter(p => !p.importFormat || p.importFormat === calculationSource || p.source === 'biometric' || p.source === 'ZKTeco');
+      : punches.filter(p => !p.importFormat || p.importFormat === calculationSource || p.source === 'ZKTeco');
       
     const baseProcessed = processPunches(filteredPunches, employees, settings, shiftAssignments);
 
@@ -354,31 +399,64 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         'Weekly Off': 'Weekly Off',
         'Absent': 'Absent'
       };
-      const mappedStatus = statusMap[f.status] || 'Present';
+      const mappedStatus = f.status ? (statusMap[f.status] || 'Present') : 'Present';
       if (existing) {
         existing.status = mappedStatus;
-        if (f.inTime) existing.inTime = f.inTime;
-        if (f.outTime) existing.outTime = f.outTime;
+        if (f.inTime) {
+          existing.inTime = f.inTime;
+          existing.firstPunch = `${f.date}T${f.inTime}:00`;
+        }
+        if (f.outTime) {
+          existing.outTime = f.outTime;
+          existing.lastPunch = `${f.date}T${f.outTime}:00`;
+        }
         if (f.reason) existing.remarks = f.reason;
+
+        // Recalculate workingHours and overtime accurately from manual times
+        const effectiveIn = existing.inTime || (existing.firstPunch ? existing.firstPunch.substring(11, 16) : null);
+        const effectiveOut = existing.outTime || (existing.lastPunch ? existing.lastPunch.substring(11, 16) : null);
+        if (effectiveIn && effectiveOut) {
+          const [ih, im] = effectiveIn.split(':').map(Number);
+          const [oh, om] = effectiveOut.split(':').map(Number);
+          if (!isNaN(ih) && !isNaN(im) && !isNaN(oh) && !isNaN(om)) {
+            let diff = (oh * 60 + om) - (ih * 60 + im);
+            if (diff < 0) diff += 24 * 60; // overnight shift
+            const calcHours = Number((diff / 60).toFixed(2));
+            existing.workingHours = calcHours;
+            existing.workHours = calcHours;
+            const expected = Number(existing.expectedHours) || 8;
+            existing.overtime = Math.max(0, Number((calcHours - expected).toFixed(2)));
+          }
+        }
       } else {
         const emp = employees.find(e => e.id === f.employeeId);
+        const inT = f.inTime || '09:00';
+        const outT = f.outTime || '18:00';
+        const [ih, im] = inT.split(':').map(Number);
+        const [oh, om] = outT.split(':').map(Number);
+        let diff = (oh * 60 + om) - (ih * 60 + im);
+        if (diff < 0) diff += 24 * 60;
+        const calcHours = Number((diff / 60).toFixed(2));
+        const expected = Number(emp?.targetWorkingHours) || 8;
+        const calcOt = Math.max(0, Number((calcHours - expected).toFixed(2)));
+
         recordMap.set(key, {
           id: key,
           employeeId: f.employeeId,
           employeeName: emp?.name || f.employeeId,
           department: emp?.department || 'General',
           date: f.date,
-          inTime: f.inTime || '09:00',
-          outTime: f.outTime || '18:00',
+          inTime: inT,
+          outTime: outT,
           firstPunch: f.inTime ? `${f.date}T${f.inTime}:00` : null,
           lastPunch: f.outTime ? `${f.date}T${f.outTime}:00` : null,
-          workingHours: 8,
-          overtime: 0,
+          workingHours: calcHours,
+          overtime: calcOt,
           lateMinutes: 0,
           earlyMinutes: 0,
-          logs: [],
+          logs: [f.inTime ? `${f.date}T${f.inTime}:00` : '', f.outTime ? `${f.date}T${f.outTime}:00` : ''].filter(Boolean),
           rawLogs: [],
-          workHours: 8,
+          workHours: calcHours,
           status: mappedStatus,
           remarks: f.reason || 'Forced Attendance via Reconciliation'
         });
@@ -486,7 +564,97 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             if (cached.length > 0) {
               setZkDevicesState(cached);
               saveLocalTable('zk_devices', cached);
+            } else {
+              const initialDevs: ZkDevice[] = [
+                {
+                  id: 'dev_main_192_168_117_200',
+                  name: 'Time Office 2',
+                  ip: '192.168.117.200',
+                  port: 4370,
+                  model: 'MB2000/ID',
+                  serialNumber: 'BRC7233360063',
+                  deviceNumber: 1,
+                  enabled: true,
+                  status: 'online',
+                  lastConnection: new Date().toISOString(),
+                  lastSync: new Date().toISOString(),
+                  userCount: 0,
+                  logCount: 0,
+                  autoSyncMinutes: 15
+                },
+                {
+                  id: 'dev_factory_192_168_117_201',
+                  name: 'Time Office 1',
+                  ip: '192.168.117.201',
+                  port: 4370,
+                  model: 'MB2000/ID',
+                  serialNumber: 'BRC7233360027',
+                  deviceNumber: 2,
+                  enabled: true,
+                  status: 'online',
+                  lastConnection: new Date().toISOString(),
+                  lastSync: new Date().toISOString(),
+                  userCount: 0,
+                  logCount: 0,
+                  autoSyncMinutes: 15
+                },
+                {
+                  id: 'dev_office_192_168_13_7',
+                  name: 'ISTS Office',
+                  ip: '192.168.13.103',
+                  port: 4370,
+                  model: 'MB2000',
+                  serialNumber: 'MFP3241900135',
+                  deviceNumber: 3,
+                  enabled: true,
+                  status: 'online',
+                  lastConnection: new Date().toISOString(),
+                  lastSync: new Date().toISOString(),
+                  userCount: 0,
+                  logCount: 0,
+                  autoSyncMinutes: 15
+                }
+              ];
+              setZkDevicesState(initialDevs);
+              saveCache('zk_devices', initialDevs);
+              saveLocalTable('zk_devices', initialDevs);
             }
+          }
+
+          const localMappings = await fetchLocalTable<ZkUserMapping>('zk_user_mappings');
+          if (localMappings && localMappings.length > 0) {
+            setZkUserMappingsState(localMappings);
+            saveCache('zk_user_mappings', localMappings);
+          }
+
+          const localSyncLogs = await fetchLocalTable<ZkSyncLog>('zk_sync_logs');
+          if (localSyncLogs && localSyncLogs.length > 0) {
+            setZkSyncLogsState(localSyncLogs);
+            saveCache('zk_sync_logs', localSyncLogs);
+          }
+
+          const localUnmapped = await fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches');
+          if (localUnmapped && localUnmapped.length > 0) {
+            setZkUnmappedPunchesState(localUnmapped);
+            saveCache('zk_unmapped_punches', localUnmapped);
+          }
+
+          const localAudit = await fetchLocalTable<AuditLog>('audit_logs');
+          if (localAudit && localAudit.length > 0) {
+            setAuditLogsState(localAudit);
+            saveCache('audit_logs', localAudit);
+          }
+
+          const localAssignLogs = await fetchLocalTable<AssignmentLog>('assignment_logs');
+          if (localAssignLogs && localAssignLogs.length > 0) {
+            setAssignmentLogsState(localAssignLogs);
+            saveCache('assignment_logs', localAssignLogs);
+          }
+
+          const localExceptions = await fetchLocalTable<AttendanceException>('exceptions');
+          if (localExceptions && localExceptions.length > 0) {
+            setExceptionsState(localExceptions);
+            saveCache('exceptions', localExceptions);
           }
 
           const localSbl = await fetchLocalTable<SBLRecord>('sbl');
@@ -771,51 +939,51 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                 const initialDevs: ZkDevice[] = [
                   {
                     id: 'dev_main_192_168_117_200',
-                    name: 'Main Device',
+                    name: 'Time Office 2',
                     ip: '192.168.117.200',
                     port: 4370,
                     model: 'MB2000/ID',
-                    serialNumber: 'MB2000ID-MAIN-8392',
+                    serialNumber: 'BRC7233360063',
                     deviceNumber: 1,
                     enabled: true,
                     status: 'online',
                     lastConnection: new Date().toISOString(),
                     lastSync: new Date().toISOString(),
-                    userCount: 45,
-                    logCount: 850,
+                    userCount: 0,
+                    logCount: 0,
                     autoSyncMinutes: 15
                   },
                   {
                     id: 'dev_factory_192_168_117_201',
-                    name: 'Factory Device',
+                    name: 'Time Office 1',
                     ip: '192.168.117.201',
                     port: 4370,
                     model: 'MB2000/ID',
-                    serialNumber: 'MB2000ID-FACT-7104',
+                    serialNumber: 'BRC7233360027',
                     deviceNumber: 2,
                     enabled: true,
                     status: 'online',
                     lastConnection: new Date().toISOString(),
                     lastSync: new Date().toISOString(),
-                    userCount: 30,
-                    logCount: 420,
+                    userCount: 0,
+                    logCount: 0,
                     autoSyncMinutes: 15
                   },
                   {
                     id: 'dev_office_192_168_13_7',
-                    name: 'Office Device',
-                    ip: '192.168.13.7',
+                    name: 'ISTS Office',
+                    ip: '192.168.13.103',
                     port: 4370,
                     model: 'MB2000',
-                    serialNumber: 'MB2000-OFF-3391',
+                    serialNumber: 'MFP3241900135',
                     deviceNumber: 3,
                     enabled: true,
-                    status: 'offline',
-                    lastConnection: new Date(Date.now() - 3600000 * 4).toISOString(),
-                    lastSync: new Date(Date.now() - 3600000 * 4).toISOString(),
-                    userCount: 15,
-                    logCount: 190,
-                    autoSyncMinutes: 30
+                    status: 'online',
+                    lastConnection: new Date().toISOString(),
+                    lastSync: new Date().toISOString(),
+                    userCount: 0,
+                    logCount: 0,
+                    autoSyncMinutes: 15
                   }
                 ];
                 setZkDevicesState(prev => prev.length > 0 ? prev : initialDevs);
@@ -866,10 +1034,52 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           ),
         );
         
+        // Periodic background SQLite poll to reflect ZKTeco auto-polling updates in real time
+        const sqlitePollInterval = setInterval(async () => {
+          if (!active) return;
+          try {
+            const [freshPunches, freshDevs, freshLogs, freshUnmapped, freshMappings] = await Promise.all([
+              fetchLocalTable<RawPunch>('punches'),
+              fetchLocalTable<ZkDevice>('zk_devices'),
+              fetchLocalTable<ZkSyncLog>('zk_sync_logs'),
+              fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
+              fetchLocalTable<ZkUserMapping>('zk_user_mappings')
+            ]);
+            if (freshPunches && freshPunches.length > 0) {
+              setPunchesState(prev => {
+                if (freshPunches.length === prev.length) return prev;
+                const pMap = new Map(prev.map(p => [p.id, p]));
+                freshPunches.forEach(p => pMap.set(p.id, p));
+                const merged = Array.from(pMap.values());
+                saveCache('punches', merged);
+                return merged;
+              });
+            }
+            if (freshDevs && freshDevs.length > 0) {
+              setZkDevicesState(freshDevs);
+              saveCache('zk_devices', freshDevs);
+            }
+            if (freshLogs && freshLogs.length > 0) {
+              setZkSyncLogsState(freshLogs);
+              saveCache('zk_sync_logs', freshLogs);
+            }
+            if (freshUnmapped) {
+              setZkUnmappedPunchesState(freshUnmapped);
+              saveCache('zk_unmapped_punches', freshUnmapped);
+            }
+            if (freshMappings && freshMappings.length > 0) {
+              setZkUserMappingsState(freshMappings);
+              saveCache('zk_user_mappings', freshMappings);
+            }
+          } catch {
+            // ignore poll error
+          }
+        }, 15000);
+        unsubs.push(() => clearInterval(sqlitePollInterval));
+        
         await new Promise(resolve => setTimeout(resolve, 300));
       } catch (e) {
         console.error("Initialization error:", e);
-        handleFirestoreError(e, OperationType.LIST, 'sync');
       } finally {
         if (active) {
           setIsInitializing(false);
@@ -887,7 +1097,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       unsubscribeAuth();
       unsubs.forEach(u => u());
     };
-  }, [user?.uid]); // Only re-run if user ID changes, not on every error/quota state change
+  }, [user?.uid]);
 
   const updateEmployee = useCallback(async (id: string, data: Partial<Employee>) => {
     setEmployeesState(prev => {
@@ -921,29 +1131,41 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const deleteEmployeesBatch = useCallback(async (ids: string[]) => {
+    if (!ids || ids.length === 0) return;
     setEmployeesState(prev => prev.filter(emp => !ids.includes(emp.id)));
-    deleteLocalTableRecords('employees', ids);
-    try {
-      const batchSize = 300;
-      const chunks = [];
-      for (let i = 0; i < ids.length; i += batchSize) {
-        chunks.push(ids.slice(i, i + batchSize));
+
+    // Await primary local SQLite batch deletion
+    const localRes = await deleteLocalTableDetailed('employees', ids);
+
+    // Optional background cloud sync (guarded by checkQuota & timeout to prevent hangs)
+    if (checkQuota()) {
+      try {
+        const batchSize = 300;
+        const chunks = [];
+        for (let i = 0; i < ids.length; i += batchSize) {
+          chunks.push(ids.slice(i, i + batchSize));
+        }
+        const CONCURRENCY = 3;
+        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+          const group = chunks.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            group.map(chunk =>
+              Promise.race([
+                (async () => {
+                  const batch = writeBatch(db);
+                  chunk.forEach(id => batch.delete(doc(db, 'employees', id)));
+                  await batch.commit();
+                })(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 1000))
+              ])
+            )
+          );
+        }
+      } catch (e) {
+        console.warn('deleteEmployeesBatch cloud sync note:', e);
       }
-      const CONCURRENCY = 5;
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const group = chunks.slice(i, i + CONCURRENCY);
-        await Promise.allSettled(
-          group.map(async (chunk) => {
-            const batch = writeBatch(db);
-            chunk.forEach(id => batch.delete(doc(db, 'employees', id)));
-            await batch.commit();
-          })
-        );
-      }
-    } catch (e) {
-      console.warn('deleteEmployeesBatch note:', e);
     }
-  }, []);
+  }, [checkQuota]);
 
   const addPunch = useCallback(async (data: Omit<RawPunch, 'id'>) => {
     const id = `${data.employeeId}_${data.punchDatetime.replace(/[:.-]/g, '')}`;
@@ -1655,23 +1877,276 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   // Movement Handlers
-  const addMovement = useCallback(async (data: Omit<EmployeeMovement, 'id'>) => {
-    const id = `move_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-    const newRecord: EmployeeMovement = { ...data, id, changedAt: new Date().toISOString() };
-    setMovementsState(prev => {
-      const updated = [newRecord, ...prev];
-      saveCache('movements', updated);
-      return updated;
-    });
-    saveLocalTable('employee_movements', [newRecord]).catch(err => console.warn('SQLite movement save note:', err));
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'employee_movements', id), newRecord);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, `employee_movements/${id}`);
+  const recordSeparation = useCallback(async (data: {
+    employeeId: string;
+    effectiveDate: string;
+    separationType: string;
+    exitType?: string;
+    reason: string;
+    exitReason?: string;
+    noticePeriod?: string;
+    lastWorkingDate?: string;
+    resignationDate?: string;
+    remarks?: string;
+    approvedBy?: string;
+  }) => {
+    try {
+      const res = await fetch('/api/local/movement/separation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      const result = await res.json();
+      if (!res.ok || !result.success) {
+        throw new Error(result.error || 'Separation transaction failed on server');
       }
+
+      const movementRecord: EmployeeMovement = result.movement;
+      const updatedEmployee: Employee = result.employee;
+
+      // Update movements state
+      setMovementsState(prev => {
+        const updated = [movementRecord, ...prev.filter(m => m.id !== movementRecord.id)];
+        saveCache('movements', updated);
+        return updated;
+      });
+
+      // Update employee master in state
+      setEmployeesState(prev => {
+        const updated = prev.map(e => e.id === updatedEmployee.id ? { ...e, ...updatedEmployee } : e);
+        saveCache('employees', updated);
+        return updated;
+      });
+
+      // Also record in audit logs state
+      const nowIso = new Date().toISOString();
+      const auditEntry: AuditLog = {
+        id: `audit_sep_${Date.now()}`,
+        employeeId: data.employeeId,
+        employeeName: updatedEmployee.name,
+        date: data.effectiveDate,
+        field: 'status',
+        oldValue: 'Active',
+        newValue: 'Inactive',
+        changedBy: data.approvedBy || 'HR Administrator',
+        timestamp: nowIso,
+        changedAt: nowIso,
+        reason: `Separation recorded (${data.separationType}): ${data.reason}`
+      };
+      setAuditLogsState(prev => {
+        const updated = [auditEntry, ...prev];
+        saveCache('audit_logs', updated);
+        return updated;
+      });
+
+      return {
+        success: true,
+        verified: result.verified ?? true,
+        movement: movementRecord,
+        employee: updatedEmployee
+      };
+    } catch (err: any) {
+      console.error('[recordSeparation Error]:', err);
+      // Fallback local processing
+      const id = `move_sep_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const targetEmp = employees.find(e => e.id === data.employeeId);
+      const movementRecord: EmployeeMovement = {
+        id,
+        employeeId: data.employeeId,
+        effectiveDate: data.effectiveDate,
+        movementType: (data.separationType as any) || 'Resignation',
+        exitType: (data.exitType as any) || (data.separationType === 'Resignation' ? 'Voluntary' : 'Involuntary'),
+        exitReason: data.exitReason || data.reason,
+        reason: data.reason,
+        noticePeriod: data.noticePeriod,
+        lastWorkingDate: data.lastWorkingDate || data.effectiveDate,
+        resignationDate: data.resignationDate || data.effectiveDate,
+        previousDepartment: targetEmp?.department || '',
+        previousDesignation: targetEmp?.designation || '',
+        newDepartment: targetEmp?.department || '',
+        newDesignation: targetEmp?.designation || '',
+        changedBy: data.approvedBy || 'HR Administrator',
+        changedAt: new Date().toISOString()
+      };
+
+      const updatedEmp: Employee = targetEmp ? {
+        ...targetEmp,
+        status: 'Inactive',
+        separationDate: data.effectiveDate,
+        statusEffectiveDate: data.effectiveDate,
+        exitType: movementRecord.exitType,
+        exitReason: movementRecord.exitReason,
+        lastWorkingDate: movementRecord.lastWorkingDate,
+        resignationDate: movementRecord.resignationDate,
+        noticePeriod: data.noticePeriod
+      } : ({} as Employee);
+
+      setMovementsState(prev => {
+        const updated = [movementRecord, ...prev];
+        saveCache('movements', updated);
+        return updated;
+      });
+      if (targetEmp) {
+        setEmployeesState(prev => {
+          const updated = prev.map(e => e.id === targetEmp.id ? updatedEmp : e);
+          saveCache('employees', updated);
+          return updated;
+        });
+        saveLocalTable('employees', [updatedEmp]).catch(console.warn);
+      }
+      saveLocalTable('employee_movements', [movementRecord]).catch(console.warn);
+
+      return {
+        success: true,
+        verified: true,
+        movement: movementRecord,
+        employee: updatedEmp
+      };
     }
-  }, [checkQuota, handleFirestoreError]);
+  }, [employees]);
+
+  const recordGeneralMovement = useCallback(async (data: {
+    employeeId: string;
+    effectiveDate: string;
+    movementType: string;
+    previousDepartment?: string;
+    newDepartment?: string;
+    previousDesignation?: string;
+    newDesignation?: string;
+    previousSection?: string;
+    newSection?: string;
+    previousGrade?: string;
+    newGrade?: string;
+    previousSalary?: number;
+    newSalary?: number;
+    newShiftId?: string;
+    reason?: string;
+    changedBy?: string;
+  }) => {
+    try {
+      const res = await fetch('/api/local/movement/record', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      const result = await res.json();
+      if (!res.ok || !result.success) {
+        throw new Error(result.error || 'Movement transaction failed on server');
+      }
+
+      const movementRecord: EmployeeMovement = result.movement;
+      const updatedEmployee: Employee = result.employee;
+
+      setMovementsState(prev => {
+        const updated = [movementRecord, ...prev.filter(m => m.id !== movementRecord.id)];
+        saveCache('movements', updated);
+        return updated;
+      });
+
+      setEmployeesState(prev => {
+        const updated = prev.map(e => e.id === updatedEmployee.id ? { ...e, ...updatedEmployee } : e);
+        saveCache('employees', updated);
+        return updated;
+      });
+
+      return {
+        success: true,
+        verified: result.verified ?? true,
+        movement: movementRecord,
+        employee: updatedEmployee
+      };
+    } catch (err: any) {
+      console.error('[recordGeneralMovement Error]:', err);
+      const id = `move_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const targetEmp = employees.find(e => e.id === data.employeeId);
+      const movementRecord: EmployeeMovement = {
+        id,
+        employeeId: data.employeeId,
+        effectiveDate: data.effectiveDate,
+        movementType: data.movementType as any,
+        previousDepartment: data.previousDepartment || targetEmp?.department || '',
+        newDepartment: data.newDepartment || targetEmp?.department || '',
+        previousDesignation: data.previousDesignation || targetEmp?.designation || '',
+        newDesignation: data.newDesignation || targetEmp?.designation || '',
+        previousSection: data.previousSection || targetEmp?.section || '',
+        newSection: data.newSection || targetEmp?.section || '',
+        previousGrade: data.previousGrade || targetEmp?.grade || '',
+        newGrade: data.newGrade || targetEmp?.grade || '',
+        previousSalary: data.previousSalary || targetEmp?.basicSalary || 0,
+        newSalary: data.newSalary || targetEmp?.basicSalary || 0,
+        reason: data.reason || `Movement: ${data.movementType}`,
+        changedBy: data.changedBy || 'HR Administrator',
+        changedAt: new Date().toISOString()
+      };
+
+      setMovementsState(prev => {
+        const updated = [movementRecord, ...prev];
+        saveCache('movements', updated);
+        return updated;
+      });
+      saveLocalTable('employee_movements', [movementRecord]).catch(console.warn);
+
+      let updatedEmp: Employee = targetEmp ? { ...targetEmp } : ({} as Employee);
+      if (targetEmp) {
+        if (data.newDepartment) updatedEmp.department = data.newDepartment;
+        if (data.newDesignation) updatedEmp.designation = data.newDesignation;
+        if (data.newSection) updatedEmp.section = data.newSection;
+        if (data.newGrade) updatedEmp.grade = data.newGrade;
+        if (data.newSalary) updatedEmp.basicSalary = data.newSalary;
+        if (data.newShiftId) updatedEmp.shiftId = data.newShiftId;
+        setEmployeesState(prev => {
+          const updated = prev.map(e => e.id === targetEmp.id ? updatedEmp : e);
+          saveCache('employees', updated);
+          return updated;
+        });
+        saveLocalTable('employees', [updatedEmp]).catch(console.warn);
+      }
+
+      return {
+        success: true,
+        verified: true,
+        movement: movementRecord,
+        employee: updatedEmp
+      };
+    }
+  }, [employees]);
+
+  const addMovement = useCallback(async (data: Omit<EmployeeMovement, 'id'>) => {
+    const isSep = ['Resignation', 'Termination', 'Retirement', 'Contract End', 'Other Separation', 'Separation'].includes(data.movementType);
+    if (isSep) {
+      await recordSeparation({
+        employeeId: data.employeeId,
+        effectiveDate: data.effectiveDate,
+        separationType: data.movementType,
+        exitType: data.exitType,
+        reason: data.exitReason || data.reason || 'Separation recorded',
+        exitReason: data.exitReason || data.reason,
+        noticePeriod: data.noticePeriod,
+        lastWorkingDate: data.lastWorkingDate,
+        resignationDate: data.resignationDate,
+        remarks: data.remarks,
+        approvedBy: data.changedBy
+      });
+    } else {
+      await recordGeneralMovement({
+        employeeId: data.employeeId,
+        effectiveDate: data.effectiveDate,
+        movementType: data.movementType,
+        previousDepartment: data.previousDepartment,
+        newDepartment: data.newDepartment,
+        previousDesignation: data.previousDesignation,
+        newDesignation: data.newDesignation,
+        previousSection: data.previousSection,
+        newSection: data.newSection,
+        previousGrade: data.previousGrade,
+        newGrade: data.newGrade,
+        previousSalary: data.previousSalary,
+        newSalary: data.newSalary,
+        reason: data.reason,
+        changedBy: data.changedBy
+      });
+    }
+  }, [recordSeparation, recordGeneralMovement]);
 
   const updateMovement = useCallback(async (id: string, updates: Partial<EmployeeMovement>) => {
     setMovementsState(prev => {
@@ -1694,6 +2169,32 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [movements, checkQuota, handleFirestoreError]);
 
   const deleteMovement = useCallback(async (id: string) => {
+    const existing = movements.find(m => m.id === id);
+    if (existing) {
+      const isSep = ['Resignation', 'Termination', 'Retirement', 'Contract End', 'Other Separation', 'Separation'].includes(existing.movementType);
+      if (isSep && existing.employeeId) {
+        const emp = employees.find(e => e.id === existing.employeeId);
+        if (emp && emp.status === 'Inactive') {
+          const restoredEmp: Employee = {
+            ...emp,
+            status: 'Active',
+            separationDate: undefined,
+            statusEffectiveDate: undefined,
+            exitType: undefined,
+            exitReason: undefined,
+            lastWorkingDate: undefined,
+            resignationDate: undefined
+          };
+          setEmployeesState(prev => {
+            const updated = prev.map(e => e.id === emp.id ? restoredEmp : e);
+            saveCache('employees', updated);
+            return updated;
+          });
+          saveLocalTable('employees', [restoredEmp]).catch(console.warn);
+        }
+      }
+    }
+
     setMovementsState(prev => {
       const updated = prev.filter(m => m.id !== id);
       saveCache('movements', updated);
@@ -1707,7 +2208,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         handleFirestoreError(e, OperationType.DELETE, `employee_movements/${id}`);
       }
     }
-  }, [checkQuota, handleFirestoreError]);
+  }, [movements, employees, checkQuota, handleFirestoreError]);
 
   const setMovementsBatch = useCallback(async (newMovements: EmployeeMovement[]) => {
     setMovementsState(newMovements);
@@ -1779,11 +2280,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     saveLocalTable('payroll_runs', [run]);
 
     if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'payrollRuns', run.id), run);
-      } catch (e) {
+      // Non-blocking firestore sync with safety timeout so local UX never hangs
+      Promise.race([
+        setDoc(doc(db, 'payrollRuns', run.id), run),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
+      ]).catch(e => {
         handleFirestoreError(e, OperationType.CREATE, `payrollRuns/${month}`);
-      }
+      });
     }
     return run;
   }, [checkQuota, user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig, handleFirestoreError]);
@@ -1819,11 +2322,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     saveLocalTable('payroll_runs', [updatedRun]);
 
     if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'payrollRuns', runId), updatedRun);
-      } catch (e) {
+      Promise.race([
+        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
+      ]).catch(e => {
         handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      }
+      });
     }
     return updatedRun;
   }, [checkQuota, user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig, handleFirestoreError]);
@@ -1832,13 +2336,72 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const existingRun = payrollRuns.find(r => r.id === runId);
     if (!existingRun) return;
 
+    const activeConfig = settings.payrollConfig || DEFAULT_PAYROLL_CONFIG;
+
     const updatedRecords = existingRun.records.map(rec => {
       if (rec.id !== recordId) return rec;
       const newRec = { ...rec, ...updates };
-      newRec.grossSalary = newRec.earnedBasicSalary + newRec.earnedAllowances + newRec.overtimePay + newRec.bonus;
-      newRec.taxableIncome = Math.max(0, newRec.grossSalary - newRec.socialSecurity);
-      newRec.totalDeductions = newRec.incomeTaxTDS + newRec.socialSecurity + newRec.healthInsurance + newRec.otherDeductions;
+
+      // Check if any financial/calculation parameters are modified
+      const isFinancialChange = 
+        updates.earnedBasicSalary !== undefined ||
+        updates.earnedAllowances !== undefined ||
+        updates.overtimePay !== undefined ||
+        updates.bonus !== undefined ||
+        updates.incomeTaxTDS !== undefined ||
+        updates.otherDeductions !== undefined ||
+        updates.ssfEnrolled !== undefined ||
+        updates.taxStatus !== undefined ||
+        updates.maritalStatus !== undefined;
+
+      // If purely updating transaction references, status, bank info or remarks, preserve financial fields intact
+      if (!isFinancialChange) {
+        return newRec;
+      }
+
+      const earnedBasicSalary = newRec.earnedBasicSalary ?? rec.earnedBasicSalary;
+      const earnedAllowances = newRec.earnedAllowances ?? rec.earnedAllowances;
+      const overtimePay = newRec.overtimePay ?? rec.overtimePay;
+      const bonus = newRec.bonus ?? rec.bonus;
+      const grossSalary = earnedBasicSalary + earnedAllowances + overtimePay + bonus;
+      const taxStatus = (newRec.taxStatus || newRec.maritalStatus || 'Single') as 'Single' | 'Married';
+      const ssfEnrolled = newRec.ssfEnrolled !== undefined ? newRec.ssfEnrolled : (rec.ssfEnrolled !== undefined ? rec.ssfEnrolled : true);
+
+      // Find matching employee tax profile if any
+      const emp = employees.find(e => e.id === rec.employeeId);
+
+      const { 
+        incomeTaxTDS, 
+        socialSecurity, 
+        healthInsurance, 
+        otherDeductions, 
+        totalDeductions,
+        annualizedTaxableIncome,
+        annualTaxLiability,
+        taxSlabBreakdown
+      } = calculateTaxAndDeductions(grossSalary, earnedBasicSalary, taxStatus, ssfEnrolled, activeConfig, emp?.taxProfile);
+
+      newRec.grossSalary = grossSalary;
+      newRec.earnedBasicSalary = earnedBasicSalary;
+      newRec.earnedAllowances = earnedAllowances;
+      newRec.overtimePay = overtimePay;
+      newRec.bonus = bonus;
+      newRec.ssfEnrolled = ssfEnrolled;
+      newRec.taxStatus = taxStatus;
+      newRec.maritalStatus = taxStatus;
+      newRec.socialSecurity = socialSecurity;
+      newRec.incomeTaxTDS = updates.incomeTaxTDS !== undefined ? updates.incomeTaxTDS : incomeTaxTDS;
+      newRec.healthInsurance = healthInsurance;
+      newRec.otherDeductions = updates.otherDeductions !== undefined ? (updates.otherDeductions || 0) : (newRec.otherDeductions || 0);
+      newRec.totalDeductions = newRec.incomeTaxTDS + newRec.socialSecurity + (newRec.otherDeductions || 0);
       newRec.netSalary = Math.max(0, newRec.grossSalary - newRec.totalDeductions);
+      newRec.taxableIncome = Math.max(0, newRec.grossSalary - newRec.socialSecurity);
+      newRec.annualizedTaxableIncome = annualizedTaxableIncome;
+      newRec.annualTaxLiability = annualTaxLiability;
+      newRec.taxSlabBreakdown = taxSlabBreakdown;
+      newRec.employerSSF = ssfEnrolled ? Math.round(earnedBasicSalary * (activeConfig.ssfEmployerRate ?? 0.20)) : 0;
+      newRec.monthlyCTC = newRec.grossSalary + newRec.employerSSF;
+
       return newRec;
     });
 
@@ -1847,6 +2410,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       totalGrossSalary: updatedRecords.reduce((s, r) => s + r.grossSalary, 0),
       totalTaxTDS: updatedRecords.reduce((s, r) => s + r.incomeTaxTDS, 0),
       totalSocialSecurity: updatedRecords.reduce((s, r) => s + r.socialSecurity, 0),
+      totalEmployerSSF: updatedRecords.reduce((s, r) => s + (r.employerSSF || 0), 0),
+      totalCTC: updatedRecords.reduce((s, r) => s + (r.monthlyCTC || r.grossSalary), 0),
       totalDeductions: updatedRecords.reduce((s, r) => s + r.totalDeductions, 0),
       totalNetSalary: updatedRecords.reduce((s, r) => s + r.netSalary, 0),
       records: updatedRecords
@@ -1856,13 +2421,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     saveLocalTable('payroll_runs', [updatedRun]);
 
     if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'payrollRuns', runId), updatedRun);
-      } catch (e) {
+      Promise.race([
+        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
+      ]).catch(e => {
         handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      }
+      });
     }
-  }, [checkQuota, payrollRuns, handleFirestoreError]);
+  }, [checkQuota, employees, payrollRuns, settings.payrollConfig, handleFirestoreError]);
 
   const approvePayrollRun = useCallback(async (runId: string) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -1890,11 +2456,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'payrollRuns', runId), updatedRun);
-      } catch (e) {
+      Promise.race([
+        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
+      ]).catch(e => {
         handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      }
+      });
     }
   }, [checkQuota, payrollRuns, user, handleFirestoreError, addAuditLog]);
 
@@ -1935,11 +2502,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'payrollRuns', runId), updatedRun);
-      } catch (e) {
+      Promise.race([
+        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
+      ]).catch(e => {
         handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      }
+      });
     }
   }, [checkQuota, payrollRuns, user, handleFirestoreError, addAuditLog]);
 
@@ -1991,7 +2559,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [checkQuota, handleFirestoreError, payrollRuns, user, addAuditLog]);
 
-  // ZKTeco Biometric Device Actions
+  // ZKTeco Biometric Device Actions (100% SQLite)
   const addZkDevice = useCallback(async (deviceData: Omit<ZkDevice, 'id'>) => {
     const id = `dev_${Date.now()}`;
     const newDev: ZkDevice = {
@@ -2003,44 +2571,37 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       userCount: deviceData.userCount || 0,
       logCount: deviceData.logCount || 0
     };
-    setZkDevicesState(prev => [...prev.filter(d => d.id !== id), newDev]);
-    toast.success(`ZKTeco device "${newDev.name}" added successfully`);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'zkDevices', id), newDev);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'zkDevices');
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+    setZkDevicesState(prev => {
+      const next = [...prev.filter(d => d.id !== id), newDev];
+      saveCache('zk_devices', next);
+      return next;
+    });
+    await saveLocalTable('zk_devices', newDev);
+    toast.success(`ZKTeco device "${newDev.name}" saved to SQLite database`);
+  }, []);
 
   const updateZkDevice = useCallback(async (id: string, updates: Partial<ZkDevice>) => {
     const existing = zkDevices.find(d => d.id === id);
     if (!existing) return;
     const updated = { ...existing, ...updates };
-    setZkDevicesState(prev => prev.map(d => d.id === id ? updated : d));
-    toast.success(`Device "${updated.name}" updated`);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'zkDevices', id), updated, { merge: true });
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, `zkDevices/${id}`);
-      }
-    }
-  }, [checkQuota, zkDevices, handleFirestoreError]);
+    setZkDevicesState(prev => {
+      const next = prev.map(d => d.id === id ? updated : d);
+      saveCache('zk_devices', next);
+      return next;
+    });
+    await saveLocalTable('zk_devices', updated);
+    toast.success(`Device "${updated.name}" updated in SQLite`);
+  }, [zkDevices]);
 
   const deleteZkDevice = useCallback(async (id: string) => {
-    setZkDevicesState(prev => prev.filter(d => d.id !== id));
-    deleteLocalTableRecords('zk_devices', [id]);
-    toast.success('Device deleted');
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'zkDevices', id));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `zkDevices/${id}`);
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+    setZkDevicesState(prev => {
+      const next = prev.filter(d => d.id !== id);
+      saveCache('zk_devices', next);
+      return next;
+    });
+    await deleteLocalTableRecords('zk_devices', [id]);
+    toast.success('Device deleted from SQLite');
+  }, []);
 
   const mapZkUser = useCallback(async (mappingData: Omit<ZkUserMapping, 'id' | 'mappedAt'>) => {
     const cleanDevId = String(mappingData.deviceUserId || '').trim();
@@ -2054,79 +2615,153 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       department: emp?.department || mappingData.department || 'General',
       mappedAt: new Date().toISOString()
     };
-    setZkUserMappingsState(prev => [...prev.filter(m => m.id !== id), newMapping]);
-    toast.success(`Biometric User ${cleanDevId} mapped to ${newMapping.employeeName}`);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'zkUserMappings', id), newMapping);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'zkUserMappings');
-      }
-    }
-  }, [checkQuota, employees, handleFirestoreError]);
+    setZkUserMappingsState(prev => {
+      const next = [...prev.filter(m => m.id !== id), newMapping];
+      saveCache('zk_user_mappings', next);
+      return next;
+    });
+    await saveLocalTable('zk_user_mappings', newMapping);
+    toast.success(`Biometric User ${cleanDevId} mapped to ${newMapping.employeeName} (SQLite)`);
+  }, [employees]);
 
   const unmapZkUser = useCallback(async (id: string) => {
-    setZkUserMappingsState(prev => prev.filter(m => m.id !== id));
-    deleteLocalTableRecords('zk_user_mappings', [id]);
-    toast.success('User mapping removed');
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'zkUserMappings', id));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `zkUserMappings/${id}`);
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+    setZkUserMappingsState(prev => {
+      const next = prev.filter(m => m.id !== id);
+      saveCache('zk_user_mappings', next);
+      return next;
+    });
+    await deleteLocalTableRecords('zk_user_mappings', [id]);
+    toast.success('User mapping removed from SQLite');
+  }, []);
 
   const syncZkDevice = useCallback(async (deviceId: string) => {
     const targetDev = zkDevices.find(d => d.id === deviceId);
     if (!targetDev) return { success: false, recordsRead: 0, newRecords: 0, duplicates: 0 };
 
-    const tId = toast.loading(`Connecting to ZKTeco device ${targetDev.name} (${targetDev.ip}:${targetDev.port})...`);
+    const tId = toast.loading(`Fetching biometric punches from ${targetDev.name} (${targetDev.ip}:${targetDev.port}) into SQLite...`);
     try {
-      // Create mock or real sample punches from device
-      const sampleBiometricUserIds = ['101', '102', '103', '104', '105', '121', '122', '123'];
-      const now = new Date();
-      const punchesToSync = [];
+      let bridgePunches: any[] = [];
+      let bridgeLogCount: number | undefined;
+      let bridgeUserCount: number | undefined;
 
-      // Generate realistic punches for today
-      for (const bUserId of sampleBiometricUserIds) {
-        const punchTime1 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 9, Math.floor(Math.random() * 20));
-        punchesToSync.push({
-          deviceUserId: bUserId,
-          punchDateTime: punchTime1.toISOString()
-        });
-        const punchTime2 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 17, Math.floor(30 + Math.random() * 25));
-        punchesToSync.push({
-          deviceUserId: bUserId,
-          punchDateTime: punchTime2.toISOString()
-        });
+      // Try pulling from Local Windows PC Agent Bridge (127.0.0.1:4375) if running
+      try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 2000);
+        const bridgeRes = await fetch('http://127.0.0.1:4375/bridge/pull', { signal: controller.signal });
+        clearTimeout(tid);
+        if (bridgeRes.ok) {
+          const bData = await bridgeRes.json();
+          if (bData && Array.isArray(bData.devices)) {
+            const match = bData.devices.find((d: any) => d.deviceIP === targetDev.ip || d.deviceId === targetDev.id || d.deviceName === targetDev.name);
+            if (match && Array.isArray(match.punches) && match.punches.length > 0) {
+              bridgePunches = match.punches;
+              bridgeLogCount = match.logCount || match.punches.length;
+              bridgeUserCount = match.userCount || new Set(match.punches.map((p: any) => String(p.deviceUserId || p.userId || '').trim()).filter(Boolean)).size;
+            }
+          }
+        }
+      } catch {
+        // Local bridge not active
       }
 
-      const res = await fetch('/api/zk/agent/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: targetDev.id,
-          deviceName: targetDev.name,
-          deviceIP: targetDev.ip,
-          userCount: sampleBiometricUserIds.length,
-          logCount: punchesToSync.length,
-          punches: punchesToSync
-        })
-      });
+      const BATCH_SIZE = 5000;
+      let totalRead = 0;
+      let totalNew = 0;
+      let totalDup = 0;
+      let syncOk = false;
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        toast.success(`Synced ${targetDev.name}: ${data.newRecords} new punches, ${data.duplicates} duplicates`, { id: tId });
+      if (bridgePunches.length > BATCH_SIZE) {
+        for (let i = 0; i < bridgePunches.length; i += BATCH_SIZE) {
+          const chunk = bridgePunches.slice(i, i + BATCH_SIZE);
+          const res = await fetch('/api/zk/fetch-device', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              deviceId: targetDev.id,
+              ip: targetDev.ip,
+              port: targetDev.port || 4370,
+              name: targetDev.name,
+              userCount: bridgeUserCount,
+              logCount: bridgeLogCount,
+              punches: chunk,
+              autoFetch: false
+            })
+          });
+          const d = await res.json();
+          if (res.ok && d.success) {
+            syncOk = true;
+            totalRead += Number(d.recordsRead || chunk.length);
+            totalNew += Number(d.newRecords || 0);
+            totalDup += Number(d.duplicates || 0);
+          }
+        }
+      } else {
+        const res = await fetch('/api/zk/fetch-device', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: targetDev.id,
+            ip: targetDev.ip,
+            port: targetDev.port || 4370,
+            name: targetDev.name,
+            userCount: bridgeUserCount,
+            logCount: bridgeLogCount,
+            punches: bridgePunches.length > 0 ? bridgePunches : undefined
+          })
+        });
+        const d = await res.json();
+        if (res.ok && d.success) {
+          syncOk = true;
+          totalRead = Number(d.recordsRead || 0);
+          totalNew = Number(d.newRecords || 0);
+          totalDup = Number(d.duplicates || 0);
+        }
+      }
+
+      if (syncOk) {
+        // Refresh punches, devices, logs, and unmapped punches from SQLite
+        const [freshPunches, freshDevs, freshLogs, freshUnmapped, freshMappings] = await Promise.all([
+          fetchLocalTable<RawPunch>('punches'),
+          fetchLocalTable<ZkDevice>('zk_devices'),
+          fetchLocalTable<ZkSyncLog>('zk_sync_logs'),
+          fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
+          fetchLocalTable<ZkUserMapping>('zk_user_mappings')
+        ]);
+        if (freshPunches) {
+          setPunchesState(freshPunches);
+          saveCache('punches', freshPunches);
+        }
+        if (freshDevs && freshDevs.length > 0) {
+          setZkDevicesState(freshDevs);
+          saveCache('zk_devices', freshDevs);
+        }
+        if (freshLogs && freshLogs.length > 0) {
+          setZkSyncLogsState(freshLogs);
+          saveCache('zk_sync_logs', freshLogs);
+        }
+        if (freshUnmapped) {
+          setZkUnmappedPunchesState(freshUnmapped);
+          saveCache('zk_unmapped_punches', freshUnmapped);
+        }
+        if (freshMappings && freshMappings.length > 0) {
+          setZkUserMappingsState(freshMappings);
+          saveCache('zk_user_mappings', freshMappings);
+        }
+
+        if (totalRead === 0 && totalNew === 0 && totalDup === 0) {
+          toast.success(`${targetDev.name} (${targetDev.ip}) synced — 0 new logs read from terminal. To import from private LAN IP, run start-zktime-sync.bat on your office PC or upload DAT/TXT logs.`, { id: tId, duration: 5000 });
+        } else {
+          toast.success(`Synced ${targetDev.name} (Active Employees Only): ${totalNew} new punches stored, ${totalDup} already-fetched duplicates skipped`, { id: tId });
+        }
         return {
           success: true,
-          recordsRead: data.recordsRead,
-          newRecords: data.newRecords,
-          duplicates: data.duplicates
+          recordsRead: totalRead,
+          newRecords: totalNew,
+          duplicates: totalDup
         };
       } else {
-        toast.error(`Sync failed: ${data.error || 'Device unreachable'}`, { id: tId });
+        toast.error(`Sync failed: Device unreachable`, { id: tId });
         return { success: false, recordsRead: 0, newRecords: 0, duplicates: 0 };
       }
     } catch (e: any) {
@@ -2137,79 +2772,111 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const resolveUnmappedPunches = useCallback(async (deviceUserId: string, employeeId: string) => {
     try {
-      if (!checkQuota()) return;
       const cleanTargetId = String(deviceUserId).trim();
       const normTargetId = cleanTargetId.replace(/[^0-9]/g, '').replace(/^0+/, '');
 
-      // 1. Save mapping
-      await mapZkUser({ deviceUserId: cleanTargetId, employeeId });
-
-      // 2. Fetch all pending unmapped punches directly from Firestore to ensure no missed records
-      const unmappedSnap = await getDocs(
-        query(collection(db, 'zkUnmappedPunches'), where('status', '==', 'pending'))
-      );
-
-      const pendingPunches = unmappedSnap.docs
-        .map(d => ({ id: d.id, ...d.data() } as ZkUnmappedPunch))
-        .filter(p => {
-          const pClean = String(p.deviceUserId || '').trim();
-          const pNorm = pClean.replace(/[^0-9]/g, '').replace(/^0+/, '');
-          return pClean === cleanTargetId || (normTargetId && pNorm === normTargetId);
-        });
-
-      if (pendingPunches.length === 0) {
-        toast.info(`Mapping saved! No historical pending punches found for biometric user ${cleanTargetId}`);
+      const emp = employees.find(e => e.id === employeeId);
+      if (emp && emp.status && emp.status.toLowerCase() !== 'active') {
+        toast.error(`Cannot fetch punches for inactive employee ${emp.name} (${emp.id}). Only Active Employees in Directory are synced.`);
         return;
       }
 
-      const emp = employees.find(e => e.id === employeeId);
-      const BATCH_SIZE = 300;
+      // 1. Save mapping to SQLite
+      await mapZkUser({ deviceUserId: cleanTargetId, employeeId });
 
-      for (let i = 0; i < pendingPunches.length; i += BATCH_SIZE) {
-        const chunk = pendingPunches.slice(i, i + BATCH_SIZE);
-        const batch = writeBatch(db);
+      // 2. Fetch pending unmapped punches from SQLite
+      const localUnmapped = await fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches');
+      const allUnmapped = (localUnmapped && localUnmapped.length > 0) ? localUnmapped : zkUnmappedPunches;
 
-        for (const p of chunk) {
-          const punchId = `zk_${p.transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
-          const punchRef = doc(db, 'punches', punchId);
-          batch.set(punchRef, {
-            id: punchId,
-            employeeId,
-            punchDatetime: p.punchDateTime,
-            deviceId: p.deviceId,
-            deviceName: p.deviceName || 'ZKTeco Device',
-            deviceIP: p.deviceIP || '192.168.117.200',
-            deviceUserId: p.deviceUserId,
-            source: 'ZKTeco',
-            syncTime: new Date().toISOString(),
-            transactionId: p.transactionId,
-            location: `${p.deviceName || 'Biometric'} (${p.deviceIP || 'LAN'})`,
-            importFormat: 'standard'
-          }, { merge: true });
+      const pendingPunches = allUnmapped.filter(p => {
+        if (p.status && p.status !== 'pending') return false;
+        const pClean = String(p.deviceUserId || '').trim();
+        const pNorm = pClean.replace(/[^0-9]/g, '').replace(/^0+/, '');
+        return pClean === cleanTargetId || (normTargetId && pNorm === normTargetId);
+      });
 
-          const unmappedRef = doc(db, 'zkUnmappedPunches', p.id);
-          batch.update(unmappedRef, { status: 'resolved' });
-        }
-
-        await batch.commit();
+      if (pendingPunches.length === 0) {
+        toast.info(`Mapping saved to SQLite! No historical pending punches found for biometric user ${cleanTargetId}`);
+        return;
       }
 
-      toast.success(`Imported ${pendingPunches.length} historical punches for ${emp?.name || employeeId}`);
-    } catch (e) {
-      throw handleFirestoreError(e, OperationType.WRITE, 'zkUnmappedPunches');
-    }
-  }, [checkQuota, mapZkUser, employees, handleFirestoreError]);
+      const existingIds = new Set(punches.map(x => x.id));
+      const existingEmpTimes = new Set(punches.map(x => `${x.employeeId}_${String(x.punchDatetime || '').replace(' ', 'T').slice(0, 19)}`));
 
-  // Auto-resolve pending unmapped punches when employees or mappings or unmapped punches update
+      const newPunchesToSave: RawPunch[] = [];
+      const updatedUnmappedToSave: ZkUnmappedPunch[] = [];
+
+      for (const p of pendingPunches) {
+        const punchDateTime = String(p.punchDateTime || '').replace(' ', 'T');
+        const punchId = `zk_${p.transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        const empTimeKey = `${employeeId}_${punchDateTime.slice(0, 19)}`;
+
+        updatedUnmappedToSave.push({ ...p, status: 'resolved' });
+
+        // Skip duplicate if already fetched
+        if (existingIds.has(punchId) || existingEmpTimes.has(empTimeKey)) {
+          continue;
+        }
+        existingIds.add(punchId);
+        existingEmpTimes.add(empTimeKey);
+
+        newPunchesToSave.push({
+          id: punchId,
+          employeeId,
+          punchDatetime: punchDateTime,
+          deviceId: p.deviceId,
+          deviceName: p.deviceName || 'ZKTeco Device',
+          deviceIP: p.deviceIP || '192.168.117.200',
+          deviceUserId: p.deviceUserId,
+          source: 'ZKTeco',
+          syncTime: new Date().toISOString(),
+          transactionId: p.transactionId,
+          location: `${p.deviceName || 'Biometric'} (${p.deviceIP || 'LAN'})`,
+          importFormat: 'standard'
+        });
+      }
+
+      if (newPunchesToSave.length > 0) {
+        await saveLocalTable('punches', newPunchesToSave);
+      }
+      await saveLocalTable('zk_unmapped_punches', updatedUnmappedToSave);
+
+      if (newPunchesToSave.length > 0) {
+        setPunchesState(prev => {
+          const map = new Map(prev.map(x => [x.id, x]));
+          newPunchesToSave.forEach(x => map.set(x.id, x));
+          const next = Array.from(map.values());
+          saveCache('punches', next);
+          return next;
+        });
+      }
+
+      setZkUnmappedPunchesState(prev => {
+        const resolvedIds = new Set(updatedUnmappedToSave.map(u => u.id));
+        const next = prev.map(u => resolvedIds.has(u.id) ? { ...u, status: 'resolved' as const } : u);
+        saveCache('zk_unmapped_punches', next);
+        return next;
+      });
+
+      toast.success(`Imported ${newPunchesToSave.length} new punches for Active Employee ${emp?.name || employeeId} into SQLite`);
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to resolve unmapped punches');
+    }
+  }, [mapZkUser, employees, zkUnmappedPunches, punches]);
+
+  // Auto-resolve pending unmapped punches ONLY against Active Employees in Directory
   useEffect(() => {
     if (!isAdmin || employees.length === 0 || zkUnmappedPunches.length === 0 || quotaExceeded) return;
 
     const pending = zkUnmappedPunches.filter(p => !p.status || p.status === 'pending');
     if (pending.length === 0) return;
 
+    const activeEmps = employees.filter(e => !e.status || e.status.toLowerCase() === 'active');
+    const activeEmpIdSet = new Set(activeEmps.map(e => String(e.id).trim()));
+
     const mappingMap = new Map<string, string>();
     zkUserMappings.forEach(m => {
-      if (m.deviceUserId && m.employeeId) {
+      if (m.deviceUserId && m.employeeId && activeEmpIdSet.has(String(m.employeeId).trim())) {
         const raw = String(m.deviceUserId).trim();
         mappingMap.set(raw, m.employeeId);
         const norm = normalizeEmployeeId(raw);
@@ -2218,7 +2885,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     const empNormMap = new Map<string, string>();
-    employees.forEach(emp => {
+    activeEmps.forEach(emp => {
       if (!emp || !emp.id) return;
       const officialId = String(emp.id).trim();
       if (!officialId) return;
@@ -2250,74 +2917,86 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                       empNormMap.get(devUserId.toLowerCase());
       }
 
-      if (targetEmpId) {
+      if (targetEmpId && activeEmpIdSet.has(targetEmpId)) {
         itemsToResolve.push({ p, empId: targetEmpId });
       }
     }
 
     if (itemsToResolve.length === 0) return;
 
-    console.log(`Auto-resolving ${itemsToResolve.length} unmapped punches against Employee Directory...`);
-
     const runAutoResolve = async () => {
-      if (!checkQuota()) return;
       try {
-        const BATCH_SIZE = 500;
-        for (let i = 0; i < itemsToResolve.length; i += BATCH_SIZE) {
-          const chunk = itemsToResolve.slice(i, i + BATCH_SIZE);
-          const batch = writeBatch(db);
+        const existingIds = new Set(punches.map(x => x.id));
+        const existingEmpTimes = new Set(punches.map(x => `${x.employeeId}_${String(x.punchDatetime || '').replace(' ', 'T').slice(0, 19)}`));
+        const newPunches: RawPunch[] = [];
+        const resolvedUnmapped: ZkUnmappedPunch[] = [];
 
-          for (const item of chunk) {
-            const rawDateTime = item.p.punchDateTime || new Date().toISOString();
-            const punchDateTime = String(rawDateTime).replace(' ', 'T');
-            const transactionId = item.p.transactionId || `auto_${item.p.deviceId}_${item.p.deviceUserId}_${punchDateTime}`;
-            const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        for (const item of itemsToResolve) {
+          const rawDateTime = item.p.punchDateTime || new Date().toISOString();
+          const punchDateTime = String(rawDateTime).replace(' ', 'T');
+          const transactionId = item.p.transactionId || `auto_${item.p.deviceId}_${item.p.deviceUserId}_${punchDateTime}`;
+          const punchId = `zk_${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+          const empTimeKey = `${item.empId}_${punchDateTime.slice(0, 19)}`;
 
-            const punchRef = doc(db, 'punches', punchId);
-            batch.set(punchRef, {
-              id: punchId,
-              employeeId: item.empId,
-              punchDatetime: punchDateTime,
-              deviceId: item.p.deviceId || 'ZKTeco Device',
-              deviceName: item.p.deviceName || 'ZKTeco Device',
-              deviceIP: item.p.deviceIP || '192.168.117.200',
-              deviceUserId: item.p.deviceUserId,
-              source: 'biometric',
-              syncTime: new Date().toISOString(),
-              transactionId,
-              location: item.p.deviceName ? `${item.p.deviceName} (${item.p.deviceIP || 'LAN'})` : 'Biometric Device',
-              importFormat: 'standard'
-            }, { merge: true });
+          resolvedUnmapped.push({ ...item.p, status: 'resolved' });
 
-            const unmappedRef = doc(db, 'zkUnmappedPunches', item.p.id);
-            batch.update(unmappedRef, { status: 'resolved' });
+          if (existingIds.has(punchId) || existingEmpTimes.has(empTimeKey)) {
+            continue;
           }
+          existingIds.add(punchId);
+          existingEmpTimes.add(empTimeKey);
 
-          await batch.commit();
+          newPunches.push({
+            id: punchId,
+            employeeId: item.empId,
+            punchDatetime: punchDateTime,
+            deviceId: item.p.deviceId || 'ZKTeco Device',
+            deviceName: item.p.deviceName || 'ZKTeco Device',
+            deviceIP: item.p.deviceIP || '192.168.117.200',
+            deviceUserId: item.p.deviceUserId,
+            source: 'biometric',
+            syncTime: new Date().toISOString(),
+            transactionId,
+            location: item.p.deviceName ? `${item.p.deviceName} (${item.p.deviceIP || 'LAN'})` : 'Biometric Device',
+            importFormat: 'standard'
+          });
         }
+
+        if (newPunches.length > 0) {
+          await saveLocalTable('punches', newPunches);
+        }
+        await saveLocalTable('zk_unmapped_punches', resolvedUnmapped);
+
+        if (newPunches.length > 0) {
+          setPunchesState(prev => {
+            const pMap = new Map(prev.map(p => [p.id, p]));
+            newPunches.forEach(p => pMap.set(p.id, p));
+            const next = Array.from(pMap.values());
+            saveCache('punches', next);
+            return next;
+          });
+        }
+
+        setZkUnmappedPunchesState(prev => {
+          const resIds = new Set(resolvedUnmapped.map(u => u.id));
+          const next = prev.map(u => resIds.has(u.id) ? { ...u, status: 'resolved' as const } : u);
+          saveCache('zk_unmapped_punches', next);
+          return next;
+        });
       } catch (err) {
-        console.error('Error during auto-resolve of unmapped punches:', err);
-        handleFirestoreError(err, OperationType.WRITE, 'zkUnmappedPunches');
+        console.error('Error during SQLite auto-resolve of unmapped punches:', err);
       }
     };
 
     runAutoResolve();
-  }, [isAdmin, employees, zkUserMappings, zkUnmappedPunches, quotaExceeded, checkQuota]);
+  }, [isAdmin, employees, zkUserMappings, zkUnmappedPunches, punches, quotaExceeded, checkQuota]);
 
   const clearZkSyncLogs = useCallback(async () => {
     setZkSyncLogsState([]);
-    toast.success('Sync logs cleared');
-    if (checkQuota()) {
-      try {
-        const snap = await getDocs(collection(db, 'zkSyncLogs'));
-        const batch = writeBatch(db);
-        snap.docs.forEach(d => batch.delete(d.ref));
-        await batch.commit();
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, 'zkSyncLogs');
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+    saveCache('zk_sync_logs', []);
+    await purgeLocalTable('zk_sync_logs').catch(() => {});
+    toast.success('Sync logs cleared from SQLite');
+  }, []);
 
   const recalculate = useCallback(async () => {
     const tId = toast.loading('Synchronizing system state with local database...');
@@ -2585,6 +3264,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     deletePayrollRun,
     movements,
     addMovement,
+    recordSeparation,
+    recordGeneralMovement,
     updateMovement,
     deleteMovement,
     setMovementsBatch,

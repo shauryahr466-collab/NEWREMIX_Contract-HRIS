@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Search, Users, DollarSign, Download, Building2, Briefcase } from 'lucide-react';
+import { X, Search, Users, Download, Building2, Briefcase } from 'lucide-react';
 import { DrillDownData } from '../../types/salaryAnalysis';
 import * as XLSX from 'xlsx';
 

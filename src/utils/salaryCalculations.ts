@@ -17,19 +17,22 @@ import {
   IncrementAnalysisRow, 
   DataQualityIssue 
 } from '../types/salaryAnalysis';
-import { differenceInMonths } from 'date-fns';
+import { 
+  calculateExperienceYears as calcExpYearsHelper, 
+  formatExperience as formatExpHelper, 
+  parseUniversalDate,
+  formatUniversalDate,
+  getNepaliDate
+} from './dateHelper';
 
 // Helper: Calculate Experience in Years from DOJ
-export function calculateExperienceYears(joiningDate?: string): number {
-  if (!joiningDate) return 0;
-  try {
-    const d = new Date(joiningDate);
-    if (isNaN(d.getTime())) return 0;
-    const months = differenceInMonths(new Date(), d);
-    return Math.max(0, Number((months / 12).toFixed(1)));
-  } catch (e) {
-    return 0;
-  }
+export function calculateExperienceYears(joiningDate?: any): number {
+  return calcExpYearsHelper(joiningDate);
+}
+
+// Helper: Format experience string
+export function formatExperience(years: number): string {
+  return formatExpHelper(years);
 }
 
 // Helper: Get Experience Band Label
@@ -121,6 +124,12 @@ export function getSalaryStructureRows(employees: Employee[], ssfEmployerRate = 
     const monthlyCTC = emp.monthlyCTC && emp.monthlyCTC > 0 ? Number(emp.monthlyCTC) : (grossSalary + employerSSF);
     const annualCTC = monthlyCTC * 12;
 
+    const rawDOJ = emp.joiningDate || (emp as any).doj || (emp as any).dateOfJoining || (emp as any).joining_date;
+    const expYears = calculateExperienceYears(rawDOJ);
+    const expFormatted = formatExperience(expYears);
+    const formattedDOJ = formatUniversalDate(rawDOJ, 'yyyy-MM-dd');
+    const nepaliDOJ = getNepaliDate(rawDOJ);
+
     return {
       employeeId: emp.id,
       employeeName: emp.name,
@@ -128,7 +137,10 @@ export function getSalaryStructureRows(employees: Employee[], ssfEmployerRate = 
       section: emp.section || 'General',
       designation: emp.designation || 'Staff',
       grade: emp.grade || 'N/A',
-      joiningDate: emp.joiningDate || 'Unrecorded',
+      joiningDate: formattedDOJ !== '-' ? formattedDOJ : (emp.joiningDate || 'Unrecorded'),
+      joiningDateBS: nepaliDOJ !== '0000-00-00' ? nepaliDOJ : undefined,
+      experienceYears: expYears,
+      experience: expFormatted,
       basicSalary,
       dearnessAllowance,
       otherAllowance,
@@ -137,7 +149,7 @@ export function getSalaryStructureRows(employees: Employee[], ssfEmployerRate = 
       employerSSF,
       monthlyCTC,
       annualCTC,
-      effectiveDate: emp.joiningDate || new Date().toISOString().split('T')[0],
+      effectiveDate: formattedDOJ !== '-' ? formattedDOJ : (emp.joiningDate || new Date().toISOString().split('T')[0]),
       employmentStatus: emp.status,
       gender: emp.gender,
       location: emp.location,

@@ -36,10 +36,32 @@ function formatTimeFromHHMM(timeStr: string | undefined | null) {
 }
 
 export function Reports() {
-  const { processedData, employees, settings, calculationSource, setCalculationSource, punches, shiftAssignments, setProcessedData, overtimeRecords, globalSearchTerm } = useAppStore();
+  const { processedData, employees, settings, calculationSource, setCalculationSource, punches, shiftAssignments, overtimeRecords, globalSearchTerm } = useAppStore();
   const [reportType, setReportType] = useState('daily');
   const [startDate, setStartDate] = useState(format(startOfMonth(new Date()), 'yyyy-MM-dd'));
   const [endDate, setEndDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+  const [hasAlignedReportDates, setHasAlignedReportDates] = useState(false);
+
+  React.useEffect(() => {
+    if (hasAlignedReportDates || punches.length === 0) return;
+    let minDt = '';
+    let maxDt = '';
+    let anyInRange = false;
+    for (const p of punches) {
+      if (!p.punchDatetime) continue;
+      const dStr = String(p.punchDatetime).slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dStr)) continue;
+      if (!minDt || dStr < minDt) minDt = dStr;
+      if (!maxDt || dStr > maxDt) maxDt = dStr;
+      if (dStr >= startDate && dStr <= endDate) anyInRange = true;
+    }
+    if (!anyInRange && minDt && maxDt) {
+      setStartDate(minDt);
+      setEndDate(maxDt);
+    }
+    setHasAlignedReportDates(true);
+  }, [punches, hasAlignedReportDates, startDate, endDate]);
+
   const [deptFilter, setDeptFilter] = useState<string[]>(['All']);
   const [designationFilter, setDesignationFilter] = useState<string[]>(['All']);
   const [contractorFilter, setContractorFilter] = useState<string[]>(['All']);

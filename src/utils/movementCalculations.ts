@@ -1,5 +1,6 @@
 import { Employee, EmployeeMovement, MovementType } from '../types';
-import { format, parseISO, isAfter, isBefore, isEqual, differenceInDays, differenceInMonths, differenceInYears } from 'date-fns';
+import { format, differenceInDays, differenceInMonths, differenceInYears } from 'date-fns';
+import { parseUniversalDate, calculateExperienceYears, formatExperience } from './dateHelper';
 
 export interface MovementFilterState {
   fiscalYear: string;
@@ -16,10 +17,50 @@ export interface MovementFilterState {
   location: string;
 }
 
+export interface FiscalYearOption {
+  value: string;
+  label: string;
+  startDate: string;
+  endDate: string;
+}
+
+export const MOVEMENT_FISCAL_YEARS: FiscalYearOption[] = [
+  {
+    value: '2083/84',
+    label: 'FY 2083/84 (2026-2027)',
+    startDate: '2026-04-14',
+    endDate: '2027-04-13',
+  },
+  {
+    value: '2082/83',
+    label: 'FY 2082/83 (2025-2026)',
+    startDate: '2025-04-14',
+    endDate: '2026-04-13',
+  },
+  {
+    value: '2081/82',
+    label: 'FY 2081/82 (2024-2025)',
+    startDate: '2024-04-13',
+    endDate: '2025-04-12',
+  },
+  {
+    value: '2080/81',
+    label: 'FY 2080/81 (2023-2024)',
+    startDate: '2023-04-14',
+    endDate: '2024-04-12',
+  },
+  {
+    value: '2079/80',
+    label: 'FY 2079/80 (2022-2023)',
+    startDate: '2022-04-14',
+    endDate: '2023-04-13',
+  },
+];
+
 export const DEFAULT_MOVEMENT_FILTERS: MovementFilterState = {
-  fiscalYear: '2080/81',
-  startDate: '2023-07-17', // Approx Shrawan 1
-  endDate: '2024-07-15',   // Approx Ashadh end
+  fiscalYear: '2081/82',
+  startDate: '2024-04-13', // Baisakh 1 2081
+  endDate: '2025-04-12',   // Chaitra 30 2081
   month: 'all',
   department: 'all',
   section: 'all',
@@ -169,10 +210,12 @@ export interface MovementAuditIssue {
 // -------------------------------------------------------------------
 
 export function filterEmployeesByMovementState(
-  employees: Employee[],
+  employees: Employee[] = [],
   filters: MovementFilterState
 ): Employee[] {
+  if (!Array.isArray(employees)) return [];
   return employees.filter(emp => {
+    if (!emp) return false;
     if (filters.department !== 'all' && emp.department !== filters.department) return false;
     if (filters.section !== 'all' && (emp.section || 'General') !== filters.section) return false;
     if (filters.designation !== 'all' && emp.designation !== filters.designation) return false;
@@ -192,16 +235,30 @@ export function filterEmployeesByMovementState(
   2. status is Active OR separationDate > targetDate
 */
 export function isEmployeeActiveOnDate(emp: Employee, targetDateStr: string): boolean {
-  if (!emp.joiningDate) return false;
-  
-  // Joined after targetDate? -> Not active
-  if (emp.joiningDate > targetDateStr) return false;
+  if (!emp) return false;
+  const targetDate = parseUniversalDate(targetDateStr);
+  if (!targetDate) return emp.status === 'Active';
+
+  const joinDate = parseUniversalDate(emp.joiningDate);
+  // If join date is recorded and in future compared to target -> not yet active
+  if (joinDate && joinDate > targetDate) {
+    return false;
+  }
 
   // Separated before or on targetDate? -> Not active
-  if (emp.separationDate && emp.separationDate <= targetDateStr) return false;
+  if (emp.separationDate) {
+    const sepDate = parseUniversalDate(emp.separationDate);
+    if (sepDate && sepDate <= targetDate) return false;
+  }
 
-  // If status is Inactive and no separation date, assume statusEffectiveDate
-  if (emp.status === 'Inactive' && emp.statusEffectiveDate && emp.statusEffectiveDate <= targetDateStr) {
+  // If status is Inactive and no separation date, check statusEffectiveDate
+  if (emp.status === 'Inactive' && emp.statusEffectiveDate) {
+    const effDate = parseUniversalDate(emp.statusEffectiveDate);
+    if (effDate && effDate <= targetDate) return false;
+  }
+
+  // If inactive without dates, check current status
+  if (emp.status === 'Inactive' && !emp.separationDate && !emp.statusEffectiveDate) {
     return false;
   }
 
@@ -212,19 +269,56 @@ export function isEmployeeActiveOnDate(emp: Employee, targetDateStr: string): bo
   Check if employee joined within [startDate, endDate]
 */
 export function isNewJoiner(emp: Employee, startDateStr: string, endDateStr: string): boolean {
-  if (!emp.joiningDate) return false;
-  return emp.joiningDate >= startDateStr && emp.joiningDate <= endDateStr;
+  if (!emp || !emp.joiningDate) return false;
+  const joinDate = parseUniversalDate(emp.joiningDate);
+  const start = parseUniversalDate(startDateStr);
+  const end = parseUniversalDate(endDateStr);
+  if (!joinDate || !start || !end) return false;
+  return joinDate >= start && joinDate <= end;
+}
+
+/**
+  Check if movement type represents an exit/separation
+*/
+export function isSeparationMovementType(type: string = ''): boolean {
+  if (!type) return false;
+  const t = String(type).trim().toLowerCase();
+  return (
+    t.includes('resignation') ||
+    t.includes('termination') ||
+    t.includes('retirement') ||
+    t.includes('contract end') ||
+    t.includes('separation') ||
+    t.includes('exit') ||
+    t === 'inactive'
+  );
 }
 
 /**
   Check if employee separated within [startDate, endDate]
 */
-export function isSeparation(emp: Employee, startDateStr: string, endDateStr: string): boolean {
-  if (emp.separationDate && emp.separationDate >= startDateStr && emp.separationDate <= endDateStr) {
-    return true;
+export function isSeparation(emp: Employee, startDateStr: string, endDateStr: string, movements?: EmployeeMovement[]): boolean {
+  if (!emp) return false;
+  const start = parseUniversalDate(startDateStr);
+  const end = parseUniversalDate(endDateStr);
+  if (!start || !end) return false;
+
+  if (emp.separationDate) {
+    const sepDate = parseUniversalDate(emp.separationDate);
+    if (sepDate && sepDate >= start && sepDate <= end) return true;
   }
-  if (emp.status === 'Inactive' && emp.statusEffectiveDate && emp.statusEffectiveDate >= startDateStr && emp.statusEffectiveDate <= endDateStr) {
-    return true;
+  if (emp.status === 'Inactive' && emp.statusEffectiveDate) {
+    const effDate = parseUniversalDate(emp.statusEffectiveDate);
+    if (effDate && effDate >= start && effDate <= end) return true;
+  }
+  if (Array.isArray(movements)) {
+    const hasMove = movements.some(m =>
+      m.employeeId === emp.id &&
+      isSeparationMovementType(m.movementType) &&
+      m.effectiveDate >= startDateStr &&
+      m.effectiveDate <= endDateStr
+    );
+    if (hasMove) return true;
   }
   return false;
 }
@@ -233,20 +327,28 @@ export function isSeparation(emp: Employee, startDateStr: string, endDateStr: st
   Determine if exit is Voluntary or Involuntary
 */
 export function getExitClassification(emp: Employee, movement?: EmployeeMovement): 'Voluntary' | 'Involuntary' {
-  const exitType = movement?.exitType || emp.exitType;
+  const exitType = movement?.exitType || emp?.exitType;
   if (exitType) {
     if (exitType === 'Voluntary') return 'Voluntary';
     if (exitType === 'Involuntary') return 'Involuntary';
+    if (exitType === 'Retirement' || exitType === 'Contract End') return 'Voluntary';
   }
 
-  const reason = (movement?.exitReason || emp.exitReason || '').toLowerCase();
+  const moveType = (movement?.movementType || '').toLowerCase();
+  if (moveType === 'resignation' || moveType === 'retirement') return 'Voluntary';
+  if (moveType === 'termination') return 'Involuntary';
+
+  const reason = (movement?.exitReason || movement?.reason || emp?.exitReason || '').toLowerCase();
   if (
     reason.includes('resign') || 
     reason.includes('personal') || 
     reason.includes('better') || 
     reason.includes('relocation') ||
     reason.includes('salary') ||
-    reason.includes('opportunity')
+    reason.includes('opportunity') ||
+    reason.includes('retire') ||
+    reason.includes('study') ||
+    reason.includes('health')
   ) {
     return 'Voluntary';
   }
@@ -259,11 +361,12 @@ export function getExitClassification(emp: Employee, movement?: EmployeeMovement
 // -------------------------------------------------------------------
 
 export function calculateMovementKPIs(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): MovementSummaryKPIs {
-  const filteredEmployees = filterEmployeesByMovementState(employees, filters);
+  const filteredEmployees = filterEmployeesByMovementState(employees || [], filters);
+  const safeMovements = Array.isArray(movements) ? movements : [];
 
   const start = filters.startDate;
   const end = filters.endDate;
@@ -274,21 +377,21 @@ export function calculateMovementKPIs(
   // Closing Headcount: Active on endDate
   const closingHeadcount = filteredEmployees.filter(emp => isEmployeeActiveOnDate(emp, end)).length;
 
-  // Average Headcount
+  // Average Headcount (Ensure positive number >= 1)
   const averageHeadcount = Math.max((openingHeadcount + closingHeadcount) / 2, 1);
 
   // New Joiners
   const newJoiners = filteredEmployees.filter(emp => isNewJoiner(emp, start, end)).length;
 
   // Separations
-  const separatedEmps = filteredEmployees.filter(emp => isSeparation(emp, start, end));
+  const separatedEmps = filteredEmployees.filter(emp => isSeparation(emp, start, end, safeMovements));
   const separations = separatedEmps.length;
 
   let voluntarySeparations = 0;
   let involuntarySeparations = 0;
 
   separatedEmps.forEach(emp => {
-    const move = movements.find(m => m.employeeId === emp.id && (m.movementType === 'Resignation' || m.movementType === 'Termination' || m.movementType === 'Other Separation'));
+    const move = safeMovements.find(m => m.employeeId === emp.id && isSeparationMovementType(m.movementType));
     const cls = getExitClassification(emp, move);
     if (cls === 'Voluntary') voluntarySeparations++;
     else involuntarySeparations++;
@@ -297,21 +400,21 @@ export function calculateMovementKPIs(
   const netMovement = newJoiners - separations;
 
   // Rates
-  const attritionRate = Number(((separations / averageHeadcount) * 100).toFixed(2));
-  const voluntaryAttritionRate = Number(((voluntarySeparations / averageHeadcount) * 100).toFixed(2));
-  const involuntaryAttritionRate = Number(((involuntarySeparations / averageHeadcount) * 100).toFixed(2));
+  const attritionRate = Number(((separations / averageHeadcount) * 100).toFixed(2)) || 0;
+  const voluntaryAttritionRate = Number(((voluntarySeparations / averageHeadcount) * 100).toFixed(2)) || 0;
+  const involuntaryAttritionRate = Number(((involuntarySeparations / averageHeadcount) * 100).toFixed(2)) || 0;
   const turnoverRate = attritionRate;
-  const retentionRate = Number((Math.max(100 - attritionRate, 0)).toFixed(2));
-  const newJoinerRate = Number(((newJoiners / averageHeadcount) * 100).toFixed(2));
+  const retentionRate = Number((Math.max(100 - attritionRate, 0)).toFixed(2)) || 100;
+  const newJoinerRate = Number(((newJoiners / averageHeadcount) * 100).toFixed(2)) || 0;
 
   // Internal Movements
-  const periodMovements = movements.filter(m => m.effectiveDate >= start && m.effectiveDate <= end);
+  const periodMovements = safeMovements.filter(m => m.effectiveDate >= start && m.effectiveDate <= end);
   const promotionCount = periodMovements.filter(m => m.movementType === 'Promotion').length;
   const transferCount = periodMovements.filter(m => m.movementType === 'Transfer').length;
   const departmentChangeCount = periodMovements.filter(m => m.movementType === 'Department Change').length;
   const internalMovementCount = promotionCount + transferCount + departmentChangeCount;
 
-  const promotionRate = Number(((promotionCount / averageHeadcount) * 100).toFixed(2));
+  const promotionRate = Number(((promotionCount / averageHeadcount) * 100).toFixed(2)) || 0;
 
   return {
     openingHeadcount,
@@ -341,15 +444,18 @@ export function calculateMovementKPIs(
 // -------------------------------------------------------------------
 
 export function calculateMonthlyTrend(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): MonthlyTrendRow[] {
-  const filteredEmployees = filterEmployeesByMovementState(employees, filters);
+  const filteredEmployees = filterEmployeesByMovementState(employees || [], filters);
+
+  const parsedStart = parseUniversalDate(filters.startDate) || new Date();
+  const currentYear = parsedStart.getFullYear();
 
   return NEPALI_FY_MONTHS.map((mObj, index) => {
-    // Generate simulated/actual dates for each month in period
-    const year = index < 6 ? 2023 : 2024;
+    // Generate dates for each month in period
+    const year = index < 6 ? currentYear : currentYear + 1;
     const monthNumStr = mObj.monthNum < 10 ? `0${mObj.monthNum}` : `${mObj.monthNum}`;
     const mStart = `${year}-${monthNumStr}-01`;
     const mEnd = `${year}-${monthNumStr}-28`;
@@ -361,7 +467,7 @@ export function calculateMonthlyTrend(
     const joiners = filteredEmployees.filter(e => isNewJoiner(e, mStart, mEnd)).length;
     const seps = filteredEmployees.filter(e => isSeparation(e, mStart, mEnd)).length;
     const net = joiners - seps;
-    const att = Number(((seps / avgHC) * 100).toFixed(2));
+    const att = Number(((seps / avgHC) * 100).toFixed(2)) || 0;
 
     return {
       monthKey: mObj.key,
@@ -381,42 +487,49 @@ export function calculateMonthlyTrend(
 // -------------------------------------------------------------------
 
 export function calculateDepartmentAttrition(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): DepartmentAttritionRow[] {
+  const safeEmployees = Array.isArray(employees) ? employees : [];
+  const safeMovements = Array.isArray(movements) ? movements : [];
+
   const start = filters.startDate;
   const end = filters.endDate;
 
   const departments = Array.from(
-    new Set(employees.map(e => e.department || 'General'))
+    new Set(safeEmployees.map(e => e.department || 'General'))
   ).sort();
 
+  if (departments.length === 0) {
+    return [];
+  }
+
   const rows: DepartmentAttritionRow[] = departments.map(dept => {
-    const deptEmployees = employees.filter(e => (e.department || 'General') === dept);
+    const deptEmployees = safeEmployees.filter(e => (e.department || 'General') === dept);
 
     const openingHC = deptEmployees.filter(e => isEmployeeActiveOnDate(e, start)).length;
     const closingHC = deptEmployees.filter(e => isEmployeeActiveOnDate(e, end)).length;
     const averageHC = Math.max((openingHC + closingHC) / 2, 1);
 
     const joiners = deptEmployees.filter(e => isNewJoiner(e, start, end)).length;
-    const separatedEmps = deptEmployees.filter(e => isSeparation(e, start, end));
+    const separatedEmps = deptEmployees.filter(e => isSeparation(e, start, end, safeMovements));
     const separations = separatedEmps.length;
 
     let voluntarySeparations = 0;
     let involuntarySeparations = 0;
 
     separatedEmps.forEach(emp => {
-      const move = movements.find(m => m.employeeId === emp.id && (m.movementType === 'Resignation' || m.movementType === 'Termination'));
+      const move = safeMovements.find(m => m.employeeId === emp.id && isSeparationMovementType(m.movementType));
       const cls = getExitClassification(emp, move);
       if (cls === 'Voluntary') voluntarySeparations++;
       else involuntarySeparations++;
     });
 
     const netMovement = joiners - separations;
-    const attritionRate = Number(((separations / averageHC) * 100).toFixed(2));
-    const voluntaryAttritionRate = Number(((voluntarySeparations / averageHC) * 100).toFixed(2));
-    const involuntaryAttritionRate = Number(((involuntarySeparations / averageHC) * 100).toFixed(2));
+    const attritionRate = Number(((separations / averageHC) * 100).toFixed(2)) || 0;
+    const voluntaryAttritionRate = Number(((voluntarySeparations / averageHC) * 100).toFixed(2)) || 0;
+    const involuntaryAttritionRate = Number(((involuntarySeparations / averageHC) * 100).toFixed(2)) || 0;
 
     return {
       department: dept,
@@ -434,7 +547,6 @@ export function calculateDepartmentAttrition(
     };
   });
 
-  // Sort by Highest Attrition Rate
   return rows.sort((a, b) => b.attritionRate - a.attritionRate);
 }
 
@@ -443,27 +555,33 @@ export function calculateDepartmentAttrition(
 // -------------------------------------------------------------------
 
 export function calculateDesignationAttrition(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): DesignationAttritionRow[] {
+  const safeEmployees = Array.isArray(employees) ? employees : [];
+  const safeMovements = Array.isArray(movements) ? movements : [];
   const start = filters.startDate;
   const end = filters.endDate;
 
   const designations = Array.from(
-    new Set(employees.map(e => e.designation || 'Staff'))
+    new Set(safeEmployees.map(e => e.designation || 'Staff'))
   ).sort();
 
+  if (designations.length === 0) {
+    return [];
+  }
+
   return designations.map(desg => {
-    const desgEmployees = employees.filter(e => (e.designation || 'Staff') === desg);
+    const desgEmployees = safeEmployees.filter(e => (e.designation || 'Staff') === desg);
 
     const activeCount = desgEmployees.filter(e => e.status === 'Active').length;
     const joiners = desgEmployees.filter(e => isNewJoiner(e, start, end)).length;
-    const seps = desgEmployees.filter(e => isSeparation(e, start, end)).length;
+    const seps = desgEmployees.filter(e => isSeparation(e, start, end, safeMovements)).length;
     const avgHC = Math.max((activeCount + (activeCount + seps - joiners)) / 2, 1);
 
-    const att = Number(((seps / avgHC) * 100).toFixed(2));
-    const ret = Number((Math.max(100 - att, 0)).toFixed(2));
+    const att = Number(((seps / avgHC) * 100).toFixed(2)) || 0;
+    const ret = Number((Math.max(100 - att, 0)).toFixed(2)) || 100;
 
     return {
       designation: desg,
@@ -481,19 +599,26 @@ export function calculateDesignationAttrition(
 // -------------------------------------------------------------------
 
 export function calculateSectionMovement(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): SectionMovementRow[] {
+  const safeEmployees = Array.isArray(employees) ? employees : [];
+  const safeMovements = Array.isArray(movements) ? movements : [];
+
   const start = filters.startDate;
   const end = filters.endDate;
 
   const sections = Array.from(
-    new Set(employees.map(e => e.section || 'General'))
+    new Set(safeEmployees.map(e => e.section || 'General'))
   ).sort();
 
+  if (sections.length === 0) {
+    return [];
+  }
+
   return sections.map(sec => {
-    const secEmployees = employees.filter(e => (e.section || 'General') === sec);
+    const secEmployees = safeEmployees.filter(e => (e.section || 'General') === sec);
 
     const openingHC = secEmployees.filter(e => isEmployeeActiveOnDate(e, start)).length;
     const closingHC = secEmployees.filter(e => isEmployeeActiveOnDate(e, end)).length;
@@ -502,11 +627,11 @@ export function calculateSectionMovement(
     const joiners = secEmployees.filter(e => isNewJoiner(e, start, end)).length;
     const seps = secEmployees.filter(e => isSeparation(e, start, end)).length;
 
-    const transfersIn = movements.filter(m => m.effectiveDate >= start && m.effectiveDate <= end && m.newSection === sec).length;
-    const transfersOut = movements.filter(m => m.effectiveDate >= start && m.effectiveDate <= end && m.previousSection === sec).length;
+    const transfersIn = safeMovements.filter(m => m.effectiveDate >= start && m.effectiveDate <= end && m.newSection === sec).length;
+    const transfersOut = safeMovements.filter(m => m.effectiveDate >= start && m.effectiveDate <= end && m.previousSection === sec).length;
 
     const net = joiners + transfersIn - transfersOut - seps;
-    const att = Number(((seps / avgHC) * 100).toFixed(2));
+    const att = Number(((seps / avgHC) * 100).toFixed(2)) || 0;
 
     return {
       section: sec,
@@ -527,10 +652,11 @@ export function calculateSectionMovement(
 // -------------------------------------------------------------------
 
 export function calculateTenureAnalysis(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): TenureAnalysisBand[] {
+  const safeEmployees = Array.isArray(employees) ? employees : [];
   const start = filters.startDate;
   const end = filters.endDate;
 
@@ -545,10 +671,13 @@ export function calculateTenureAnalysis(
   const now = new Date();
 
   return bands.map(b => {
-    const bandEmps = employees.filter(emp => {
-      if (!emp.joiningDate) return false;
-      const joinD = parseISO(emp.joiningDate);
+    const bandEmps = safeEmployees.filter(emp => {
+      const joinD = parseUniversalDate(emp.joiningDate);
+      if (!joinD) {
+        return b.key === '0-1';
+      }
       const tenureDays = differenceInDays(now, joinD);
+      if (isNaN(tenureDays)) return false;
       return tenureDays >= b.minDays && tenureDays <= b.maxDays;
     });
 
@@ -561,7 +690,7 @@ export function calculateTenureAnalysis(
     const seps = bandEmps.filter(e => isSeparation(e, start, end)).length;
 
     const avgHC = Math.max(employeeCount, 1);
-    const att = Number(((seps / avgHC) * 100).toFixed(2));
+    const att = Number(((seps / avgHC) * 100).toFixed(2)) || 0;
 
     return {
       band: b.key,
@@ -580,14 +709,17 @@ export function calculateTenureAnalysis(
 // -------------------------------------------------------------------
 
 export function calculateExitReasonAnalysis(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): ExitReasonRow[] {
+  const safeEmployees = Array.isArray(employees) ? employees : [];
+  const safeMovements = Array.isArray(movements) ? movements : [];
+
   const start = filters.startDate;
   const end = filters.endDate;
 
-  const separatedEmps = employees.filter(e => isSeparation(e, start, end));
+  const separatedEmps = safeEmployees.filter(e => isSeparation(e, start, end));
 
   if (separatedEmps.length === 0) {
     return [
@@ -601,13 +733,18 @@ export function calculateExitReasonAnalysis(
   const map: Record<string, { count: number; voluntary: number; involuntary: number; totalTenureDays: number }> = {};
 
   separatedEmps.forEach(emp => {
-    const move = movements.find(m => m.employeeId === emp.id && (m.movementType === 'Resignation' || m.movementType === 'Termination'));
-    const reason = move?.exitReason || emp.exitReason || 'Personal / Unspecified';
+    const move = safeMovements.find(m => m.employeeId === emp.id && isSeparationMovementType(m.movementType));
+    const reason = move?.exitReason || move?.reason || emp.exitReason || (move?.movementType ? `${move.movementType}` : 'Personal / Unspecified');
     const cls = getExitClassification(emp, move);
 
     let tenureDays = 365;
-    if (emp.joiningDate && emp.separationDate) {
-      tenureDays = Math.max(differenceInDays(parseISO(emp.separationDate), parseISO(emp.joiningDate)), 30);
+    const joinD = parseUniversalDate(emp.joiningDate);
+    const sepD = parseUniversalDate(emp.separationDate);
+    if (joinD && sepD) {
+      const diff = differenceInDays(sepD, joinD);
+      if (!isNaN(diff)) {
+        tenureDays = Math.max(diff, 30);
+      }
     }
 
     if (!map[reason]) {
@@ -625,10 +762,10 @@ export function calculateExitReasonAnalysis(
   return Object.keys(map).map(r => ({
     reason: r,
     count: map[r].count,
-    percentage: Number(((map[r].count / totalSeps) * 100).toFixed(1)),
+    percentage: Number(((map[r].count / totalSeps) * 100).toFixed(1)) || 0,
     voluntaryCount: map[r].voluntary,
     involuntaryCount: map[r].involuntary,
-    avgTenureYears: Number(((map[r].totalTenureDays / map[r].count) / 365).toFixed(1)),
+    avgTenureYears: Number(((map[r].totalTenureDays / Math.max(map[r].count, 1)) / 365).toFixed(1)) || 0,
   })).sort((a, b) => b.count - a.count);
 }
 
@@ -637,17 +774,20 @@ export function calculateExitReasonAnalysis(
 // -------------------------------------------------------------------
 
 export function getPromotionRecords(
-  employees: Employee[],
-  movements: EmployeeMovement[],
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): PromotionRecordRow[] {
+  const safeEmployees = Array.isArray(employees) ? employees : [];
+  const safeMovements = Array.isArray(movements) ? movements : [];
+
   const start = filters.startDate;
   const end = filters.endDate;
 
-  const promos = movements.filter(m => m.movementType === 'Promotion' && m.effectiveDate >= start && m.effectiveDate <= end);
+  const promos = safeMovements.filter(m => m.movementType === 'Promotion' && m.effectiveDate >= start && m.effectiveDate <= end);
 
   return promos.map(p => {
-    const emp = employees.find(e => e.id === p.employeeId);
+    const emp = safeEmployees.find(e => e.id === p.employeeId);
     const prevSal = p.previousSalary || 30000;
     const newSal = p.newSalary || 35000;
     const incPct = prevSal > 0 ? Number((((newSal - prevSal) / prevSal) * 100).toFixed(1)) : 0;
@@ -671,13 +811,14 @@ export function getPromotionRecords(
 }
 
 export function getDepartmentTransferMatrix(
-  movements: EmployeeMovement[],
+  movements: EmployeeMovement[] = [],
   filters: MovementFilterState
 ): TransferMatrixRow[] {
+  const safeMovements = Array.isArray(movements) ? movements : [];
   const start = filters.startDate;
   const end = filters.endDate;
 
-  const transfers = movements.filter(m => (m.movementType === 'Transfer' || m.movementType === 'Department Change') && m.effectiveDate >= start && m.effectiveDate <= end);
+  const transfers = safeMovements.filter(m => (m.movementType === 'Transfer' || m.movementType === 'Department Change') && m.effectiveDate >= start && m.effectiveDate <= end);
 
   const map: Record<string, number> = {};
 
@@ -701,14 +842,15 @@ export function getDepartmentTransferMatrix(
 // -------------------------------------------------------------------
 
 export function getMovementDataQualityAudit(
-  employees: Employee[],
-  movements: EmployeeMovement[]
+  employees: Employee[] = [],
+  movements: EmployeeMovement[] = []
 ): MovementAuditIssue[] {
   const issues: MovementAuditIssue[] = [];
+  const safeEmployees = Array.isArray(employees) ? employees : [];
 
   // Check 1: Duplicate Bio IDs
   const seenIds = new Set<string>();
-  employees.forEach(emp => {
+  safeEmployees.forEach(emp => {
     if (seenIds.has(emp.id)) {
       issues.push({
         employeeId: emp.id,
@@ -721,9 +863,9 @@ export function getMovementDataQualityAudit(
     seenIds.add(emp.id);
   });
 
-  employees.forEach(emp => {
+  safeEmployees.forEach(emp => {
     // Check 2: Missing Date of Joining
-    if (!emp.joiningDate) {
+    if (!emp.joiningDate || emp.joiningDate === 'Unrecorded') {
       issues.push({
         employeeId: emp.id,
         employeeName: emp.name,
@@ -799,41 +941,48 @@ export function getMovementDataQualityAudit(
 
 export function generateMovementManagementInsights(
   kpis: MovementSummaryKPIs,
-  deptAttrition: DepartmentAttritionRow[],
-  exitReasons: ExitReasonRow[]
+  deptAttrition: DepartmentAttritionRow[] = [],
+  exitReasons: ExitReasonRow[] = []
 ): { insights: string[]; flags: { label: string; type: 'danger' | 'warning' | 'info' }[] } {
   const insights: string[] = [];
   const flags: { label: string; type: 'danger' | 'warning' | 'info' }[] = [];
 
-  if (kpis.attritionRate > 10) {
+  const safeKpis = kpis || {
+    attritionRate: 0,
+    netMovement: 0,
+    promotionCount: 0,
+    promotionRate: 0
+  };
+
+  if (safeKpis.attritionRate > 10) {
     flags.push({ label: 'CRITICAL: High Attrition Rate (>10%)', type: 'danger' });
-    insights.push(`Workforce Attrition Rate stands at ${kpis.attritionRate}%, which exceeds standard industrial benchmarks.`);
-  } else if (kpis.attritionRate > 5) {
+    insights.push(`Workforce Attrition Rate stands at ${safeKpis.attritionRate}%, which exceeds standard industrial benchmarks.`);
+  } else if (safeKpis.attritionRate > 5) {
     flags.push({ label: 'WARNING: Moderate Attrition Rate (5-10%)', type: 'warning' });
-    insights.push(`Workforce Attrition Rate is ${kpis.attritionRate}%, requiring close operational monitoring.`);
+    insights.push(`Workforce Attrition Rate is ${safeKpis.attritionRate}%, requiring close operational monitoring.`);
   } else {
     flags.push({ label: 'HEALTHY: Stable Attrition Rate (<5%)', type: 'info' });
-    insights.push(`Workforce Attrition Rate is healthy at ${kpis.attritionRate}%.`);
+    insights.push(`Workforce Attrition Rate is healthy at ${safeKpis.attritionRate}%.`);
   }
 
-  if (kpis.netMovement < 0) {
+  if (safeKpis.netMovement < 0) {
     flags.push({ label: 'ALERT: Negative Headcount Growth', type: 'danger' });
-    insights.push(`Net headcount movement is negative (${kpis.netMovement} staff), indicating separations outpaced recruitment.`);
-  } else if (kpis.netMovement > 0) {
-    insights.push(`Net workforce expanded by +${kpis.netMovement} employees during the analysis window.`);
+    insights.push(`Net headcount movement is negative (${safeKpis.netMovement} staff), indicating separations outpaced recruitment.`);
+  } else if (safeKpis.netMovement > 0) {
+    insights.push(`Net workforce expanded by +${safeKpis.netMovement} employees during the analysis window.`);
   }
 
-  if (deptAttrition.length > 0 && deptAttrition[0].attritionRate > 12) {
+  if (deptAttrition && deptAttrition.length > 0 && deptAttrition[0].attritionRate > 12) {
     flags.push({ label: `HIGH DEPT ATTRITION: ${deptAttrition[0].department}`, type: 'warning' });
     insights.push(`${deptAttrition[0].department} department recorded the highest attrition rate at ${deptAttrition[0].attritionRate}%.`);
   }
 
-  if (exitReasons.length > 0 && exitReasons[0].count > 0) {
+  if (exitReasons && exitReasons.length > 0 && exitReasons[0].count > 0) {
     insights.push(`Primary driver for employee exits: '${exitReasons[0].reason}' (${exitReasons[0].percentage}% of total separations).`);
   }
 
-  if (kpis.promotionCount > 0) {
-    insights.push(`A total of ${kpis.promotionCount} internal staff promotions were executed (${kpis.promotionRate}% promotion rate).`);
+  if (safeKpis.promotionCount > 0) {
+    insights.push(`A total of ${safeKpis.promotionCount} internal staff promotions were executed (${safeKpis.promotionRate}% promotion rate).`);
   }
 
   return { insights, flags };

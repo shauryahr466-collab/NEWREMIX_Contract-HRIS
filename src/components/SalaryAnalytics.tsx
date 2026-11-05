@@ -3,7 +3,7 @@ import { useAppStore } from '../store';
 import { Employee } from '../types';
 import { Card, Button, Input, Badge } from './ui';
 import { 
-  DollarSign, TrendingUp, TrendingDown, Users, AlertTriangle, ShieldAlert,
+  TrendingUp, TrendingDown, Users, AlertTriangle, ShieldAlert,
   Download, Filter, RefreshCw, BarChart2, PieChart as PieChartIcon, HelpCircle,
   Briefcase, Award, ArrowUpDown, ChevronRight, CheckCircle2
 } from 'lucide-react';

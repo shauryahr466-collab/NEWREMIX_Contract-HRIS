@@ -1,6 +1,6 @@
 import { format, parseISO } from 'date-fns';
 import type { RawPunch, Employee, ProcessedAttendance } from '../types';
-import { formatAMPM, normalizeEmployeeId } from './utils';
+import { formatAMPM, normalizeEmployeeId, toDeviceWallClockIso } from './utils';
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
@@ -43,8 +43,9 @@ export function generateZkBioDataRows(
   if (punches && punches.length > 0) {
     punches.forEach(p => {
       if (!p.punchDatetime) return;
-      const cleanIso = String(p.punchDatetime).replace(' ', 'T');
-      const dateStr = cleanIso.includes('T') ? cleanIso.split('T')[0] : cleanIso.split(' ')[0];
+      const cleanWallClock = toDeviceWallClockIso(p.punchDatetime);
+      if (!cleanWallClock) return;
+      const dateStr = cleanWallClock.includes('T') ? cleanWallClock.split('T')[0] : cleanWallClock.split(' ')[0];
       
       if (startDate && dateStr < startDate) return;
       if (endDate && dateStr > endDate) return;
@@ -55,11 +56,7 @@ export function generateZkBioDataRows(
       const empIdToUse = emp?.id || p.employeeId;
       const key = `${empIdToUse}_${dateStr}`;
 
-      let parsedDate = parseISO(cleanIso);
-      if (isNaN(parsedDate.getTime())) parsedDate = new Date(cleanIso);
-      if (isNaN(parsedDate.getTime())) return;
-
-      const timeStr = formatAMPM(parsedDate.toISOString());
+      const timeStr = formatAMPM(cleanWallClock);
 
       let entry = groupMap.get(key);
       if (!entry) {

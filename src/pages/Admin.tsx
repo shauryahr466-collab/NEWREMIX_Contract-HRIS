@@ -249,13 +249,13 @@ export function AdminDashboard() {
                     <div className="flex items-center gap-3">
                       <div className={cn(
                         "p-2 rounded-lg shrink-0",
-                        log.action === 'assign' ? "bg-primary/10 text-primary" : "bg-red-50 dark:bg-red-900/10 text-red-600"
+                        log.action === 'Assigned' ? "bg-primary/10 text-primary" : "bg-red-50 dark:bg-red-900/10 text-red-600"
                       )}>
                         <Clock size={16} />
                       </div>
                       <div>
                         <p className="text-xs font-bold text-slate-900 dark:text-white">
-                          {log.action === 'assign' ? 'Assigned' : 'Unassigned'} {log.shiftName}
+                          {log.action === 'Assigned' ? 'Assigned' : log.action} {log.shiftName}
                         </p>
                         <p className="text-[10px] text-slate-500 font-medium">
                           Emp: {log.employeeId} • Date: {log.date}

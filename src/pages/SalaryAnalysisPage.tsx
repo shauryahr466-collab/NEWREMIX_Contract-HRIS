@@ -15,6 +15,10 @@ import {
   getSalaryEquityAnalysis, 
   getDataQualityAudit 
 } from '../utils/salaryCalculations';
+import { 
+  formatUniversalDate, 
+  getNepaliDate 
+} from '../utils/dateHelper';
 import { GlobalFilterBar } from '../components/salaryAnalysis/GlobalFilterBar';
 import { SalaryBandModal } from '../components/salaryAnalysis/SalaryBandModal';
 import { DrillDownModal } from '../components/salaryAnalysis/DrillDownModal';
@@ -106,7 +110,10 @@ export function SalaryAnalysisPage() {
       'Section': r.section,
       'Designation': r.designation,
       'Grade': r.grade,
-      'DOJ': r.joiningDate,
+      'DOJ': formatUniversalDate(r.joiningDate, 'yyyy-MM-dd'),
+      'DOJ (B.S.)': r.joiningDateBS || getNepaliDate(r.joiningDate),
+      'Experience': r.experience || `${r.experienceYears || 0} yrs`,
+      'Experience (Years)': r.experienceYears || 0,
       'Basic Salary': r.basicSalary,
       'DA': r.dearnessAllowance,
       'Other Allowance': r.otherAllowance,
@@ -188,9 +195,9 @@ export function SalaryAnalysisPage() {
   const handleExportCSV = () => {
     const rows = getSalaryStructureRows(filteredEmployees);
     const csvHeader = `As Of Date: ${filters.effectiveDate}, Fiscal Year: ${filters.fiscalYear}, Department: ${filters.department}, Section: ${filters.section}\n`;
-    const headers = 'Employee ID,Employee Name,Department,Section,Designation,Grade,Basic Salary,Gross Salary,Employer SSF,Monthly CTC,Annual CTC,Status\n';
+    const headers = 'Employee ID,Employee Name,Department,Section,Designation,Grade,DOJ,Experience,Basic Salary,Gross Salary,Employer SSF,Monthly CTC,Annual CTC,Status\n';
     const csvBody = rows.map(r => 
-      `"${r.employeeId}","${r.employeeName}","${r.department}","${r.section}","${r.designation}","${r.grade}",${r.basicSalary},${r.grossSalary},${r.employerSSF},${r.monthlyCTC},${r.annualCTC},"${r.employmentStatus}"`
+      `"${r.employeeId}","${r.employeeName}","${r.department}","${r.section}","${r.designation}","${r.grade}","${formatUniversalDate(r.joiningDate, 'yyyy-MM-dd')}","${r.experience || ''}",${r.basicSalary},${r.grossSalary},${r.employerSSF},${r.monthlyCTC},${r.annualCTC},"${r.employmentStatus}"`
     ).join('\n');
 
     const blob = new Blob([csvHeader + headers + csvBody], { type: 'text/csv;charset=utf-8;' });

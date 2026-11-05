@@ -27,6 +27,9 @@ import { AdminDashboard } from './pages/Admin';
 import { Login } from './pages/Login';
 import { SignUp } from './pages/SignUp';
 import { StoreProvider, useAppStore } from './store';
+import { ActionStatusProvider } from './context/ActionStatusContext';
+import { GlobalActionModal } from './components/GlobalActionModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { AlertCircle, X } from 'lucide-react';
 import { Toaster } from 'sonner';
 
@@ -112,27 +115,22 @@ function AppContent() {
         if (!quotaExceeded && isAdminUser && !alreadySynced) {
           const timeout = setTimeout(async () => {
             try {
-              const { db } = await import('./lib/firebase');
-              const { doc, setDoc, getDoc } = await import('firebase/firestore');
-              const userDoc = await getDoc(doc(db, 'users', u.uid));
-              
-              if (!userDoc.exists() || (userDoc.data()?.role !== 'Admin' && userDoc.data()?.role !== 'Editor')) {
-                await setDoc(doc(db, 'users', u.uid), {
-                  id: u.uid,
-                  username: u.displayName || u.email || 'Admin',
+              await fetch('/api/admin/create-user', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  uid: u.uid,
+                  email: u.email || 'admin@local',
+                  name: u.displayName || u.email || 'Admin',
                   role: isAdminUser ? 'Admin' : 'Editor'
-                }, { merge: true });
-                console.log("Verified and synced Editor permissions for owner.");
-              }
+                })
+              });
             } catch (e: any) {
-              console.warn("Minor: Admin role sync deferred (possibly quota):", e);
-              if (e?.code === 'resource-exhausted' || String(e).toLowerCase().includes('quota')) {
-                reportError(e);
-              }
+              console.warn("Admin role SQLite sync note:", e);
             } finally {
               sessionStorage.setItem(sessionKey, 'true');
             }
-          }, 3000); // Wait longer to allow other data to load first
+          }, 1000);
           return () => clearTimeout(timeout);
         }
       }
@@ -166,24 +164,25 @@ function AppContent() {
     <BrowserRouter>
       <Toaster position="top-right" richColors />
       <QuotaBanner />
+      <GlobalActionModal />
       <Routes>
         <Route path="/" element={<Layout />}>
-          <Route index element={<Dashboard />} />
-          <Route path="employees" element={<Employees />} />
-          <Route path="salary-analysis" element={<SalaryAnalysisPage />} />
-          <Route path="movement-attrition" element={<MovementAttritionPage />} />
-          <Route path="devices" element={<DeviceSetup />} />
-          <Route path="import" element={<Import />} />
-          <Route path="attendance" element={<Attendance />} />
-          <Route path="auditor" element={<AttendanceAuditor />} />
-          <Route path="overtime" element={<Overtime />} />
-          <Route path="audit-logs" element={<AuditLogs />} />
-          <Route path="sbl" element={<SBL />} />
-          <Route path="force-attendance" element={<ForceAttendance />} />
-          <Route path="payroll" element={<Payroll />} />
-          <Route path="reports" element={<Reports />} />
-          <Route path="settings" element={<SettingsPage />} />
-          {isAdmin && <Route path="admin" element={<AdminDashboard />} />}
+          <Route index element={<ErrorBoundary moduleName="Dashboard"><Dashboard /></ErrorBoundary>} />
+          <Route path="employees" element={<ErrorBoundary moduleName="Employee Directory"><Employees /></ErrorBoundary>} />
+          <Route path="salary-analysis" element={<ErrorBoundary moduleName="Salary Analysis"><SalaryAnalysisPage /></ErrorBoundary>} />
+          <Route path="movement-attrition" element={<ErrorBoundary moduleName="Movement & Attrition"><MovementAttritionPage /></ErrorBoundary>} />
+          <Route path="devices" element={<ErrorBoundary moduleName="Device Setup"><DeviceSetup /></ErrorBoundary>} />
+          <Route path="import" element={<ErrorBoundary moduleName="Punch Import"><Import /></ErrorBoundary>} />
+          <Route path="attendance" element={<ErrorBoundary moduleName="Attendance Logs"><Attendance /></ErrorBoundary>} />
+          <Route path="auditor" element={<ErrorBoundary moduleName="Attendance Auditor"><AttendanceAuditor /></ErrorBoundary>} />
+          <Route path="overtime" element={<ErrorBoundary moduleName="Overtime"><Overtime /></ErrorBoundary>} />
+          <Route path="audit-logs" element={<ErrorBoundary moduleName="Audit Logs"><AuditLogs /></ErrorBoundary>} />
+          <Route path="sbl" element={<ErrorBoundary moduleName="SBL Management"><SBL /></ErrorBoundary>} />
+          <Route path="force-attendance" element={<ErrorBoundary moduleName="Manual Corrections"><ForceAttendance /></ErrorBoundary>} />
+          <Route path="payroll" element={<ErrorBoundary moduleName="Payroll & Disburse"><Payroll /></ErrorBoundary>} />
+          <Route path="reports" element={<ErrorBoundary moduleName="Analytic Reports"><Reports /></ErrorBoundary>} />
+          <Route path="settings" element={<ErrorBoundary moduleName="Configuration"><SettingsPage /></ErrorBoundary>} />
+          {isAdmin && <Route path="admin" element={<ErrorBoundary moduleName="System Admin"><AdminDashboard /></ErrorBoundary>} />}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
@@ -194,7 +193,9 @@ function AppContent() {
 export default function App() {
   return (
     <StoreProvider>
-      <AppContent />
+      <ActionStatusProvider>
+        <AppContent />
+      </ActionStatusProvider>
     </StoreProvider>
   );
 }

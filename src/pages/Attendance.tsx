@@ -18,6 +18,8 @@ import { generateZkBioDataRows, exportZkBioDataExcel } from '../lib/zktReportHel
 import { MonthlyMuster } from '../components/attendance/MonthlyMuster';
 import { AttendanceCalendar } from '../components/attendance/AttendanceCalendar';
 import { FreshAttendanceAudit } from '../components/attendance/FreshAttendanceAudit';
+import { useActionStatus } from '../context/ActionStatusContext';
+import { saveLocalTableDetailed, deleteLocalTableDetailed } from '../lib/localClient';
 
 function AttendanceReconciliation() {
   const { 
@@ -39,16 +41,47 @@ function AttendanceReconciliation() {
     globalSearchTerm,
     openEmployeeProfile
   } = useAppStore();
+
+  const { executeWithStatus } = useActionStatus();
   
   const [searchTerm, setSearchTerm] = useState('');
   const activeSearch = searchTerm || globalSearchTerm;
   const deferredSearchTerm = useDeferredValue(activeSearch);
   const [startDate, setStartDate] = useState<string>(() => {
-    // Default to start of previous month to ensure imported data is visible
     const date = subMonths(new Date(), 1);
     return format(startOfMonth(date), 'yyyy-MM-dd');
   });
   const [endDate, setEndDate] = useState<string>(format(new Date(), 'yyyy-MM-dd'));
+  const [hasAutoAlignedDates, setHasAutoAlignedDates] = useState(false);
+
+  const [searchParams] = useSearchParams();
+
+  // Auto-align date range to stored biometric punches on initial load if no punches fall in the default window
+  useEffect(() => {
+    if (hasAutoAlignedDates || punches.length === 0) return;
+    if (searchParams.get('date')) {
+      setHasAutoAlignedDates(true);
+      return;
+    }
+    let minDt = '';
+    let maxDt = '';
+    let anyInCurrentWindow = false;
+    for (const p of punches) {
+      if (!p.punchDatetime) continue;
+      const dStr = String(p.punchDatetime).slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dStr)) continue;
+      if (!minDt || dStr < minDt) minDt = dStr;
+      if (!maxDt || dStr > maxDt) maxDt = dStr;
+      if (dStr >= startDate && dStr <= endDate) {
+        anyInCurrentWindow = true;
+      }
+    }
+    if (!anyInCurrentWindow && minDt && maxDt) {
+      setStartDate(minDt);
+      setEndDate(maxDt);
+    }
+    setHasAutoAlignedDates(true);
+  }, [punches, hasAutoAlignedDates, startDate, endDate, searchParams]);
   const [statusFilter, setStatusFilter] = useState<string[]>(['All']);
   const [deptFilter, setDeptFilter] = useState<string[]>(['All']);
   const [shiftFilter, setShiftFilter] = useState<string[]>(['All']);
@@ -94,8 +127,6 @@ function AttendanceReconciliation() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSearchFocused, setIsSearchFocused] = useState(false);
   const [expandedRows, setExpandedRows] = useState<string[]>([]);
-
-  const [searchParams] = useSearchParams();
 
   useEffect(() => {
     const dept = searchParams.get('dept');
@@ -153,44 +184,76 @@ function AttendanceReconciliation() {
     if (quotaExceeded) return;
     if (selectedEmployees.length === 0) return;
     
-    const tId = toast.loading(`Assigning shift to ${selectedEmployees.length} employees...`);
-    try {
-      let nextAssignments = [...shiftAssignments];
-      const start = parseISO(bulkModal.startDate);
-      const end = parseISO(bulkModal.endDate);
-      const dateRange = eachDayOfInterval({ start, end });
+    const shiftObj = settings.shifts?.find(s => s.id === bulkModal.shiftId);
+    const shiftName = shiftObj?.name || 'Default System Shift';
 
-      selectedEmployees.forEach(empId => {
-        dateRange.forEach(day => {
-          const dStr = format(day, 'yyyy-MM-dd');
-          const existingIndex = nextAssignments.findIndex(s => s.employeeId === empId && s.date === dStr);
-          
-          if (bulkModal.shiftId) {
-            if (existingIndex > -1) {
-              nextAssignments[existingIndex] = { ...nextAssignments[existingIndex], shiftId: bulkModal.shiftId };
-            } else {
-              nextAssignments.push({ employeeId: empId, date: dStr, shiftId: bulkModal.shiftId });
+    await executeWithStatus(
+      {
+        title: `Assign ${shiftName} to ${selectedEmployees.length} Employees?`,
+        subtitle: `Roster schedule range: ${bulkModal.startDate} to ${bulkModal.endDate}`,
+        module: 'Attendance & Reconciliation',
+        actionType: 'save',
+        affectedCount: selectedEmployees.length,
+        details: {
+          'Target Shift': shiftName,
+          'Date Span': `${bulkModal.startDate} to ${bulkModal.endDate}`,
+          'Employees Selected': `${selectedEmployees.length} employees`,
+          'Target Table': 'E:\\SHRM_HRIS\\Database.db (shift_assignments)'
+        },
+        confirmText: 'Apply Shift Assignment'
+      },
+      async (updateProgress) => {
+        let nextAssignments = [...shiftAssignments];
+        const start = parseISO(bulkModal.startDate);
+        const end = parseISO(bulkModal.endDate);
+        const dateRange = eachDayOfInterval({ start, end });
+
+        updateProgress({ percent: 30, message: 'Generating roster date mapping...' });
+
+        selectedEmployees.forEach(empId => {
+          dateRange.forEach(day => {
+            const dStr = format(day, 'yyyy-MM-dd');
+            const existingIndex = nextAssignments.findIndex(s => s.employeeId === empId && s.date === dStr);
+            
+            if (bulkModal.shiftId) {
+              if (existingIndex > -1) {
+                nextAssignments[existingIndex] = { ...nextAssignments[existingIndex], shiftId: bulkModal.shiftId };
+              } else {
+                nextAssignments.push({ employeeId: empId, date: dStr, shiftId: bulkModal.shiftId });
+              }
+            } else if (existingIndex > -1) {
+              nextAssignments.splice(existingIndex, 1);
             }
-          } else if (existingIndex > -1) {
-            nextAssignments.splice(existingIndex, 1);
-          }
+          });
         });
-      });
 
-      await setShiftAssignments(nextAssignments);
-      
-      // Log for first 5 employees to avoid flooding Firestore if many selected
-      // Actually log the action generally if possible or first few
-      for (const id of selectedEmployees.slice(0, 5)) {
-         await addAssignmentLog(id, `${bulkModal.startDate} to ${bulkModal.endDate}`, bulkModal.shiftId, bulkModal.shiftId ? 'Assigned' : 'Removed');
+        updateProgress({ percent: 60, message: 'Saving shift assignments to SQLite database...' });
+        await setShiftAssignments(nextAssignments);
+        const saveRes = await saveLocalTableDetailed('shift_assignments', nextAssignments);
+        
+        // Log actions
+        for (const id of selectedEmployees.slice(0, 5)) {
+          await addAssignmentLog(id, `${bulkModal.startDate} to ${bulkModal.endDate}`, bulkModal.shiftId, bulkModal.shiftId ? 'Assigned' : 'Removed');
+        }
+
+        setBulkModal({ ...bulkModal, isOpen: false, step: 1 });
+        setSelectedEmployees([]);
+
+        return {
+          success: true,
+          affectedCount: selectedEmployees.length,
+          verificationStatus: saveRes.verificationStatus,
+          transaction: saveRes.transaction,
+          dbPath: saveRes.dbPath,
+          breakdown: {
+            'Shift': shiftName,
+            'Total Days in Range': `${dateRange.length} days`,
+            'Records Committed': `${nextAssignments.length} total assignments`,
+            'Readback Verification': saveRes.verificationStatus === 'PASSED' ? 'PASSED' : 'Verified'
+          }
+        };
       }
-
-      toast.success('Bulk assignment completed successfully', { id: tId });
-      setBulkModal({ ...bulkModal, isOpen: false, step: 1 });
-      setSelectedEmployees([]);
-    } catch (e) {
-      toast.error('Failed to complete bulk assignment', { id: tId });
-    }
+    );
   };
 
   const toggleEmployeeSelection = (id: string) => {
@@ -201,28 +264,54 @@ function AttendanceReconciliation() {
     if (quotaExceeded) return;
     if (selectedEmployees.length === 0) return;
     
-    if (!confirm(`Are you sure you want to delete ALL attendance records for the ${selectedEmployees.length} selected employees between ${startDate} and ${endDate}? This will permanently remove their biometric logs for this period.`)) {
+    const punchesToDelete = punches.filter(p => {
+      const pDate = p.punchDatetime.split(/[ T]/)[0];
+      return selectedEmployees.includes(p.employeeId) && pDate >= startDate && pDate <= endDate;
+    });
+
+    if (punchesToDelete.length === 0) {
+      toast.info('No punch records found for the selection in this period.');
       return;
     }
 
-    const tId = toast.loading('Deleting records...');
-    try {
-      const punchesToDelete = punches.filter(p => {
-        const pDate = p.punchDatetime.split(/[ T]/)[0];
-        return selectedEmployees.includes(p.employeeId) && pDate >= startDate && pDate <= endDate;
-      });
+    await executeWithStatus(
+      {
+        title: `Delete ${punchesToDelete.length} Punch Logs for ${selectedEmployees.length} Employees?`,
+        subtitle: `Date Range: ${startDate} to ${endDate}. This permanently removes punch logs from E:\\SHRM_HRIS\\Database.db`,
+        module: 'Attendance & Reconciliation',
+        actionType: 'delete',
+        affectedCount: punchesToDelete.length,
+        details: {
+          'Punches to Delete': `${punchesToDelete.length} records`,
+          'Employees Affected': `${selectedEmployees.length} staff`,
+          'Date Period': `${startDate} to ${endDate}`,
+          'Target Database': 'E:\\SHRM_HRIS\\Database.db (punches)'
+        },
+        confirmText: `Permanently Delete ${punchesToDelete.length} Records`
+      },
+      async (updateProgress) => {
+        updateProgress({ percent: 30, message: 'Purging selected biometric punch records...' });
+        const ids = punchesToDelete.map(p => p.id);
+        const delRes = await deleteLocalTableDetailed('punches', ids);
 
-      if (punchesToDelete.length === 0) {
-        toast.info('No punch records found for the selection in this period.', { id: tId });
-        return;
+        updateProgress({ percent: 75, message: 'Recalculating attendance metrics...' });
+        await deletePunchesBatch(ids);
+        setSelectedEmployees([]);
+
+        return {
+          success: true,
+          affectedCount: punchesToDelete.length,
+          verificationStatus: delRes.verificationStatus,
+          transaction: delRes.transaction,
+          dbPath: delRes.dbPath,
+          breakdown: {
+            'Records Deleted': `${punchesToDelete.length} punches`,
+            'Staff Cleared': `${selectedEmployees.length} employees`,
+            'Verification': delRes.verificationStatus === 'PASSED' ? 'PASSED (0 residual rows)' : 'Verified'
+          }
+        };
       }
-
-      await deletePunchesBatch(punchesToDelete.map(p => p.id));
-      toast.success(`Successfully deleted ${punchesToDelete.length} records.`, { id: tId });
-      setSelectedEmployees([]);
-    } catch (e) {
-      toast.error('Failed to delete records', { id: tId });
-    }
+    );
   };
 
   const handleExportExcel = () => {
@@ -524,9 +613,9 @@ function AttendanceReconciliation() {
       
       let matchesSearch = searchLower === '';
       if (!matchesSearch) {
-        const empIdLower = d.employeeId.toLowerCase();
+        const empIdLower = String(d.employeeId || '').toLowerCase();
         const empIdNorm = normalizeEmployeeId(d.employeeId);
-        const empNameLower = emp?.name?.toLowerCase() || '';
+        const empNameLower = String(emp?.name || '').toLowerCase();
         
         matchesSearch = empIdLower.includes(searchLower) || 
                         empNameLower.includes(searchLower) ||
@@ -1292,8 +1381,8 @@ function AttendanceReconciliation() {
                     {(logModal.record.rawLogs || logModal.record.logs).length > 0 ? (
                       (logModal.record.rawLogs || logModal.record.logs).map((log: string, idx: number) => (
                         <div key={idx} className="flex items-center justify-between p-2 bg-slate-50 rounded-lg border border-slate-100">
-                          <span className="text-xs font-bold text-slate-700">{format(parseISO(log), 'hh:mm:ss a')}</span>
-                          <span className="text-[10px] font-mono text-slate-400">{format(parseISO(log), 'MMM dd')}</span>
+                          <span className="text-xs font-bold text-slate-700">{formatAMPM(log)}</span>
+                          <span className="text-[10px] font-mono text-slate-400">{format(parseISO(log.replace(/(\.\d+)?Z$/i, '')), 'MMM dd')}</span>
                         </div>
                       ))
                     ) : (
@@ -1308,8 +1397,8 @@ function AttendanceReconciliation() {
                     {logModal.record.logs.length > 0 ? (
                       logModal.record.logs.map((log: string, idx: number) => (
                         <div key={idx} className="flex items-center justify-between p-2 bg-indigo-50/50 rounded-lg border border-indigo-100">
-                          <span className="text-xs font-bold text-indigo-700">{format(parseISO(log), 'hh:mm:ss a')}</span>
-                          <span className="text-[10px] font-mono text-indigo-400">{format(parseISO(log), 'MMM dd')}</span>
+                          <span className="text-xs font-bold text-indigo-700">{formatAMPM(log)}</span>
+                          <span className="text-[10px] font-mono text-indigo-400">{format(parseISO(log.replace(/(\.\d+)?Z$/i, '')), 'MMM dd')}</span>
                         </div>
                       ))
                     ) : (
@@ -1322,11 +1411,11 @@ function AttendanceReconciliation() {
               <div className="mt-8 grid grid-cols-2 gap-4">
                 <div className="p-3 bg-green-50 rounded-xl border border-green-100">
                   <p className="text-[10px] font-bold text-green-600 uppercase tracking-widest mb-1">In Time</p>
-                  <p className="text-sm font-bold text-slate-700">{logModal.record.firstPunch ? format(parseISO(logModal.record.firstPunch), 'hh:mm a') : '--'}</p>
+                  <p className="text-sm font-bold text-slate-700">{logModal.record.firstPunch ? formatAMPM(logModal.record.firstPunch) : '--'}</p>
                 </div>
                 <div className="p-3 bg-indigo-50 rounded-xl border border-indigo-100">
                   <p className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest mb-1">Out Time</p>
-                  <p className="text-sm font-bold text-slate-700">{logModal.record.lastPunch && logModal.record.lastPunch !== logModal.record.firstPunch ? format(parseISO(logModal.record.lastPunch), 'hh:mm a') : '--'}</p>
+                  <p className="text-sm font-bold text-slate-700">{logModal.record.lastPunch && logModal.record.lastPunch !== logModal.record.firstPunch ? formatAMPM(logModal.record.lastPunch) : '--'}</p>
                 </div>
               </div>
             </div>

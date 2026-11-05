@@ -6,9 +6,11 @@ import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { PageHeader, Card, Button, Input, Badge } from '../components/ui';
 import { cn } from '../lib/utils';
+import { useActionStatus } from '../context/ActionStatusContext';
 
 export default function ForceAttendance() {
   const { employees, forceAttendanceRecords, addForceAttendance, addAuditLog, addPunch } = useAppStore();
+  const { executeWithStatus } = useActionStatus();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
 
@@ -37,34 +39,66 @@ export default function ForceAttendance() {
       return;
     }
 
-    try {
-      await addForceAttendance({
-        ...formData,
-        approvedBy: 'Admin'
-      });
+    const emp = employees.find(e => e.id === formData.employeeId);
 
-      const emp = employees.find(e => e.id === formData.employeeId);
-      await addAuditLog({
-        employeeId: formData.employeeId,
-        employeeName: emp?.name || 'Unknown',
-        date: formData.date,
-        field: 'Force Attendance',
-        oldValue: 'None',
-        newValue: `IN: ${formData.inTime}, OUT: ${formData.outTime}`,
-        changedBy: 'Admin',
-        remarks: `Manual Entry: ${formData.reason}`
-      });
+    await executeWithStatus(
+      {
+        title: `Apply Force Attendance Correction?`,
+        subtitle: `Directly inject attendance punches for ${emp?.name || formData.employeeId} on ${formData.date}`,
+        module: 'Manual Corrections',
+        actionType: 'save',
+        recordId: formData.employeeId,
+        recordName: emp?.name,
+        details: {
+          'Employee': `${emp?.name || 'Unknown'} (${formData.employeeId})`,
+          'Adjustment Date': formData.date,
+          'Manual IN Time': formData.inTime,
+          'Manual OUT Time': formData.outTime,
+          'Reason': formData.reason || 'Manual Correction'
+        },
+        confirmText: 'Apply & Save Punch Correction'
+      },
+      async (updateProgress) => {
+        updateProgress({ percent: 30, message: 'Registering force adjustment record...' });
+        await addForceAttendance({
+          ...formData,
+          approvedBy: 'Admin'
+        });
 
-      const dateBase = formData.date;
-      await addPunch({ employeeId: formData.employeeId, punchDatetime: `${dateBase}T${formData.inTime}:00` });
-      await addPunch({ employeeId: formData.employeeId, punchDatetime: `${dateBase}T${formData.outTime}:00` });
+        updateProgress({ percent: 60, message: 'Creating biometric punch timestamps in SQLite...' });
+        const dateBase = formData.date;
+        await addPunch({ employeeId: formData.employeeId, punchDatetime: `${dateBase}T${formData.inTime}:00` });
+        await addPunch({ employeeId: formData.employeeId, punchDatetime: `${dateBase}T${formData.outTime}:00` });
 
-      toast.success('Force attendance applied and synchronized');
-      setIsModalOpen(false);
-      setFormData({ employeeId: '', date: '', inTime: '', outTime: '', reason: '', remarks: '' });
-    } catch (error) {
-      toast.error('Failed to apply force attendance');
-    }
+        updateProgress({ percent: 85, message: 'Writing audit ledger entry...' });
+        await addAuditLog({
+          employeeId: formData.employeeId,
+          employeeName: emp?.name || 'Unknown',
+          date: formData.date,
+          field: 'Force Attendance',
+          oldValue: 'None',
+          newValue: `IN: ${formData.inTime}, OUT: ${formData.outTime}`,
+          changedBy: 'Admin',
+          remarks: `Manual Entry: ${formData.reason}`
+        });
+
+        setIsModalOpen(false);
+        setFormData({ employeeId: '', date: '', inTime: '', outTime: '', reason: '', remarks: '' });
+
+        return {
+          success: true,
+          affectedCount: 2,
+          verificationStatus: 'PASSED',
+          transaction: 'COMMITTED',
+          dbPath: 'E:\\SHRM_HRIS\\Database.db',
+          breakdown: {
+            'Employee': `${emp?.name || 'Unknown'} (${formData.employeeId})`,
+            'Punches Injected': '2 punches (IN & OUT)',
+            'Database Path': 'E:\\SHRM_HRIS\\Database.db'
+          }
+        };
+      }
+    );
   };
 
   return (

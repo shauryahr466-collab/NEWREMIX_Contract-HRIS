@@ -32,6 +32,9 @@ export interface SalaryStructureRow {
   designation: string;
   grade: string;
   joiningDate: string;
+  joiningDateBS?: string;
+  experienceYears: number;
+  experience: string;
   basicSalary: number;
   dearnessAllowance: number;
   otherAllowance: number;

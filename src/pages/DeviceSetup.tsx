@@ -39,6 +39,7 @@ export const DeviceSetup: React.FC = () => {
     zkSyncLogs, 
     zkUnmappedPunches,
     employees,
+    punches,
     addZkDevice,
     updateZkDevice,
     deleteZkDevice,
@@ -52,6 +53,7 @@ export const DeviceSetup: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<'devices' | 'mapping' | 'unmapped' | 'history' | 'connector' | 'usb_dat'>('devices');
   const [searchTerm, setSearchTerm] = useState('');
+  const [selectedDatDeviceId, setSelectedDatDeviceId] = useState<string>('');
   
   // Modal States
   const [isDeviceModalOpen, setIsDeviceModalOpen] = useState(false);
@@ -81,24 +83,24 @@ export const DeviceSetup: React.FC = () => {
   const [isProcessingDat, setIsProcessingDat] = useState(false);
   const [showZkTimeGuideModal, setShowZkTimeGuideModal] = useState(false);
 
-  // Helper to parse ZK date/time string variants safely
+  // Helper to parse ZK date/time string variants safely (Exact DIA Local Hardware Time — NO UTC/ISO timezone shift!)
   const parseZkDateTime = (dateStr: string, timeStr?: string): string | null => {
     if (!dateStr) return null;
     const cleanD = dateStr.trim().replace(/^"|"$/g, '');
     const cleanT = (timeStr || '').trim().replace(/^"|"$/g, '') || '00:00:00';
+    const pad = (n: number) => String(n).padStart(2, '0');
 
     // 1. Try ISO / YYYY-MM-DD or YYYY/MM/DD or YYYY.MM.DD
     const ymdMatch = cleanD.match(/^(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})$/);
     if (ymdMatch) {
       const yr = parseInt(ymdMatch[1], 10);
-      const mo = parseInt(ymdMatch[2], 10) - 1;
+      const mo = parseInt(ymdMatch[2], 10);
       const dy = parseInt(ymdMatch[3], 10);
       const tParts = cleanT.split(':');
       const hr = parseInt(tParts[0] || '0', 10);
       const mn = parseInt(tParts[1] || '0', 10);
       const sc = parseInt(tParts[2] || '0', 10);
-      const d = new Date(yr, mo, dy, hr, mn, sc);
-      return isNaN(d.getTime()) ? null : d.toISOString();
+      return `${yr}-${pad(mo)}-${pad(dy)}T${pad(hr)}:${pad(mn)}:${pad(sc)}`;
     }
 
     // 2. Try DD/MM/YYYY or MM/DD/YYYY
@@ -108,27 +110,27 @@ export const DeviceSetup: React.FC = () => {
       const p2 = parseInt(dmyMatch[2], 10);
       const yr = parseInt(dmyMatch[3], 10);
       let dy = p1;
-      let mo = p2 - 1;
+      let mo = p2;
       if (p1 > 12) {
         dy = p1;
-        mo = p2 - 1;
+        mo = p2;
       } else if (p2 > 12) {
-        mo = p1 - 1;
+        mo = p1;
         dy = p2;
       }
       const tParts = cleanT.split(':');
       const hr = parseInt(tParts[0] || '0', 10);
       const mn = parseInt(tParts[1] || '0', 10);
       const sc = parseInt(tParts[2] || '0', 10);
-      const d = new Date(yr, mo, dy, hr, mn, sc);
-      return isNaN(d.getTime()) ? null : d.toISOString();
+      return `${yr}-${pad(mo)}-${pad(dy)}T${pad(hr)}:${pad(mn)}:${pad(sc)}`;
     }
 
-    // 3. Fallback to JS Date constructor
+    // 3. Fallback to JS Date local components (never .toISOString() which shifts by UTC offset)
     try {
       const full = `${cleanD} ${cleanT}`;
       const d = new Date(full);
-      return isNaN(d.getTime()) ? null : d.toISOString();
+      if (isNaN(d.getTime())) return null;
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     } catch {
       return null;
     }
@@ -197,26 +199,91 @@ export const DeviceSetup: React.FC = () => {
         return;
       }
 
-      // Sync via API
-      const defaultDev = zkDevices[0] || { id: 'dev_usb', name: 'ZKTime 5.0 Import', ip: 'USB/File' };
-      const res = await fetch('/api/zk/agent/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceId: defaultDev.id,
-          deviceName: defaultDev.name,
-          deviceIP: defaultDev.ip,
-          logCount: punches.length,
-          punches
-        })
+      // Filter to ONLY Active Employees in Directory and their active dates
+      const activeEmps = employees.filter(emp => !emp.status || emp.status.toLowerCase() === 'active');
+      const activeEmpIds = new Set(activeEmps.map(e => String(e.id).trim()));
+      const activeEmpNormMap = new Map<string, string>();
+      const activeEmpJoiningDate = new Map<string, string>();
+
+      activeEmps.forEach(emp => {
+        const eid = String(emp.id).trim();
+        activeEmpNormMap.set(eid, eid);
+        activeEmpNormMap.set(eid.toLowerCase(), eid);
+        const norm = eid.replace(/[^0-9]/g, '').replace(/^0+/, '');
+        if (norm) {
+          activeEmpNormMap.set(norm, eid);
+          activeEmpNormMap.set(`EMP${norm}`, eid);
+          activeEmpNormMap.set(`EMP-${norm}`, eid);
+          activeEmpNormMap.set(`EMP${norm.padStart(3, '0')}`, eid);
+          activeEmpNormMap.set(`EMP-${norm.padStart(3, '0')}`, eid);
+        }
+        if (emp.joiningDate) {
+          activeEmpJoiningDate.set(eid, String(emp.joiningDate).slice(0, 10));
+        }
       });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        toast.success(`Successfully imported ${data.newRecords} new attendance records from "${file.name}" (${data.duplicates} existing duplicates)`, { id: tId });
-      } else {
-        toast.error(`Import failed: ${data.error || 'Invalid file structure'}`, { id: tId });
+      zkUserMappings.forEach(m => {
+        if (m.deviceUserId && m.employeeId && activeEmpIds.has(String(m.employeeId).trim())) {
+          const raw = String(m.deviceUserId).trim();
+          const eid = String(m.employeeId).trim();
+          activeEmpNormMap.set(raw, eid);
+          const norm = raw.replace(/[^0-9]/g, '').replace(/^0+/, '');
+          if (norm) activeEmpNormMap.set(norm, eid);
+        }
+      });
+
+      const distinctMatchedUsers = new Set<string>();
+      const activeFilteredPunches = punches.filter(p => {
+        if (activeEmpIds.size === 0) return true;
+        const uid = String(p.deviceUserId || '').trim();
+        const norm = uid.replace(/[^0-9]/g, '').replace(/^0+/, '') || uid;
+        const matchedEid = activeEmpNormMap.get(uid) || activeEmpNormMap.get(norm) || activeEmpNormMap.get(uid.toLowerCase());
+        if (!matchedEid || !activeEmpIds.has(matchedEid)) return false;
+
+        const jDate = activeEmpJoiningDate.get(matchedEid);
+        const pDate = String(p.punchDateTime || '').slice(0, 10);
+        if (jDate && /^\d{4}-\d{2}-\d{2}$/.test(jDate) && /^\d{4}-\d{2}-\d{2}$/.test(pDate) && pDate < jDate) {
+          return false;
+        }
+        distinctMatchedUsers.add(matchedEid);
+        return true;
+      });
+
+      if (activeFilteredPunches.length === 0) {
+        toast.error('No punches matched Active Employees in the Employee Directory.', { id: tId });
+        return;
       }
+
+      // Sync ALL active employee punches in batches to the selected target device so userCount & logCount match 100%
+      const targetDev = zkDevices.find(d => d.id === selectedDatDeviceId) || zkDevices[0] || { id: 'dev_usb', name: 'ZKTime 5.0 Import', ip: 'USB/File' };
+      const BATCH_SIZE = 5000;
+      let totalNew = 0;
+      let totalDuplicates = 0;
+
+      for (let i = 0; i < activeFilteredPunches.length; i += BATCH_SIZE) {
+        const batch = activeFilteredPunches.slice(i, i + BATCH_SIZE);
+        const res = await fetch('/api/zk/agent/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceId: targetDev.id,
+            deviceName: targetDev.name,
+            deviceIP: targetDev.ip,
+            userCount: distinctMatchedUsers.size,
+            logCount: activeFilteredPunches.length,
+            punches: batch,
+            autoFetch: false
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.success) {
+          totalNew += Number(data.newRecords || 0);
+          totalDuplicates += Number(data.duplicates || 0);
+        }
+      }
+
+      toast.success(`Synced ${activeFilteredPunches.length} logs across ${distinctMatchedUsers.size} Active Employees to "${targetDev.name}": ${totalNew} new stored, ${totalDuplicates} duplicates skipped!`, { id: tId });
     } catch (err: any) {
       toast.error(`Failed to read file: ${err.message}`, { id: tId });
     } finally {
@@ -227,64 +294,61 @@ export const DeviceSetup: React.FC = () => {
 
   // Helper to construct the JS connector agent content
   const getAgentJsScript = () => {
-    let origin = window.location.origin;
-    if (origin.includes('ais-dev-')) {
-      origin = origin.replace('ais-dev-', 'ais-pre-');
-    }
+    const currentOrigin = window.location.origin;
 
     const activeDevs = (zkDevices && zkDevices.length > 0) ? zkDevices : [
-      { id: 'dev_factory_192_168_117_201', name: 'Factory Device', ip: '192.168.117.201', port: 4370 },
-      { id: 'dev_main_192_168_117_200', name: 'Main Device', ip: '192.168.117.200', port: 4370 }
+      { id: 'dev_time_office_1', name: 'Time Office 1', ip: '192.168.117.201', port: 4370 },
+      { id: 'dev_time_office_2', name: 'Time Office 2', ip: '192.168.117.200', port: 4370 },
+      { id: 'dev_ists_office', name: 'ISTS Office', ip: '192.168.13.103', port: 4370 }
     ];
 
-    return `// zk-lan-connector.js - ZKTeco LAN & Local PC Disk (E:) Database Agent
-// Run this script on your local Windows PC or Server inside your device LAN!
-// Requirements: Node.js (v16+) -> npm install firebase node-zklib axios
+    // Embed current Active Employees from Directory & Mappings so the PC Agent knows all active employees immediately
+    const activeDirectoryEmployees = employees
+      .filter(e => !e.status || e.status.toLowerCase() === 'active')
+      .map(e => ({
+        id: String(e.id).trim(),
+        name: e.name,
+        joiningDate: e.joiningDate ? String(e.joiningDate).slice(0, 10) : ''
+      }));
+
+    const directoryMappings = zkUserMappings.map(m => ({
+      deviceUserId: String(m.deviceUserId).trim(),
+      employeeId: String(m.employeeId).trim()
+    }));
+
+    return `// zk-lan-connector.js - ZKTeco LAN & Local PC Disk (E:\\SHRM_HRIS\\Database.db) Direct SQLite Engine
+// Run this script on your Windows PC inside your ZKTeco device LAN!
+// Requirements: Node.js (v16+) -> npm install sql.js node-zklib axios
 
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const axios = require('axios');
-let ZKLib;
-try { ZKLib = require('node-zklib'); } catch (e) { ZKLib = null; }
+let ZKLib = null;
+try { ZKLib = require('node-zklib'); } catch (e) {}
+let initSqlJs = null;
+try { initSqlJs = require('sql.js'); } catch (e) {}
 
-// Firebase Cloud Firestore Direct Connector
-let initializeApp, getFirestore, doc, setDoc, writeBatch, getDocs, collection;
-let db = null;
-try {
-  const fbApp = require('firebase/app');
-  const fbStore = require('firebase/firestore');
-  initializeApp = fbApp.initializeApp;
-  getFirestore = fbStore.getFirestore;
-  doc = fbStore.doc;
-  setDoc = fbStore.setDoc;
-  writeBatch = fbStore.writeBatch;
-  getDocs = fbStore.getDocs;
-  collection = fbStore.collection;
+const SQLITE_DB_DIR = 'E:\\\\SHRM_HRIS';
+const SQLITE_DB_PATH = 'E:\\\\SHRM_HRIS\\\\Database.db';
+const LOCAL_BRIDGE_PORT = 4375;
 
-  const firebaseConfig = {
-    projectId: "infra-snowfall-cq7jp",
-    appId: "1:357458622366:web:6a0769f6e8e4606871c88f",
-    apiKey: "AIzaSyDuwenK4Iez6c1qYTFKUGxzlK81fdiRZIs",
-    authDomain: "infra-snowfall-cq7jp.firebaseapp.com",
-    firestoreDatabaseId: "ai-studio-remixattendancem-0b3005dc-f604-446b-b1ea-1badf613271a"
-  };
-
-  const app = initializeApp(firebaseConfig);
-  db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-  console.log(" -> [OK] Cloud Firestore Direct Connection initialized.");
-} catch (fbInitErr) {
-  console.log(" -> [NOTE] Firestore direct SDK load note: " + fbInitErr.message);
-}
+const API_CANDIDATES = [
+  'http://127.0.0.1:3000/api/zk/agent/sync',
+  'http://localhost:3000/api/zk/agent/sync',
+  '${currentOrigin}/api/zk/agent/sync'
+];
 
 const DEVICES = ${JSON.stringify(activeDevs.map(d => ({ id: d.id, name: d.name, ip: d.ip, port: d.port || 4370 })), null, 2)};
 
-// Common ZKTime 5.0 / BioTime Database & Log File Paths on Local PC (Disk E: & C:)
+const INITIAL_ACTIVE_EMPLOYEES = ${JSON.stringify(activeDirectoryEmployees)};
+const INITIAL_USER_MAPPINGS = ${JSON.stringify(directoryMappings)};
+
 const LOCAL_DB_PATHS = [
   'E:\\\\att2000.mdb',
   'E:\\\\ZKTime5.0\\\\att2000.mdb',
   'E:\\\\ZKTime\\\\att2000.mdb',
   'E:\\\\BioTime\\\\att2000.mdb',
-  'E:\\\\zktime.db',
   'E:\\\\att_logs.dat',
   'E:\\\\1_attlog.dat',
   'E:\\\\attlog.txt',
@@ -294,163 +358,431 @@ const LOCAL_DB_PATHS = [
 ];
 
 console.log("==========================================================");
-console.log(" ZKTeco LAN & Local PC Disk (E:) Direct Cloud Sync Agent");
-console.log(" Cloud Firestore Database ID: ai-studio-remixattendancem-0b30...");
-console.log(" Monitored LAN Devices: " + DEVICES.length);
-console.log(" Monitored Local PC Paths: " + LOCAL_DB_PATHS.length);
+console.log(" ZKTeco LAN & Local PC Disk (E:) Direct SQLite Sync Agent");
+console.log(" Primary SQLite Database : " + SQLITE_DB_PATH);
+console.log(" Local Browser Bridge    : http://127.0.0.1:" + LOCAL_BRIDGE_PORT);
+console.log(" Active Employees Filter : ENABLED (Only Active Directory Employees)");
+console.log(" Duplicate Protection    : ENABLED (Skip Already Fetched Data)");
+console.log(" Monitored LAN Devices   : " + DEVICES.length);
 console.log("==========================================================\\n");
 
-async function pushPunchesDirectToCloud(devId, devName, devIP, punches) {
+// In-memory queue of ALL active-employee punches for the Browser Bridge (http://127.0.0.1:4375)
+const bridgeQueueByDevice = new Map();
+
+// Persistent local cache of already-fetched punch keys so 2nd time downloads NEVER re-fetch or duplicate
+let SYNCED_CACHE = new Set();
+const CACHE_FILE = path.join(process.cwd(), 'synced_punches.json');
+try {
+  if (fs.existsSync(CACHE_FILE)) {
+    const arr = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    if (Array.isArray(arr)) SYNCED_CACHE = new Set(arr);
+  }
+} catch (e) {}
+
+function saveSyncedCache() {
+  try {
+    const arr = Array.from(SYNCED_CACHE);
+    const trimmed = arr.length > 300000 ? arr.slice(arr.length - 300000) : arr;
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(trimmed));
+  } catch (e) {}
+}
+
+// 1. Direct Physical SQLite Writer to E:\\SHRM_HRIS\\Database.db (Active Employees Only + Zero Duplicates)
+async function writePunchesDirectToDiskSqlite(devId, devName, devIP, punches) {
+  if (!initSqlJs || !punches || punches.length === 0) {
+    return { newRecords: 0, duplicates: 0, skippedInactive: 0, newPunchesOnly: [], savedToDisk: false };
+  }
+
+  try {
+    if (!fs.existsSync(SQLITE_DB_DIR)) {
+      fs.mkdirSync(SQLITE_DB_DIR, { recursive: true });
+    }
+
+    const SQL = await initSqlJs();
+    let db;
+    if (fs.existsSync(SQLITE_DB_PATH)) {
+      const fileBuf = fs.readFileSync(SQLITE_DB_PATH);
+      db = new SQL.Database(fileBuf);
+    } else {
+      db = new SQL.Database();
+    }
+
+    db.run(\`
+      CREATE TABLE IF NOT EXISTS attendance_punches (
+        id TEXT PRIMARY KEY,
+        employee_id TEXT NOT NULL DEFAULT '',
+        punch_datetime TEXT NOT NULL DEFAULT '',
+        device_id TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        data TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS zk_devices (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS zk_user_mappings (
+        id TEXT PRIMARY KEY,
+        device_user_id TEXT NOT NULL DEFAULT '',
+        employee_id TEXT NOT NULL DEFAULT '',
+        data TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE TABLE IF NOT EXISTS zk_sync_logs (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS employees (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT 'Unnamed',
+        department TEXT DEFAULT '',
+        designation TEXT DEFAULT '',
+        shift_id TEXT DEFAULT '',
+        joining_date TEXT DEFAULT '',
+        status TEXT DEFAULT 'Active',
+        data TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT
+      );
+    \`);
+
+    // Load Active Employees from SQLite + embedded directory snapshot
+    const activeEmpIds = new Set();
+    const empNormMap = new Map();
+    const empJoiningDateMap = new Map();
+
+    for (const emp of INITIAL_ACTIVE_EMPLOYEES) {
+      if (!emp || !emp.id) continue;
+      const eid = String(emp.id).trim();
+      activeEmpIds.add(eid);
+      if (emp.joiningDate) empJoiningDateMap.set(eid, String(emp.joiningDate).slice(0, 10));
+      empNormMap.set(eid, eid);
+      empNormMap.set(eid.toLowerCase(), eid);
+      const norm = eid.replace(/[^0-9]/g, '').replace(/^0+/, '');
+      if (norm) {
+        empNormMap.set(norm, eid);
+        empNormMap.set('EMP' + norm, eid);
+        empNormMap.set('EMP-' + norm, eid);
+        empNormMap.set('EMP' + norm.padStart(3, '0'), eid);
+        empNormMap.set('EMP-' + norm.padStart(3, '0'), eid);
+      }
+    }
+
+    try {
+      const empRes = db.exec("SELECT id, status, joining_date, data FROM employees");
+      if (empRes.length > 0) {
+        for (const r of empRes[0].values) {
+          const eid = String(r[0] || '').trim();
+          let status = String(r[1] || 'Active').trim();
+          let jDate = String(r[2] || '').trim();
+          if (r[3]) {
+            try {
+              const ed = JSON.parse(String(r[3]));
+              if (ed.status) status = String(ed.status).trim();
+              if (ed.joiningDate) jDate = String(ed.joiningDate).trim();
+            } catch (e) {}
+          }
+          if (!eid) continue;
+          if (status.toLowerCase() !== 'active') {
+            activeEmpIds.delete(eid);
+            continue;
+          }
+          activeEmpIds.add(eid);
+          if (jDate) empJoiningDateMap.set(eid, jDate.slice(0, 10));
+          empNormMap.set(eid, eid);
+          empNormMap.set(eid.toLowerCase(), eid);
+          const norm = eid.replace(/[^0-9]/g, '').replace(/^0+/, '');
+          if (norm) {
+            empNormMap.set(norm, eid);
+            empNormMap.set('EMP' + norm, eid);
+            empNormMap.set('EMP-' + norm, eid);
+            empNormMap.set('EMP' + norm.padStart(3, '0'), eid);
+            empNormMap.set('EMP-' + norm.padStart(3, '0'), eid);
+          }
+        }
+      }
+    } catch (e) {}
+
+    // Load user mappings & filter to Active Employees only
+    const userMap = new Map();
+    for (const m of INITIAL_USER_MAPPINGS) {
+      if (m.deviceUserId && m.employeeId && (activeEmpIds.size === 0 || activeEmpIds.has(m.employeeId))) {
+        userMap.set(String(m.deviceUserId).trim(), String(m.employeeId).trim());
+        const norm = String(m.deviceUserId).replace(/[^0-9]/g, '').replace(/^0+/, '');
+        if (norm) userMap.set(norm, String(m.employeeId).trim());
+      }
+    }
+    try {
+      const mRes = db.exec("SELECT device_user_id, employee_id FROM zk_user_mappings");
+      if (mRes.length > 0) {
+        for (const r of mRes[0].values) {
+          const dUid = String(r[0] || '').trim();
+          const eId = String(r[1] || '').trim();
+          if (dUid && eId && (activeEmpIds.size === 0 || activeEmpIds.has(eId))) {
+            userMap.set(dUid, eId);
+            const norm = dUid.replace(/[^0-9]/g, '').replace(/^0+/, '');
+            if (norm) userMap.set(norm, eId);
+          }
+        }
+      }
+    } catch (e) {}
+
+    // Load existing punch IDs & (employee_id + punch_datetime) from SQLite to strictly prevent duplicate storage on 2nd download
+    const existingIds = new Set();
+    const existingEmpTimeKeys = new Set();
+    try {
+      const pRes = db.exec("SELECT id, employee_id, punch_datetime FROM attendance_punches");
+      if (pRes.length > 0) {
+        for (const r of pRes[0].values) {
+          const pid = String(r[0] || '');
+          const eid = String(r[1] || '');
+          const pdt = String(r[2] || '').replace(' ', 'T');
+          if (pid) existingIds.add(pid);
+          if (eid && pdt) {
+            existingEmpTimeKeys.add(eid + '_' + pdt);
+            existingEmpTimeKeys.add(eid + '_' + pdt.slice(0, 19));
+          }
+        }
+      }
+    } catch (e) {}
+
+    const now = new Date().toISOString();
+    let newRecords = 0;
+    let duplicates = 0;
+    let skippedInactive = 0;
+    const newPunchesOnly = [];
+
+    db.run("BEGIN TRANSACTION");
+    // INSERT OR IGNORE ensures already-fetched punches are NEVER overwritten or duplicated
+    const stmt = db.prepare(\`
+      INSERT OR IGNORE INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    \`);
+
+    for (const p of punches) {
+      const uid = String(p.deviceUserId || '').trim();
+      const punchDateTime = String(p.punchDateTime || '').replace(' ', 'T');
+      if (!uid || !punchDateTime) continue;
+
+      const normUid = uid.replace(/[^0-9]/g, '').replace(/^0+/, '') || uid;
+      const matchedEmpId = userMap.get(uid) || userMap.get(normUid) || empNormMap.get(uid) || empNormMap.get(normUid) || empNormMap.get(uid.toLowerCase());
+
+      // ONLY FETCH & STORE PUNCHES FOR ACTIVE EMPLOYEES IN DIRECTORY
+      if (!matchedEmpId || (activeEmpIds.size > 0 && !activeEmpIds.has(matchedEmpId))) {
+        skippedInactive++;
+        continue;
+      }
+
+      // Check active employee joining date (only fetch dates where employee is active)
+      const jDate = empJoiningDateMap.get(matchedEmpId);
+      const pDateOnly = punchDateTime.slice(0, 10);
+      if (jDate && /^\\d{4}-\\d{2}-\\d{2}$/.test(jDate) && /^\\d{4}-\\d{2}-\\d{2}$/.test(pDateOnly) && pDateOnly < jDate) {
+        skippedInactive++;
+        continue;
+      }
+
+      const transactionId = \`\${devId}_\${uid}_\${punchDateTime}\`;
+      const punchId = \`p_\${matchedEmpId}_\${punchDateTime}\`.replace(/[^a-zA-Z0-9]/g, '_');
+      const legacyPunchId = \`zk_\${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}\`;
+      const empTimeKey = \`\${matchedEmpId}_\${punchDateTime}\`;
+      const empTimeSecKey = \`\${matchedEmpId}_\${punchDateTime.slice(0, 19)}\`;
+
+      // IF SECOND TIME DOWNLOAD: SKIP IF ALREADY FETCHED IN SQLITE OR CACHE
+      if (
+        existingIds.has(punchId) ||
+        existingIds.has(legacyPunchId) ||
+        existingEmpTimeKeys.has(empTimeKey) ||
+        existingEmpTimeKeys.has(empTimeSecKey) ||
+        SYNCED_CACHE.has(punchId) ||
+        SYNCED_CACHE.has(legacyPunchId) ||
+        SYNCED_CACHE.has(empTimeSecKey)
+      ) {
+        duplicates++;
+        SYNCED_CACHE.add(punchId);
+        SYNCED_CACHE.add(empTimeSecKey);
+        continue;
+      }
+
+      const punchObj = {
+        id: punchId,
+        employeeId: matchedEmpId,
+        punchDatetime: punchDateTime,
+        importFormat: 'standard',
+        importId: \`BATCH_DIA_\${devId}\`,
+        importDate: now,
+        fileName: \`DIA Biometric (\${devName} - \${devIP})\`,
+        deviceId: devId,
+        deviceName: devName,
+        deviceIP: devIP,
+        deviceUserId: uid,
+        source: 'ZKTeco',
+        syncTime: now,
+        transactionId: transactionId,
+        location: \`\${devName} (\${devIP})\`
+      };
+
+      stmt.run([punchId, matchedEmpId, punchDateTime, devId, 'ZKTeco', JSON.stringify(punchObj), now]);
+      existingIds.add(punchId);
+      existingEmpTimeKeys.add(empTimeKey);
+      existingEmpTimeKeys.add(empTimeSecKey);
+      SYNCED_CACHE.add(punchId);
+      SYNCED_CACHE.add(empTimeSecKey);
+      newPunchesOnly.push({ deviceUserId: uid, employeeId: matchedEmpId, punchDateTime });
+      newRecords++;
+    }
+    stmt.free();
+
+    // Count exact logs and distinct matched users for this device in SQLite
+    let devLogCnt = existingIds.size;
+    let devUserCnt = 0;
+    try {
+      const cntRes = db.exec(\`SELECT COUNT(*), COUNT(DISTINCT employee_id) FROM attendance_punches WHERE device_id = '\${devId}'\`);
+      if (cntRes.length > 0 && cntRes[0].values.length > 0) {
+        devLogCnt = Number(cntRes[0].values[0][0] || 0);
+        devUserCnt = Number(cntRes[0].values[0][1] || 0);
+      }
+    } catch (e) {}
+
+    // Update zk_devices status in SQLite with matched userCount & logCount
+    const devObj = {
+      id: devId,
+      name: devName,
+      ip: devIP,
+      port: 4370,
+      model: 'MB2000/ID',
+      enabled: true,
+      status: 'online',
+      lastConnection: now,
+      lastSync: now,
+      userCount: devUserCnt,
+      logCount: devLogCnt,
+      autoSyncMinutes: 5
+    };
+    const devStmt = db.prepare("INSERT INTO zk_devices (id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at");
+    devStmt.run([devId, JSON.stringify(devObj), now]);
+    devStmt.free();
+
+    // Insert sync log
+    const logId = \`log_\${Date.now()}_\${Math.random().toString(36).slice(2, 6)}\`;
+    const logObj = {
+      id: logId,
+      deviceId: devId,
+      deviceName: devName,
+      deviceIP: devIP,
+      timestamp: now,
+      recordsRead: punches.length,
+      newRecords: newRecords,
+      duplicates: duplicates,
+      status: 'Success',
+      durationMs: 120,
+      message: \`Active Employees SQLite Sync: \${newRecords} new stored, \${duplicates} already-fetched duplicates skipped (\${skippedInactive} inactive filtered)\`
+    };
+    const logStmt = db.prepare("INSERT INTO zk_sync_logs (id, data, created_at) VALUES (?, ?, ?)");
+    logStmt.run([logId, JSON.stringify(logObj), now]);
+    logStmt.free();
+
+    db.run("COMMIT");
+
+    const binaryArray = db.export();
+    const tempPath = SQLITE_DB_PATH + '.tmp';
+    fs.writeFileSync(tempPath, Buffer.from(binaryArray));
+    fs.renameSync(tempPath, SQLITE_DB_PATH);
+    db.close();
+    saveSyncedCache();
+
+    return { newRecords, duplicates, skippedInactive, newPunchesOnly, savedToDisk: true };
+  } catch (err) {
+    return { newRecords: 0, duplicates: 0, skippedInactive: 0, newPunchesOnly: [], savedToDisk: false, error: err.message };
+  }
+}
+
+// 2. Sync ALL Active Employee Data to SQLite (Disk E:\\SHRM_HRIS\\Database.db + Local/Web Server Bridge)
+async function pushPunchesDirectToSqlite(devId, devName, devIP, punches) {
   if (!punches || punches.length === 0) return 0;
 
-  const now = new Date().toISOString();
-  const thirtyDaysAgoMs = Date.now() - 30 * 86400 * 1000;
-  let newRecords = 0;
+  // Sort newest punches first
+  const sortedPunches = [...punches].sort((a, b) => String(b.punchDateTime).localeCompare(String(a.punchDateTime)));
 
-  // Local PC Disk Sync Cache to avoid duplicate write ops against Firestore free daily quota
-  let SYNCED_CACHE = new Set();
-  try {
-    if (fs.existsSync('synced_punches.json')) {
-      const rawCache = fs.readFileSync('synced_punches.json', 'utf8');
-      SYNCED_CACHE = new Set(JSON.parse(rawCache));
-    }
-  } catch (e) {}
-
-  // 1. Filter out punches older than 30 days and punches already in local sync cache
-  const candidatePunches = punches.filter(p => {
-    const rawDateTime = p.punchDateTime || p.recordTime || p.timestamp || p.attTime || p.time || p.date || now;
-    const punchMs = new Date(rawDateTime).getTime();
-    if (!isNaN(punchMs) && punchMs < thirtyDaysAgoMs) return false;
-
-    const deviceUserId = String(p.deviceUserId || p.userId || p.pin || p.userSn || p.sn || p.id || '').trim();
-    if (!deviceUserId) return false;
-
-    const punchDateTime = String(rawDateTime).replace(' ', 'T');
-    const transactionId = \`\${devId}_\${deviceUserId}_\${punchDateTime}\`;
-    const punchId = \`zk_\${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}\`;
-
-    return !SYNCED_CACHE.has(punchId);
-  }).slice(0, 500); // Limit max candidates per cycle to preserve daily write quota
-
-  if (candidatePunches.length === 0) {
-    console.log(\` -> All candidate punches for \${devName} are already synced or older than 30 days.\`);
-    return 0;
+  // Step A: Write ALL active-employee punches directly to physical SQLite Database on Disk E: (skipping already-fetched duplicates)
+  const diskRes = await writePunchesDirectToDiskSqlite(devId, devName, devIP, sortedPunches);
+  if (diskRes.savedToDisk) {
+    console.log(\` -> [SQLite Disk E:] \${devName}: \${diskRes.newRecords} NEW active-employee punches stored, \${diskRes.duplicates} already-fetched duplicates skipped (\${diskRes.skippedInactive} inactive ignored).\`);
   }
 
-  if (db) {
-    try {
-      // Fetch current employees map if available
-      const empMap = new Map();
-      try {
-        const empSnap = await getDocs(collection(db, 'employees'));
-        empSnap.docs.forEach(docSnap => {
-          const emp = docSnap.data();
-          const empId = String(emp.id || '').trim();
-          if (empId) {
-            empMap.set(empId, empId);
-            if (emp.acNo) empMap.set(String(emp.acNo).trim(), empId);
-            if (emp.deviceUserId) empMap.set(String(emp.deviceUserId).trim(), empId);
-            if (emp.biometricId) empMap.set(String(emp.biometricId).trim(), empId);
-            if (emp.zkPin) empMap.set(String(emp.zkPin).trim(), empId);
-          }
-        });
-      } catch (e) {
-        console.log(" -> Note: Employee directory read note (using AC-No directly).");
-      }
+  // Queue ALL newly discovered active-employee punches for the Browser Local Bridge (http://127.0.0.1:4375)
+  const existingQueue = bridgeQueueByDevice.get(devId);
+  const combinedBridgePunches = diskRes.newPunchesOnly && diskRes.newPunchesOnly.length > 0
+    ? diskRes.newPunchesOnly
+    : (existingQueue ? existingQueue.punches : []);
 
-      const BATCH_SIZE = 50; // safe batch size for Firestore
-      const writtenEmpsInRun = new Set();
+  bridgeQueueByDevice.set(devId, {
+    deviceId: devId,
+    deviceName: devName,
+    deviceIP: devIP,
+    logCount: punches.length,
+    updatedAt: diskRes.newRecords > 0 ? new Date().toISOString() : (existingQueue ? existingQueue.updatedAt : new Date().toISOString()),
+    punches: combinedBridgePunches
+  });
 
-      for (let i = 0; i < candidatePunches.length; i += BATCH_SIZE) {
-        const chunk = candidatePunches.slice(i, i + BATCH_SIZE);
-        const batch = writeBatch(db);
-        const chunkPunchIds = [];
-
-        for (const p of chunk) {
-          const deviceUserId = String(p.deviceUserId || p.userId || p.pin || p.userSn || p.sn || p.id || '').trim();
-          if (!deviceUserId) continue;
-
-          const normDevId = deviceUserId.replace(/[^0-9]/g, '').replace(/^0+/, '') || deviceUserId;
-          const rawDateTime = p.punchDateTime || p.recordTime || p.timestamp || p.attTime || p.time || p.date || now;
-          const punchDateTime = String(rawDateTime).replace(' ', 'T');
-          const transactionId = \`\${devId}_\${deviceUserId}_\${punchDateTime}\`;
-          const punchId = \`zk_\${transactionId.replace(/[^a-zA-Z0-9_-]/g, '_')}\`;
-
-          const resolvedEmpId = empMap.get(deviceUserId) || empMap.get(normDevId) || deviceUserId || (normDevId ? \`EMP-\${normDevId.padStart(3, '0')}\` : 'UNKNOWN');
-
-          // Write Punch
-          const punchRef = doc(db, 'punches', punchId);
-          batch.set(punchRef, {
-            id: punchId,
-            employeeId: resolvedEmpId,
-            punchDatetime: punchDateTime,
-            deviceId: devId,
-            deviceName: devName || 'ZKTeco Device',
-            deviceIP: devIP || '192.168.117.200',
-            deviceUserId: deviceUserId,
-            source: 'ZKTeco',
-            syncTime: now,
-            transactionId: transactionId,
-            location: \`\${devName || 'Biometric'} (\${devIP || 'LAN'})\`,
-            importFormat: 'standard'
-          }, { merge: true });
-
-          chunkPunchIds.push(punchId);
-
-          // Only write Employee record ONCE per resolvedEmpId in run to save write quota
-          if (!empMap.has(resolvedEmpId) && !writtenEmpsInRun.has(resolvedEmpId)) {
-            writtenEmpsInRun.add(resolvedEmpId);
-            const empRef = doc(db, 'employees', resolvedEmpId);
-            batch.set(empRef, {
-              id: resolvedEmpId,
-              name: \`Employee (AC-No: \${deviceUserId})\`,
-              department: 'Biometric Devices',
-              designation: 'Staff',
-              joiningDate: now.split('T')[0],
-              status: 'Active',
-              deviceUserId: deviceUserId,
-              biometricId: deviceUserId,
-              acNo: deviceUserId,
-              zkPin: deviceUserId
-            }, { merge: true });
-          }
-
-          newRecords++;
-        }
-
+  // Step B: If there are NEW punches not yet stored, push ALL of them in batches to the active HTTP HRIS server
+  if (diskRes.newPunchesOnly && diskRes.newPunchesOnly.length > 0) {
+    const BATCH_SIZE = 5000;
+    for (const apiUrl of API_CANDIDATES) {
+      let apiReachable = false;
+      for (let i = 0; i < diskRes.newPunchesOnly.length; i += BATCH_SIZE) {
+        const chunk = diskRes.newPunchesOnly.slice(i, i + BATCH_SIZE);
         try {
-          await batch.commit();
-          chunkPunchIds.forEach(id => SYNCED_CACHE.add(id));
-          try {
-            fs.writeFileSync('synced_punches.json', JSON.stringify(Array.from(SYNCED_CACHE).slice(-20000)));
-          } catch (e) {}
-        } catch (commitErr) {
-          const msg = commitErr.message || String(commitErr);
-          if (msg.includes('resource-exhausted') || msg.toLowerCase().includes('quota')) {
-            console.log(" -> [NOTICE] Cloud Firestore Daily Free Write Quota reached (20,000 writes/day). Sync paused until reset.");
-            break;
-          } else {
-            console.log(" -> Batch commit note: " + msg);
+          const res = await axios.post(apiUrl, {
+            deviceId: devId,
+            deviceName: devName,
+            deviceIP: devIP,
+            logCount: punches.length,
+            punches: chunk,
+            autoFetch: false
+          }, { timeout: 10000 });
+
+          if (res.data && res.data.success) {
+            apiReachable = true;
           }
+        } catch (e) {
+          break;
         }
       }
-
-      if (newRecords > 0) {
-        console.log(\` -> [SUCCESS] Direct Cloud Sync completed for \${newRecords} punches!\`);
+      if (apiReachable) {
+        console.log(\` -> [HRIS API Sync] Synced \${diskRes.newPunchesOnly.length} new active-employee punches to \${apiUrl}.\`);
+        break;
       }
-      return newRecords;
-    } catch (fbErr) {
-      console.log(\` -> Direct Firestore sync note: \${fbErr.message}\`);
     }
+  } else {
+    console.log(\` -> [Duplicate Skip] All active-employee punches from \${devName} are already stored in SQLite. Skipping duplicate re-upload.\`);
   }
 
-  return 0;
+  return diskRes.newRecords;
+}
+
+function formatExactHardwareTime(val) {
+  if (!val) return null;
+  const pad = (n) => String(n).padStart(2, '0');
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return null;
+    return \`\${val.getFullYear()}-\${pad(val.getMonth() + 1)}-\${pad(val.getDate())}T\${pad(val.getHours())}:\${pad(val.getMinutes())}:\${pad(val.getSeconds())}\`;
+  }
+  const str = String(val).trim().replace(/^"|"$/g, '');
+  const m = str.match(/^(\\d{4})[/.-](\\d{1,2})[/.-](\\d{1,2})[T\\s]+(\\d{1,2}):(\\d{1,2})(?::(\\d{1,2}))?/);
+  if (m) {
+    return \`\${m[1]}-\${pad(m[2])}-\${pad(m[3])}T\${pad(m[4])}:\${pad(m[5])}:\${pad(m[6] || '00')}\`;
+  }
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) {
+    return \`\${d.getFullYear()}-\${pad(d.getMonth() + 1)}-\${pad(d.getDate())}T\${pad(d.getHours())}:\${pad(d.getMinutes())}:\${pad(d.getSeconds())}\`;
+  }
+  return null;
 }
 
 async function scanLocalDiskDatabase() {
   console.log(\`[\${new Date().toLocaleTimeString()}] Scanning Local PC Disk (E:) for ZKTime database/logs...\`);
   for (const filePath of LOCAL_DB_PATHS) {
-    if (!fs.existsSync(filePath)) continue;
+    if (!fs.existsSync(filePath) || filePath.toLowerCase().endsWith('.db')) continue;
 
     console.log(\` -> Found local ZK database/file: \${filePath}\`);
     try {
@@ -465,26 +797,23 @@ async function scanLocalDiskDatabase() {
         const parts = trimmed.split(/\\s+|,|\\t/);
         if (parts.length >= 2) {
           const uid = parts[0].replace(/^"|"$/g, '');
-          let isoDate = null;
+          let exactDate = null;
 
           if (parts[1] && (parts[1].includes(' ') || parts[1].includes('T'))) {
-            const d = new Date(parts[1].replace('T', ' '));
-            if (!isNaN(d.getTime())) isoDate = d.toISOString();
+            exactDate = formatExactHardwareTime(parts[1]);
           } else if (parts[1] && parts[2]) {
-            const d = new Date(\`\${parts[1]} \${parts[2]}\`);
-            if (!isNaN(d.getTime())) isoDate = d.toISOString();
+            exactDate = formatExactHardwareTime(\`\${parts[1]} \${parts[2]}\`);
           }
 
-          if (uid && isoDate) {
-            validPunches.push({ deviceUserId: uid, punchDateTime: isoDate });
+          if (uid && exactDate) {
+            validPunches.push({ deviceUserId: uid, punchDateTime: exactDate });
           }
         }
       }
 
       if (validPunches.length > 0) {
         console.log(\` -> Extracted \${validPunches.length} valid punch records from \${filePath}.\`);
-        const synced = await pushPunchesDirectToCloud('dev_local_disk_e', \`Local Disk (E:) Database (\${path.basename(filePath)})\`, filePath, validPunches);
-        console.log(\` -> [SUCCESS] Synced \${synced || validPunches.length} records from Local Disk (E:) database.\\n\`);
+        await pushPunchesDirectToSqlite('dev_local_disk_e', \`Local Disk (E:) Database (\${path.basename(filePath)})\`, filePath, validPunches);
       }
     } catch (err) {
       console.log(\` -> Local file parse note for \${filePath}: \${err.message}\\n\`);
@@ -515,22 +844,18 @@ async function syncDevice(dev) {
       const uid = String(l.deviceUserId || l.userId || l.userSn || l.pin || l.sn || l.id || '').trim();
       if (!uid) continue;
       
-      let pDate = null;
       const rawTime = l.recordTime || l.timestamp || l.attTime || l.time || l.date;
-      if (rawTime) {
-        const d = new Date(rawTime);
-        if (!isNaN(d.getTime())) pDate = d.toISOString();
-      }
+      const pDate = formatExactHardwareTime(rawTime);
       if (pDate) {
         validPunches.push({ deviceUserId: uid, punchDateTime: pDate });
       }
     }
 
-    console.log(\` -> Fetched \${validPunches.length} valid punches from \${dev.name}.\`);
+    console.log(\` -> Fetched \${validPunches.length} total punches from \${dev.name} (Exact Hardware Time).\`);
 
     if (validPunches.length > 0) {
-      const synced = await pushPunchesDirectToCloud(dev.id || ('dev_' + String(dev.ip || '').replace(/[^0-9]/g, '_')), dev.name || 'ZKTeco Device', dev.ip, validPunches);
-      console.log(\` -> [SUCCESS] Direct Synced \${synced || validPunches.length} records for \${dev.name}.\\n\`);
+      const devId = dev.id || ('dev_' + String(dev.ip || '').replace(/[^0-9]/g, '_'));
+      await pushPunchesDirectToSqlite(devId, dev.name || 'ZKTeco Device', dev.ip, validPunches);
     }
   } catch (err) {
     console.error(\` -> [NOTE] \${dev.name} (\${dev.ip}): \${err.message}\\n\`);
@@ -544,8 +869,60 @@ async function runSyncAll() {
   }
 }
 
-// Poll every 15 minutes
-setInterval(runSyncAll, 15 * 60 * 1000);
+// Start Local Browser Bridge Server on 127.0.0.1:4375 so open HRIS browser tabs can pull ALL new active-employee punches directly
+try {
+  const bridgeServer = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    if (req.url && req.url.startsWith('/bridge/pull')) {
+      const batches = Array.from(bridgeQueueByDevice.values());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success: true,
+        databasePath: SQLITE_DB_PATH,
+        devices: batches
+      }));
+      return;
+    }
+
+    if (req.url && req.url.startsWith('/bridge/ack')) {
+      // Clear already-synced bridge queues once the browser confirms SQLite storage
+      for (const [k, v] of bridgeQueueByDevice.entries()) {
+        bridgeQueueByDevice.set(k, { ...v, punches: [] });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    if (req.url && req.url.startsWith('/bridge/trigger')) {
+      runSyncAll();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, message: 'Triggered immediate ZKTeco LAN sync' }));
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'online', sqlitePath: SQLITE_DB_PATH, monitoredDevices: DEVICES.length }));
+  });
+
+  bridgeServer.on('error', () => {});
+  bridgeServer.listen(LOCAL_BRIDGE_PORT, '127.0.0.1', () => {
+    console.log(\` -> [OK] Local Browser Sync Bridge listening on http://127.0.0.1:\${LOCAL_BRIDGE_PORT}\\n\`);
+  });
+} catch (e) {}
+
+// Auto-Poll every 5 minutes
+setInterval(runSyncAll, 5 * 60 * 1000);
 
 // Run immediately
 runSyncAll();
@@ -554,22 +931,18 @@ runSyncAll();
 
   // Download Windows 1-Click BAT Launcher
   const handleDownloadWindowsBatchInstaller = () => {
-    let origin = window.location.origin;
-    if (origin.includes('ais-dev-')) {
-      origin = origin.replace('ais-dev-', 'ais-pre-');
-    }
     const jsContent = getAgentJsScript();
     const jsBase64 = btoa(unescape(encodeURIComponent(jsContent)));
 
     const batContent = `@echo off
-TITLE ZKTime 5.0 & ZKTeco Cloud HRIS Auto-Sync Bridge
+TITLE ZKTime 5.0 & ZKTeco SQLite HRIS Auto-Polling Sync Bridge
 COLOR 0A
 cls
 echo ===================================================
-echo   ZKTime 5.0 / ZKTeco Cloud HRIS Sync Agent
+echo   ZKTime 5.0 / ZKTeco SQLite HRIS Auto-Sync Agent
 echo ===================================================
 echo.
-echo Target Cloud HRIS: Direct Cloud Firestore Connection
+echo Target Database: Local SQLite (E:\\SHRM_HRIS\\Database.db)
 echo.
 echo Step 1: Checking Node.js installation...
 node -v >nul 2>&1
@@ -584,14 +957,14 @@ if %errorlevel% neq 0 (
 
 echo [OK] Node.js found.
 echo.
-echo Step 2: Installing required libraries (firebase, node-zklib, axios)...
-call npm install firebase node-zklib axios --no-audit --no-fund
+echo Step 2: Installing required libraries (sql.js, node-zklib, axios)...
+call npm install sql.js node-zklib axios --no-audit --no-fund
 echo.
 echo Step 3: Generating/updating zk-lan-connector.js...
 node -e "require('fs').writeFileSync('zk-lan-connector.js', Buffer.from('${jsBase64}', 'base64').toString('utf8'))"
 echo [OK] zk-lan-connector.js updated.
 echo.
-echo Step 4: Starting ZKTime 5.0 Direct Cloud Auto-Sync Agent...
+echo Step 4: Starting ZKTime 5.0 Direct SQLite Auto-Polling Agent...
 echo Press Ctrl+C anytime to stop.
 echo ===================================================
 echo.
@@ -606,7 +979,7 @@ pause
     a.download = 'start-zktime-sync.bat';
     a.click();
     URL.revokeObjectURL(url);
-    toast.success('Downloaded "start-zktime-sync.bat" for Windows PC!');
+    toast.success('Downloaded updated "start-zktime-sync.bat" (Direct SQLite E:\\SHRM_HRIS\\Database.db)!');
   };
 
   // Download LAN Connector Agent Script
@@ -627,7 +1000,9 @@ pause
     if (!diagnosticDevice) return;
     const tId = toast.loading(`Sending test punch for Biometric User #${testUserId}...`);
     try {
-      const now = new Date().toISOString();
+      const d = new Date();
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const exactLocalNow = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
       const res = await fetch('/api/zk/agent/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -635,19 +1010,17 @@ pause
           deviceId: diagnosticDevice.id,
           deviceName: diagnosticDevice.name,
           deviceIP: diagnosticDevice.ip,
-          userCount: 1,
-          logCount: 1,
           punches: [
             {
               deviceUserId: testUserId,
-              punchDateTime: now
+              punchDateTime: exactLocalNow
             }
           ]
         })
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        toast.success(`Test Punch Received! ${data.newRecords ? 'New record created' : 'Duplicate recorded'}.`, { id: tId });
+        toast.success(`Test Punch Processed! ${data.newRecords ? 'New record created' : 'Skipped (Duplicate or Inactive Employee)'}.`, { id: tId });
       } else {
         toast.error(`Test Punch Error: ${data.error}`, { id: tId });
       }
@@ -704,7 +1077,7 @@ pause
       if (editingDevice) {
         await updateZkDevice(editingDevice.id, formData);
       } else {
-        await addZkDevice(formData);
+        await addZkDevice({ ...formData, status: 'offline' });
       }
       setIsDeviceModalOpen(false);
     } catch (err: any) {
@@ -790,6 +1163,51 @@ pause
     d.ip.includes(searchTerm) ||
     d.model.toLowerCase().includes(searchTerm.toLowerCase())
   );
+
+  // Active Directory Employees count & live per-device user/log counts computed from SQLite punches
+  const activeDirectoryEmployeeCount = React.useMemo(
+    () => employees.filter(e => !e.status || e.status.toLowerCase() === 'active').length,
+    [employees]
+  );
+
+  const liveDeviceStatsMap = React.useMemo(() => {
+    const map = new Map<string, { logs: number; users: number }>();
+    const userSets = new Map<string, Set<string>>();
+
+    zkDevices.forEach(d => {
+      map.set(d.id, { logs: 0, users: 0 });
+      userSets.set(d.id, new Set<string>());
+    });
+
+    const primaryEnabledDev = zkDevices.find(d => d.enabled) || zkDevices[0];
+
+    punches.forEach(p => {
+      const dId = p.deviceId || '';
+      const matchedDev = zkDevices.find(
+        d => d.id === dId || (p.deviceIP && d.ip === p.deviceIP) || (p.deviceName && d.name === p.deviceName)
+      ) || (!dId ? primaryEnabledDev : undefined);
+
+      if (matchedDev) {
+        const curr = map.get(matchedDev.id) || { logs: 0, users: 0 };
+        curr.logs += 1;
+        if (p.employeeId) {
+          userSets.get(matchedDev.id)?.add(String(p.employeeId).trim());
+        }
+        curr.users = userSets.get(matchedDev.id)?.size || 0;
+        map.set(matchedDev.id, curr);
+      }
+    });
+
+    return map;
+  }, [zkDevices, punches]);
+
+  const totalDiaStats = React.useMemo(() => {
+    const empSet = new Set<string>();
+    punches.forEach(p => {
+      if (p.employeeId) empSet.add(String(p.employeeId).trim());
+    });
+    return { totalLogs: punches.length, totalUsers: empSet.size };
+  }, [punches]);
 
   // Mapped user IDs
   const mappedDeviceUserIds = new Set(zkUserMappings.map(m => m.deviceUserId));
@@ -1042,13 +1460,26 @@ pause
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                      <span>Registered Users:</span>
-                      <span className="font-semibold text-slate-800 dark:text-slate-200">{dev.userCount || 0} users</span>
+                      <span>Active Directory Users:</span>
+                      <span className="font-semibold text-indigo-600 dark:text-indigo-400">
+                        {activeDirectoryEmployeeCount} active mapped
+                      </span>
+                    </div>
+
+                    <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                      <span>Punched Users (In Logs):</span>
+                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                        {(liveDeviceStatsMap.get(dev.id)?.logs || 0) > 0
+                          ? liveDeviceStatsMap.get(dev.id)?.users || 0
+                          : (dev.logCount ? dev.userCount || 0 : 0)} users
+                      </span>
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
                       <span>Total Punch Logs:</span>
-                      <span className="font-semibold text-slate-800 dark:text-slate-200">{dev.logCount || 0} logs</span>
+                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                        {Math.max(liveDeviceStatsMap.get(dev.id)?.logs || 0, dev.logCount || 0)} logs
+                      </span>
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
@@ -1440,6 +1871,25 @@ pause
                 <Download className="w-3.5 h-3.5" />
                 Download E:\ Auto-Sync Agent
               </button>
+            </div>
+
+            {/* Target Device Selector for File Upload */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-800 text-xs">
+              <div>
+                <span className="font-bold text-slate-900 dark:text-slate-100 block">Target Biometric Device for Uploaded Logs</span>
+                <span className="text-slate-500 dark:text-slate-400">Select which registered terminal these punch logs belong to so User &amp; Log counts match on the device card:</span>
+              </div>
+              <select
+                value={selectedDatDeviceId || (zkDevices[0]?.id || '')}
+                onChange={(e) => setSelectedDatDeviceId(e.target.value)}
+                className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl text-xs font-semibold text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              >
+                {zkDevices.map(d => (
+                  <option key={d.id} value={d.id}>
+                    {d.name} ({d.ip})
+                  </option>
+                ))}
+              </select>
             </div>
 
             <div className="border-2 border-dashed border-indigo-200 dark:border-indigo-900 hover:border-indigo-500 dark:hover:border-indigo-500 bg-indigo-50/40 dark:bg-indigo-950/20 rounded-2xl p-8 text-center transition-all">

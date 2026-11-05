@@ -1,16 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { 
-  collection, 
-  doc, 
-  onSnapshot, 
-  setDoc, 
-  deleteDoc, 
-  query, 
-  where,
-  getDocs,
-  writeBatch
-} from 'firebase/firestore';
-import { db, auth } from './firebase';
+import { fetchLocalTable, saveLocalTable, deleteLocalTableRecords } from './localClient';
 
 export function useFirestoreSync<T extends { id: string }>(
   collectionName: string,
@@ -20,23 +9,25 @@ export function useFirestoreSync<T extends { id: string }>(
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsub = onSnapshot(collection(db, collectionName), (snapshot) => {
-      const docs = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as T));
-      setData(docs);
+    let active = true;
+    fetchLocalTable<T>(collectionName).then((rows) => {
+      if (!active) return;
+      if (rows && rows.length > 0) setData(rows);
       setLoading(false);
-    }, (error) => {
-      console.error(`Error syncing ${collectionName}:`, error);
-      setLoading(false);
+    }).catch(() => {
+      if (active) setLoading(false);
     });
-    return () => unsub();
+    return () => { active = false; };
   }, [collectionName]);
 
   const upsert = useCallback(async (item: T) => {
-    await setDoc(doc(db, collectionName, item.id), item);
+    setData(prev => [...prev.filter(x => x.id !== item.id), item]);
+    await saveLocalTable(collectionName, item);
   }, [collectionName]);
 
   const remove = useCallback(async (id: string) => {
-    await deleteDoc(doc(db, collectionName, id));
+    setData(prev => prev.filter(x => x.id !== id));
+    await deleteLocalTableRecords(collectionName, [id]);
   }, [collectionName]);
 
   return [data, upsert, remove, loading] as const;
@@ -51,20 +42,23 @@ export function useFirestoreDocumentSync<T>(
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsub = onSnapshot(doc(db, collectionName, docId), (snapshot) => {
-      if (snapshot.exists()) {
-        setData(snapshot.data() as T);
+    let active = true;
+    fetchLocalTable<any>(collectionName).then((rows) => {
+      if (!active) return;
+      if (rows && rows.length > 0) {
+        const found = rows.find((r: any) => r.id === docId) || rows[0];
+        if (found) setData(found as T);
       }
       setLoading(false);
-    }, (error) => {
-      console.error(`Error syncing ${collectionName}/${docId}:`, error);
-      setLoading(false);
+    }).catch(() => {
+      if (active) setLoading(false);
     });
-    return () => unsub();
+    return () => { active = false; };
   }, [collectionName, docId]);
 
   const update = useCallback(async (updates: T) => {
-    await setDoc(doc(db, collectionName, docId), updates, { merge: true });
+    setData(updates);
+    await saveLocalTable(collectionName, { id: docId, ...(updates as any) });
   }, [collectionName, docId]);
 
   return [data, update, loading] as const;

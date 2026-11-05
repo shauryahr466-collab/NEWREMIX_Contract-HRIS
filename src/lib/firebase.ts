@@ -11,24 +11,21 @@ import {
   User,
   onAuthStateChanged
 } from 'firebase/auth';
-import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-// Use the config but override firestoreDatabaseId if needed for recovery
-// If data was in default db, we should use empty string
+// The HRIS operates 100% on Local SQLite Database (E:\SHRM_HRIS\Database.db).
+// Cloud Firestore is completely disabled so no gRPC Listen/Write streams are ever opened.
 const config = {
   ...firebaseConfig,
 };
 
 const app = initializeApp(config);
 
-// Use initializeFirestore with local persistence and auto-detecting long polling for stability
-export const db = initializeFirestore(app, {
-  localCache: persistentLocalCache({
-    tabManager: persistentMultipleTabManager(),
-  }),
-  experimentalAutoDetectLongPolling: true,
-}, config.firestoreDatabaseId || "(default)");
+// Export a safe stub for db so legacy references never trigger network gRPC connections
+export const db: any = {
+  type: 'sqlite-local-only',
+  app
+};
 
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();

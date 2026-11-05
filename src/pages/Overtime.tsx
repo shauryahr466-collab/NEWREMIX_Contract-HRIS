@@ -4,19 +4,21 @@ import { format, parseISO, isWithinInterval } from 'date-fns';
 import { 
   Clock, Search, Download, 
   RefreshCw, Plus, Save, Trash2,
-  Calendar, ChevronLeft, ChevronRight, X
+  Calendar, ChevronLeft, ChevronRight, X,
+  FileSpreadsheet, Upload
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 import { OTAuditLog } from '../components/OTAuditLog';
-import { OvertimeRecord, Employee, ProcessedAttendance, ShiftMaster } from '../types';
+import { SupervisorOTImportModal, generateSupervisorOTTemplate } from '../components/SupervisorOTImportModal';
+import { OvertimeRecord, Employee, ProcessedAttendance, ShiftMaster, RawPunch } from '../types';
 import { PageHeader, Card, Button, Input, KPICard, Badge } from '../components/ui';
-import { cn } from '../lib/utils';
+import { cn, normalizeEmployeeId, formatPunchTime, getAttendanceInAndOut, toDeviceWallClockIso } from '../lib/utils';
 
 export default function Overtime() {
   const { 
-    overtimeRecords, employees, processedData, settings,
+    overtimeRecords, employees, processedData, settings, punches,
     updateOvertime, addOvertime, deleteOvertime, setOvertimeBatch, deleteOvertimeBatch, user, openEmployeeProfile, globalSearchTerm 
   } = useAppStore();
   
@@ -27,6 +29,7 @@ export default function Overtime() {
   const [contractorFilter, setContractorFilter] = useState<string>('All');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [selectedRecord, setSelectedRecord] = useState<OvertimeRecord | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [dateRange, setDateRange] = useState({
@@ -136,7 +139,11 @@ export default function Overtime() {
       let added = 0;
       let updated = 0;
 
-      const otMap = new Map<string, OvertimeRecord>(overtimeRecords.map(r => [`${r.employeeId}_${r.date}`, r]));
+      const otMap = new Map<string, OvertimeRecord>();
+      overtimeRecords.forEach(r => {
+        otMap.set(`${r.employeeId}_${r.date}`, r);
+        otMap.set(`${normalizeEmployeeId(r.employeeId)}_${r.date}`, r);
+      });
       const batchToUpsert: OvertimeRecord[] = [];
       const startDate = dateRange.start;
       const endDate = dateRange.end;
@@ -145,24 +152,36 @@ export default function Overtime() {
         const att = processedData[i];
         if (att.date < startDate || att.date > endDate) continue;
 
-        const emp = empMap.get(att.employeeId);
-        const standardDutyHours = Number(emp?.targetWorkingHours) || Number(att.expectedHours) || 8;
+        const normId = normalizeEmployeeId(att.employeeId);
+        const emp = empMap.get(normId) || empMap.get(att.employeeId);
+        const standardDutyHours = Number(emp?.targetWorkingHours) || Number((att as any).expectedHours) || 8;
         const workingHours = Number(att.workingHours) || 0;
         const bioOtHours = Math.max(0, workingHours - standardDutyHours);
         
         if (bioOtHours <= 0 && att.status !== 'Present') continue;
 
-        const key = `${att.employeeId}_${att.date}`;
-        const existing = otMap.get(key);
+        const punchInfo = getAttendanceInAndOut(att);
+        const inTime = punchInfo.inTime !== '--:--' ? punchInfo.inTime : undefined;
+        const outTime = punchInfo.outTime !== '--:--' ? punchInfo.outTime : undefined;
+
+        const key = `${normId}_${att.date}`;
+        const existing = otMap.get(key) || otMap.get(`${att.employeeId}_${att.date}`);
         
         if (existing) {
-          if (existing.bioOtHours !== bioOtHours || existing.standardDutyHours !== standardDutyHours) {
-            const supOt = Number(existing.supervisorOtHours) || 0;
-            const finalOtEligible = Math.min(bioOtHours, supOt);
-            const hrSaving = Math.max(0, bioOtHours - finalOtEligible);
-            
+          const supOt = Number(existing.supervisorOtHours) || 0;
+          const finalOtEligible = Math.min(bioOtHours, supOt);
+          const hrSaving = Math.max(0, bioOtHours - finalOtEligible);
+          
+          if (
+            existing.bioOtHours !== bioOtHours || 
+            existing.standardDutyHours !== standardDutyHours ||
+            existing.inTime !== inTime ||
+            existing.outTime !== outTime
+          ) {
             batchToUpsert.push({
               ...existing,
+              inTime,
+              outTime,
               bioOtHours: Number(bioOtHours.toFixed(2)),
               standardDutyHours: Number(standardDutyHours.toFixed(2)),
               hours: Number(finalOtEligible.toFixed(2)),
@@ -180,6 +199,8 @@ export default function Overtime() {
             id,
             employeeId: att.employeeId,
             date: att.date,
+            inTime,
+            outTime,
             bioOtHours: Number(bioOtHours.toFixed(2)),
             supervisorOtHours,
             standardDutyHours: Number(standardDutyHours.toFixed(2)),
@@ -281,28 +302,69 @@ export default function Overtime() {
 
   const handleExportCSV = () => {
     try {
-      const attMap = new Map<string, ProcessedAttendance>(processedData.map(p => [`${p.employeeId}_${p.date}`, p]));
+      const attMap = new Map<string, ProcessedAttendance>();
+      processedData.forEach(p => {
+        attMap.set(`${p.employeeId}_${p.date}`, p);
+        attMap.set(`${normalizeEmployeeId(p.employeeId)}_${p.date}`, p);
+      });
       const shiftMap = new Map<string, ShiftMaster>((settings.shifts || []).map(s => [s.id, s]));
 
+      // Build punches lookup for CSV export audit cross-check
+      const punchesMap = new Map<string, string[]>();
+      (punches || []).forEach(p => {
+        const cleanIso = toDeviceWallClockIso(p.punchDatetime);
+        if (!cleanIso) return;
+        const dateStr = cleanIso.includes('T') ? cleanIso.split('T')[0] : cleanIso.split(' ')[0];
+        const normId = normalizeEmployeeId(p.employeeId);
+        const key = `${normId}_${dateStr}`;
+        const list = punchesMap.get(key) || [];
+        list.push(formatPunchTime(cleanIso));
+        punchesMap.set(key, list);
+      });
+
       const data = filteredRecords.map(record => {
-        const emp = empMap.get(record.employeeId);
-        const att = attMap.get(`${record.employeeId}_${record.date}`);
-        const shift = record.shiftId ? shiftMap.get(record.shiftId) : undefined;
+        const normId = normalizeEmployeeId(record.employeeId);
+        const emp = empMap.get(normId) || empMap.get(record.employeeId);
+        const att = attMap.get(`${normId}_${record.date}`) || attMap.get(`${record.employeeId}_${record.date}`);
+        const shift = record.shiftId ? shiftMap.get(record.shiftId) : (att?.shiftId ? shiftMap.get(att.shiftId) : (emp?.shiftId ? shiftMap.get(emp.shiftId) : undefined));
+
+        const punchInfo = getAttendanceInAndOut(att);
+        const rawTimes = punchesMap.get(`${normId}_${record.date}`) || [];
+
+        let inTime = record.inTime || punchInfo.inTime;
+        let outTime = record.outTime || punchInfo.outTime;
+        if (inTime === '--:--' && rawTimes.length > 0) inTime = rawTimes[0];
+        if (outTime === '--:--' && rawTimes.length > 1) outTime = rawTimes[rawTimes.length - 1];
+
+        // Audit verdict
+        const bioOt = Number(record.bioOtHours || 0);
+        const supOt = Number(record.supervisorOtHours || 0);
+        let auditVerdict = 'PASS';
+        if (punchInfo.isSinglePunch || (rawTimes.length === 1 && !att?.outTime)) {
+          auditVerdict = 'SINGLE PUNCH (EXCEPTION)';
+        } else if (supOt > bioOt) {
+          auditVerdict = `OVER-CLAIM (+${(supOt - bioOt).toFixed(2)}h)`;
+        } else if (bioOt > supOt && bioOt > 0) {
+          auditVerdict = `HR SAVINGS (${record.hrSaving}h)`;
+        }
 
         return {
           'Employee ID': record.employeeId,
           'Employee Name': emp?.name || 'Unknown',
           'Department': emp?.department || '-',
           'Date': record.date,
-          'Shift': shift?.name || '-',
+          'Shift': shift?.name || 'Day Shift',
+          'Shift Window': shift ? `${shift.startTime} - ${shift.endTime}` : '-',
           'Standard Duty Hours': record.standardDutyHours || 8,
-          'In Time': att?.firstPunch ? att.firstPunch.substring(11, 16) || att.firstPunch : '-',
-          'Out Time': att?.lastPunch ? att.lastPunch.substring(11, 16) || att.lastPunch : '-',
+          'In Time': inTime,
+          'Out Time': (punchInfo.isSinglePunch || (rawTimes.length === 1 && !att?.outTime)) && !punchInfo.hasOut ? '--:-- (Single Punch)' : outTime,
+          'Raw Biometric Punches': rawTimes.join(', ') || '-',
           'Working Hours': att?.workingHours || 0,
           'Bio OT': record.bioOtHours,
           'Supervisor OT': record.supervisorOtHours,
           'Final OT Eligible': record.hours,
           'HR Saving': record.hrSaving,
+          'Audit Cross-Check Verdict': auditVerdict,
           'OT Remarks': record.remarks || '',
           'Approval Status': record.status,
           'Reviewed By': record.reviewedBy || '-',
@@ -386,6 +448,23 @@ export default function Overtime() {
             <Button variant="outline" onClick={handleExportCSV} className="gap-2">
               <Download size={16} />
               Export
+            </Button>
+            <Button 
+              variant="outline" 
+              onClick={() => generateSupervisorOTTemplate(employees)} 
+              className="gap-2 border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
+              title="Download official Excel template with instructions and sample rows"
+            >
+              <FileSpreadsheet size={16} />
+              Export Template
+            </Button>
+            <Button 
+              onClick={() => setIsImportModalOpen(true)} 
+              className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm"
+              title="Import Supervisor OT and Remarks from Excel"
+            >
+              <Upload size={16} />
+              Import Supervisor OT & Remarks
             </Button>
             {selectedIds.length > 0 && (
               <Button type="button" variant="danger" onClick={() => setIsDeleteModalOpen(true)} className="gap-2">
@@ -482,6 +561,7 @@ export default function Overtime() {
           employees={employees}
           attendanceData={processedData}
           shifts={settings.shifts || []}
+          punches={punches || []}
           onEdit={openEditModal}
           onApprove={(id) => handleStatusChange(id, 'Approved')}
           onReject={(id) => handleStatusChange(id, 'Rejected')}
@@ -734,6 +814,18 @@ export default function Overtime() {
           </div>
         )}
       </AnimatePresence>
+
+      {/* Supervisor OT & Remarks Import Modal */}
+      <SupervisorOTImportModal 
+        isOpen={isImportModalOpen}
+        onClose={() => setIsImportModalOpen(false)}
+        overtimeRecords={overtimeRecords}
+        employees={employees}
+        processedData={processedData}
+        shifts={settings.shifts || []}
+        setOvertimeBatch={setOvertimeBatch}
+        currentUser={user}
+      />
     </div>
   );
 }

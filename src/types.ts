@@ -35,7 +35,8 @@ export interface EmployeeTaxProfile {
 }
 
 export interface Employee {
-  id: string; // Employee ID
+  id: string; // Numeric Employee ID / Bio ID
+  bioId?: string | number; // Biometric ID (same as numeric Employee ID)
   name: string;
   department: string;
   designation: string;
@@ -46,7 +47,11 @@ export interface Employee {
   contactNumber?: string;
   weeklyOff?: string; // e.g., "Sunday"
   otEligible?: boolean;
+  otEligibilityType?: 'Regular OT' | 'Shift OT' | 'Special OT' | 'Not Eligible';
+  otEffectiveDate?: string;
   targetWorkingHours?: number; // e.g., 8
+  requiredWorkingHoursPerDay?: number; // e.g., 8 or 12
+  requiredWorkingHoursPerWeek?: number; // e.g., 48 or 72
   profilePicture?: string;
   accommodation?: string;
   email?: string;
@@ -57,11 +62,17 @@ export interface Employee {
   dobBS?: string;
   dobAD?: string;
   address?: string;
+  permanentAddress?: string;
+  currentAddress?: string;
   emergencyContact?: string;
+  emergencyContactNumber?: string;
+  nationality?: string;
+  citizenshipNumber?: string;
 
   // Employment Information
   section?: string;
   location?: string;
+  plantLocation?: string;
   employmentType?: 'Permanent' | 'Contract' | 'Probation' | 'Temporary';
   grade?: string;
   level?: string;
@@ -75,10 +86,13 @@ export interface Employee {
   employeeSSF?: number;
   employerSSF?: number;
   monthlyCTC?: number;
+  annualCTC?: number;
+  salaryEffectiveDate?: string;
   allowances?: number;
   panNumber?: string;
   ssfNumber?: string;
   citNumber?: string;
+  taxCategory?: string;
   bankName?: string;
   accountNumber?: string;
   branchName?: string;
@@ -89,12 +103,6 @@ export interface Employee {
   ssfEnrolled?: boolean;
   taxProfile?: EmployeeTaxProfile;
   companyType?: 'SCIL' | 'ISTS';
-
-  // Complete HR Master Data Fields
-  nationality?: string;
-  citizenshipNumber?: string;
-  currentAddress?: string;
-  taxCategory?: string;
 
   // Exit & Movement Information
   statusEffectiveDate?: string;
@@ -159,6 +167,8 @@ export interface EmployeeMovement {
   noticePeriod?: string;
   lastWorkingDate?: string;
   resignationDate?: string;
+  remarks?: string;
+  approvedBy?: string;
 }
 
 export type PayrollStatus = 'Draft' | 'Calculated' | 'Review' | 'Approved' | 'Finalized' | 'Locked' | 'Disbursed';
@@ -170,6 +180,8 @@ export interface TaxSlabDetail {
   taxableAmount: number;
   rate: number;
   taxAmount: number;
+  minAmount?: number;
+  maxAmount?: number;
 }
 
 export interface PayrollRecord {
@@ -441,17 +453,31 @@ export interface AttendanceException {
   remarks?: string;
 }
 
+export type AuditAction = 
+  | 'CREATE' 
+  | 'UPDATE' 
+  | 'DEACTIVATE' 
+  | 'IMPORT' 
+  | 'SALARY_CHANGE' 
+  | 'TRANSFER' 
+  | 'PROMOTION' 
+  | 'STATUS_CHANGE';
+
 export interface AuditLog {
   id: string;
   employeeId: string;
-  employeeName: string;
-  date: string; // The date of the record being audited
-  field: string; // e.g., 'firstPunch', 'lastPunch', 'shiftId'
+  employeeName?: string;
+  date?: string; // The date of the record being audited
+  field: string; // e.g., 'firstPunch', 'lastPunch', 'shiftId', 'department', 'salary'
   oldValue: string;
   newValue: string;
   changedBy: string;
   timestamp: string; // ISO string
-  remarks: string;
+  changedAt?: string;
+  remarks?: string;
+  action?: AuditAction | string;
+  reason?: string;
+  user?: string;
 }
 
 export interface OvertimeRecord {
@@ -465,13 +491,20 @@ export interface OvertimeRecord {
   standardDutyHours: number;
   otStartTime?: string; // HH:mm
   otEndTime?: string; // HH:mm
+  inTime?: string; // Reconciled In Time (HH:mm)
+  outTime?: string; // Reconciled Out Time (HH:mm)
   type: 'Regular' | 'Holiday' | 'Weekly Off';
   status: 'Pending' | 'Approved' | 'Rejected';
+  auditStatus?: 'PASS' | 'WARNING' | 'MISMATCH' | 'ERROR';
+  auditReason?: string;
   approvedBy?: string;
   reviewedBy?: string;
   reviewedDate?: string;
   remarks: string;
   shiftId?: string;
+  otBasis?: 'basic' | 'gross';
+  otRate?: number;
+  otAmount?: number;
 }
 
 export interface SBLRecord {
@@ -495,6 +528,7 @@ export interface ForceAttendanceRecord {
   id: string;
   employeeId: string;
   date: string;
+  status?: string;
   inTime: string; // HH:mm
   outTime: string; // HH:mm
   reason: string;
@@ -519,21 +553,113 @@ export interface TaxSlabConfig {
   limitSingle: number;
   limitMarried: number;
   rate: number;
+  taxType?: 'Social Security Tax' | 'Income Tax';
+  cumulativeCheckpoint?: number;
+  description?: string;
+}
+
+export interface TaxRuleItem {
+  id: string;
+  fiscalYear: string;
+  taxpayerType: 'RESIDENT_INDIVIDUAL' | 'NON_RESIDENT' | 'COUPLE';
+  maritalStatusApplicable: boolean;
+  slabOrder: number;
+  label: string;
+  lowerLimit: number;
+  upperLimit: number;
+  rate: number;
+  taxType: 'Social Security Tax' | 'Income Tax';
+  cumulativeTaxCheckpoint: number;
+  effectiveFrom: string;
+  effectiveTo?: string;
+  active: boolean;
+  sourceReference: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface DeductionRuleItem {
+  id: string;
+  name: string;
+  code: string;
+  type: 'RETIREMENT_FUND' | 'INSURANCE' | 'REMOTE_AREA' | 'REBATE' | 'OTHER';
+  annualLimit: number;
+  monthlyLimit?: number;
+  incomePercentageCap?: number; // e.g. 0.3333 for 1/3 assessable income
+  eligible: boolean;
+  fiscalYear: string;
+  effectiveDate: string;
+  active: boolean;
+  description?: string;
+}
+
+export interface SalaryComponentConfig {
+  id: string;
+  name: string;
+  code: string;
+  type: 'Earning' | 'Deduction' | 'EmployerCost';
+  taxable: boolean;
+  ssfApplicable: boolean;
+  ctcApplicable: boolean;
+  description: string;
+}
+
+export interface PayrollConfigAuditLog {
+  id: string;
+  timestamp: string;
+  user: string;
+  fiscalYear: string;
+  ruleVersion: string;
+  changesSummary: string;
+  reason?: string;
+  diff?: FieldDiff[];
 }
 
 export interface PayrollConfig {
-  fiscalYear: string;
-  effectiveBsYear: number;
+  fiscalYear: string; // "FY 2083/84"
+  gregorianYear?: string; // "2026/27"
+  effectiveBsYear: number; // 2083
+  effectiveFrom?: string; // "2083-04-01" (Shrawan 1, 2083)
+  taxpayerType?: string; // "RESIDENT_INDIVIDUAL"
+  maritalStatusApplicable?: boolean; // false for unified slabs in FY 2083/84
+  
+  // Tax Slabs & Rules
   singleSlabs: TaxSlabConfig[];
   marriedSlabs: TaxSlabConfig[];
-  ssfEmployeeRate: number;
-  ssfEmployerRate: number;
-  pfNonSsfRate: number;
-  healthInsuranceRate: number;
-  ssfSlab1SstWaiver: boolean;
-  standardDaysInMonth: number;
-  overtimeMultiplier: number;
-  currencySymbol: string;
+  taxRules?: TaxRuleItem[];
+  
+  // Social Security Tax & SSF
+  ssfEmployeeRate: number; // 0.11 (11% of Basic)
+  ssfEmployerRate: number; // 0.20 (20% of Basic)
+  pfNonSsfRate: number; // 0.10 (10% for non-SSF)
+  healthInsuranceRate: number; // 0 (covered under SSF)
+  firstBandSstApplicable?: boolean; // true (1% SST on first 10 Lakhs)
+  ssfSlab1SstWaiver: boolean; // true (100% waiver for SSF contributors)
+  
+  // Deductions Master Caps
+  retirementFundMaxCap?: number; // 500,000
+  retirementFundIncomeRatioCap?: number; // 0.33333333 (1/3 of assessable income)
+  lifeInsuranceAnnualLimit?: number; // 40,000
+  healthInsuranceAnnualLimit?: number; // 20,000
+  privateBuildingInsuranceLimit?: number; // 10,000
+  
+  // Tax Rebates & Concessions
+  femaleRebateEnabled?: boolean; // false or true
+  femaleRebateRate?: number; // 0.10 (10%)
+  disabilityFirstSlabExpansionRate?: number; // 0.50 (+50% to Slab 1 limit)
+  
+  // Working Hours, OT & General
+  standardDaysInMonth: number; // 31 for Shrawan / standard
+  overtimeMultiplier: number; // 1.5
+  overtimeCalculationBasis?: 'basic' | 'gross'; // 'basic' = Basic Salary, 'gross' = Gross Salary (Basic + Allowances)
+  currencySymbol: string; // "NPR"
+  
+  // Master Versioning & Source Reference
+  ruleVersion?: string; // "1.0"
+  sourceReference?: string; // "Nepal Finance Act 2083 & IRD Unified Resident Individual Guidelines"
+  lastUpdated?: string;
+  updatedBy?: string;
+  auditLogs?: PayrollConfigAuditLog[];
 }
 
 export interface Settings {
@@ -550,4 +676,59 @@ export interface Settings {
   calculationEndDate?: string; // YYYY-MM-DD
   holidays?: { date: string; name: string }[];
   payrollConfig?: PayrollConfig;
+}
+
+export type ActionState = 
+  | 'IDLE' 
+  | 'CONFIRMATION_REQUIRED' 
+  | 'CONFIRMED'
+  | 'PROCESSING' 
+  | 'VERIFYING'
+  | 'SUCCESS' 
+  | 'WARNING' 
+  | 'FAILED' 
+  | 'CANCELLED';
+
+export interface FieldDiff {
+  field: string;
+  label?: string;
+  oldValue: any;
+  newValue: any;
+}
+
+export interface ActionConfirmationConfig {
+  title: string;
+  subtitle?: string;
+  actionType: 'save' | 'delete' | 'bulk_delete' | 'import' | 'purge' | 'payroll_run' | 'payroll_approve' | 'payroll_lock' | 'shift_change' | 'general';
+  module: string;
+  recordId?: string;
+  recordName?: string;
+  affectedCount?: number;
+  changedFields?: FieldDiff[];
+  details?: Record<string, any>;
+  confirmText?: string;
+  cancelText?: string;
+  isDestructive?: boolean;
+  severity?: 'danger' | 'warning' | 'info';
+  operationId?: string;
+  autoCloseDelayMs?: number;
+  onConfirm?: () => Promise<any>;
+}
+
+export interface ActionStatusResult {
+  success: boolean;
+  verified: boolean;
+  verificationStatus: 'PASSED' | 'FAILED' | 'WARNING' | 'SKIPPED';
+  transaction: 'COMMITTED' | 'ROLLED_BACK' | 'N/A';
+  dbPath: string;
+  affectedCount: number;
+  module: string;
+  recordId?: string;
+  recordName?: string;
+  changedFieldsCount?: number;
+  timestamp: string;
+  error?: string;
+  errorRefId?: string;
+  operationId?: string;
+  breakdown?: Record<string, any>;
 }

@@ -191,14 +191,42 @@ export function Skeleton({ className }: { className?: string }) {
   );
 }
 
-export function NepaliRupeeIcon({ size = 20, className = '' }: { size?: number; className?: string }) {
+export function NepaliRupeeIcon({ 
+  size = 18, 
+  className = '',
+  color = 'currentColor',
+  ...props 
+}: { 
+  size?: number | string; 
+  className?: string; 
+  color?: string;
+  [key: string]: any;
+}) {
+  const numericSize = typeof size === 'number' ? size : parseInt(size as string, 10) || 18;
   return (
-    <span 
-      className={cn("font-black inline-flex items-center justify-center select-none leading-none tracking-tighter shrink-0", className)} 
-      style={{ fontSize: `${size}px` }}
-      title="Nepali Currency (रु)"
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={numericSize}
+      height={numericSize}
+      viewBox="0 0 24 24"
+      fill="none"
+      className={cn("shrink-0 select-none inline-block align-middle", className)}
+      {...props}
     >
-      रु
-    </span>
+      <title>Nepali Currency (रु.)</title>
+      <text
+        x="12"
+        y="17"
+        textAnchor="middle"
+        dominantBaseline="auto"
+        fill={color}
+        fontSize="15"
+        fontWeight="800"
+        fontFamily="system-ui, -apple-system, 'Segoe UI', 'Noto Sans Devanagari', 'Mukta', 'Mangal', sans-serif"
+        style={{ userSelect: 'none' }}
+      >
+        रु.
+      </text>
+    </svg>
   );
 }

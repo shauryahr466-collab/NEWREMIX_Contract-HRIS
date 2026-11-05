@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { format, parseISO, addDays, startOfDay, endOfDay, differenceInMinutes } from 'date-fns';
 import { Plus, Trash2, Clock } from 'lucide-react';
 import { ProcessedAttendance } from '../types';
-import { formatAMPM } from '../lib/utils';
+import { formatAMPM, toDeviceWallClockIso } from '../lib/utils';
 import { useAppStore } from '../store';
 
 interface PunchTimelineProps {
@@ -20,12 +20,12 @@ export function PunchTimeline({ record }: PunchTimelineProps) {
     try {
       const punchDate = record.date;
       const [hours, minutes] = newTime.split(':');
-      const punchDatetime = new Date(parseISO(punchDate));
-      punchDatetime.setHours(parseInt(hours), parseInt(minutes), 0);
+      const pad = (n: string | number) => String(n).padStart(2, '0');
+      const exactLocalIso = `${punchDate}T${pad(hours || '09')}:${pad(minutes || '00')}:00`;
       
       await addPunch({
         employeeId: record.employeeId,
-        punchDatetime: punchDatetime.toISOString(),
+        punchDatetime: exactLocalIso,
         importFormat: 'standard'
       });
       setIsAdding(false);
@@ -37,8 +37,10 @@ export function PunchTimeline({ record }: PunchTimelineProps) {
   const handleDelete = async (punchIso: string) => {
     if (!confirm('Are you sure you want to delete this punch?')) return;
     try {
-      // Find the punch ID from the store
-      const punchObj = allRawPunches.find(p => p.employeeId === record.employeeId && p.punchDatetime === punchIso);
+      const targetWallClock = toDeviceWallClockIso(punchIso);
+      const punchObj = allRawPunches.find(
+        p => p.employeeId === record.employeeId && (p.punchDatetime === punchIso || toDeviceWallClockIso(p.punchDatetime) === targetWallClock)
+      );
       if (punchObj) {
         await deletePunch(punchObj.id);
       }
@@ -80,19 +82,20 @@ export function PunchTimeline({ record }: PunchTimelineProps) {
   const dayStart = startOfDay(parseISO(record.date));
   const dayEnd = endOfDay(dayStart);
 
-  // If there are night shift punches, they might go into the next day
-  // Let's expand the window if necessary
-  const sortedPunches = [...punches].sort().map(p => parseISO(p));
-  const firstPunch = sortedPunches[0];
-  const lastPunch = sortedPunches[sortedPunches.length - 1];
-  
-  const timelineStart = firstPunch.getHours() >= 20 || firstPunch.getHours() < 4 ? addDays(dayStart, 0) : dayStart; 
-  // Simplified: we'll just use the interval from first punch to last punch + some padding
-  // or a standard 24h view starting from 6 AM if it's day shift, or 6 PM if it's night shift.
+  const sortedPunchItems = [...punches]
+    .map(raw => {
+      const clean = toDeviceWallClockIso(raw) || raw;
+      return { raw, clean, date: parseISO(clean) };
+    })
+    .filter(item => !isNaN(item.date.getTime()))
+    .sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  if (sortedPunchItems.length === 0) return null;
+
+  const firstPunch = sortedPunchItems[0].date;
   
   const isNight = firstPunch.getHours() >= 18 || firstPunch.getHours() < 4;
   const viewportStart = isNight ? new Date(dayStart.setHours(18, 0, 0, 0)) : new Date(dayStart.setHours(6, 0, 0, 0));
-  const viewportEnd = addDays(viewportStart, 1);
   const totalMinutes = 24 * 60;
 
   const getPos = (date: Date) => {
@@ -154,12 +157,12 @@ export function PunchTimeline({ record }: PunchTimelineProps) {
 
         {/* The rail */}
         <div className="relative w-full h-1.5 bg-slate-200/50 rounded-full overflow-hidden">
-           {punches.length >= 2 && (
+           {sortedPunchItems.length >= 2 && (
              <div 
               className="absolute h-full bg-indigo-500/20"
               style={{ 
-                left: `${getPos(sortedPunches[0])}%`, 
-                width: `${getPos(sortedPunches[sortedPunches.length - 1]) - getPos(sortedPunches[0])}%` 
+                left: `${getPos(sortedPunchItems[0].date)}%`, 
+                width: `${getPos(sortedPunchItems[sortedPunchItems.length - 1].date) - getPos(sortedPunchItems[0].date)}%` 
               }}
              />
            )}
@@ -167,10 +170,10 @@ export function PunchTimeline({ record }: PunchTimelineProps) {
 
         {/* Punch Markers */}
         <div className="absolute inset-0 px-4 flex items-center pointer-events-none">
-          {sortedPunches.map((p, i) => {
+          {sortedPunchItems.map((item, i) => {
             const isFirst = i === 0;
-            const isLast = i === sortedPunches.length - 1;
-            const pos = getPos(p);
+            const isLast = i === sortedPunchItems.length - 1;
+            const pos = getPos(item.date);
             
             return (
               <div 
@@ -184,11 +187,11 @@ export function PunchTimeline({ record }: PunchTimelineProps) {
                   }`} 
                 />
                 <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 bg-slate-800 text-white text-[9px] font-bold px-1.5 py-0.5 rounded invisible group-hover/punch:visible whitespace-nowrap z-30 flex items-center gap-1.5 shadow-xl">
-                  <span>{formatAMPM(p.toISOString())}</span>
+                  <span>{formatAMPM(item.clean)}</span>
                   <button 
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleDelete(p.toISOString());
+                      handleDelete(item.raw);
                     }}
                     className="p-1 hover:bg-rose-500 rounded transition-colors text-white"
                   >

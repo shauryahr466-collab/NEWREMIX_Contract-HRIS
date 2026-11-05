@@ -10,7 +10,8 @@ import { format, parse, parseISO } from 'date-fns';
 import { toast } from 'sonner';
 import { processRosterUpload, generateRosterTemplate } from '../lib/roster';
 import { PageHeader, Card, Button, Input, Badge } from '../components/ui';
-import { fetchLocalTable, saveLocalTable, deleteLocalTableRecords } from '../lib/localClient';
+import { fetchLocalTable, saveLocalTable, deleteLocalTableRecords, saveLocalTableDetailed, deleteLocalTableDetailed } from '../lib/localClient';
+import { useActionStatus } from '../context/ActionStatusContext';
 
 export function Import() {
   const { 
@@ -18,6 +19,8 @@ export function Import() {
     employees, setEmployees, settings, shiftAssignments, setShiftAssignments, 
     calculationSource, setCalculationSource, quotaExceeded, recalculate 
   } = useAppStore();
+
+  const { executeWithStatus } = useActionStatus();
   const [importType, setImportType] = useState<'punch' | 'roster'>('punch');
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
@@ -214,6 +217,177 @@ export function Import() {
     }
   };
 
+  const handleDeletePunchBatch = async (session: { id: string; fileName?: string; count: number; date: string }) => {
+    const sessionName = session.fileName || `Session ${session.id}`;
+    await executeWithStatus(
+      {
+        title: `Delete Punch Import Session?`,
+        subtitle: `Delete ${session.count} punch records from import session "${sessionName}" in SQLite database (E:\\SHRM_HRIS\\Database.db)`,
+        module: 'Punch & Directory Import',
+        actionType: 'delete',
+        severity: 'danger',
+        affectedCount: session.count,
+        details: {
+          'Import Session': sessionName,
+          'Batch ID': session.id,
+          'Import Date': format(parseISO(session.date), 'dd MMM yyyy HH:mm'),
+          'Punches to Delete': `${session.count} logs`
+        },
+        confirmText: `Delete ${session.count} Punches`
+      },
+      async (updateProgress) => {
+        updateProgress({ percent: 30, message: 'Filtering batch punch IDs...' });
+        const batchPunchIds = punches.filter(p => p.importId === session.id).map(p => p.id);
+        
+        updateProgress({ percent: 60, message: `Deleting ${batchPunchIds.length} punches from SQLite database...` });
+        const delRes = await deleteLocalTableDetailed('punches', batchPunchIds);
+        
+        if (!delRes.success) {
+          return { success: false, error: delRes.error || 'Failed to delete punches from SQLite' };
+        }
+
+        updateProgress({ percent: 90, message: 'Updating active punch cache...' });
+        await deletePunchBatch(session.id);
+
+        return {
+          success: true,
+          affectedCount: batchPunchIds.length,
+          verificationStatus: delRes.verificationStatus,
+          transaction: delRes.transaction,
+          dbPath: delRes.dbPath,
+          breakdown: {
+            'Session File': sessionName,
+            'Deleted Records': `${batchPunchIds.length} punches`,
+            'Database Path': 'E:\\SHRM_HRIS\\Database.db'
+          }
+        };
+      }
+    );
+  };
+
+  const handleDeleteSinglePunch = async (punch: RawPunch) => {
+    const emp = employees.find(e => e.id === punch.employeeId);
+    await executeWithStatus(
+      {
+        title: `Delete Biometric Punch Record?`,
+        subtitle: `Deleting punch for ${emp?.name || punch.employeeId} on ${format(parseISO(punch.punchDatetime), 'dd MMM yyyy HH:mm:ss')}`,
+        module: 'Punch & Directory Import',
+        actionType: 'delete',
+        severity: 'danger',
+        affectedCount: 1,
+        details: {
+          'Employee': `${emp?.name || 'Unregistered'} (${punch.employeeId})`,
+          'Punch Timestamp': format(parseISO(punch.punchDatetime), 'dd MMM yyyy HH:mm:ss'),
+          'Punch ID': punch.id
+        },
+        confirmText: 'Delete Record'
+      },
+      async (updateProgress) => {
+        updateProgress({ percent: 40, message: 'Executing SQLite delete on punches table...' });
+        const delRes = await deleteLocalTableDetailed('punches', [punch.id]);
+        
+        if (!delRes.success) {
+          return { success: false, error: delRes.error || 'Failed to delete punch from SQLite' };
+        }
+
+        updateProgress({ percent: 90, message: 'Updating memory workspace...' });
+        await deletePunch(punch.id);
+
+        return {
+          success: true,
+          affectedCount: 1,
+          verificationStatus: delRes.verificationStatus,
+          transaction: delRes.transaction,
+          dbPath: delRes.dbPath
+        };
+      }
+    );
+  };
+
+  const handleDeleteRosterBatch = async (batch: RosterBatch) => {
+    await executeWithStatus(
+      {
+        title: `Delete Roster Batch?`,
+        subtitle: `Delete roster batch "${batch.rosterName}" and its assignments from SQLite (E:\\SHRM_HRIS\\Database.db)`,
+        module: 'Punch & Directory Import',
+        actionType: 'delete',
+        severity: 'danger',
+        affectedCount: batch.totalDays || 1,
+        details: {
+          'Roster Batch': batch.rosterName,
+          'Period Window': `${batch.periodStart} → ${batch.periodEnd}`,
+          'Source File': batch.sourceFileName || 'File Import',
+          'Imported At': format(parseISO(batch.importedAt), 'dd MMM yyyy HH:mm')
+        },
+        confirmText: 'Delete Roster Batch'
+      },
+      async (updateProgress) => {
+        updateProgress({ percent: 40, message: 'Deleting roster batch from SQLite database...' });
+        const delRes = await deleteLocalTableDetailed('roster_batches', [batch.id]);
+        
+        if (!delRes.success) {
+          return { success: false, error: delRes.error || 'Failed to delete roster batch from SQLite' };
+        }
+
+        updateProgress({ percent: 70, message: 'Refreshing roster batch index...' });
+        await loadRosterBatches();
+
+        return {
+          success: true,
+          affectedCount: 1,
+          verificationStatus: delRes.verificationStatus,
+          transaction: delRes.transaction,
+          dbPath: delRes.dbPath
+        };
+      }
+    );
+  };
+
+  const handlePurgeAllPunches = async () => {
+    const punchCount = punches.length;
+    await executeWithStatus(
+      {
+        title: `CRITICAL: Purge All Punch Logs?`,
+        subtitle: `Permanently delete all ${punchCount} biometric punch logs across all employees from local SQLite database (E:\\SHRM_HRIS\\Database.db).`,
+        module: 'Punch & Directory Import',
+        actionType: 'delete',
+        severity: 'danger',
+        affectedCount: punchCount,
+        details: {
+          'Database Target': 'E:\\SHRM_HRIS\\Database.db (punches table)',
+          'Total Records to Delete': `${punchCount} biometric punches`,
+          'Warning': 'This operation cannot be undone. All historical punch timestamps will be cleared.'
+        },
+        confirmText: `PURGE ALL ${punchCount} PUNCHES`
+      },
+      async (updateProgress) => {
+        updateProgress({ percent: 20, message: 'Purging local SQLite punches table...' });
+        const allPunchIds = punches.map(p => p.id);
+        const delRes = await deleteLocalTableDetailed('punches', allPunchIds);
+
+        if (!delRes.success) {
+          return { success: false, error: delRes.error || 'Failed to purge punches table in SQLite' };
+        }
+
+        updateProgress({ percent: 80, message: 'Clearing memory state and active cache...' });
+        await clearPunches();
+
+        return {
+          success: true,
+          affectedCount: punchCount,
+          verificationStatus: delRes.verificationStatus,
+          transaction: delRes.transaction,
+          dbPath: delRes.dbPath,
+          breakdown: {
+            'Purged Records': `${punchCount} logs`,
+            'Active Punches Remaining': '0 logs',
+            'Database Path': 'E:\\SHRM_HRIS\\Database.db'
+          }
+        };
+      }
+    );
+  };
+
   const processFile = async () => {
     if (!file) return;
     setStatus('processing');
@@ -342,16 +516,30 @@ export function Import() {
 
               const rawEmpId = matchedId;
 
+              const toExactLocalIso = (d: Date) => {
+                const pad = (n: number) => String(n).padStart(2, '0');
+                return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+              };
+
               if (rowDateTimeKey) {
                 const rawDT = row[rowDateTimeKey];
                 let punchIso = '';
                 if (typeof rawDT === 'number') {
                   const dateObj = new Date(Math.round((rawDT - 25569) * 864e5));
-                  punchIso = dateObj.toISOString();
+                  // Excel serial dates are UTC-based wall clock values
+                  const pad = (n: number) => String(n).padStart(2, '0');
+                  punchIso = `${dateObj.getUTCFullYear()}-${pad(dateObj.getUTCMonth() + 1)}-${pad(dateObj.getUTCDate())}T${pad(dateObj.getUTCHours())}:${pad(dateObj.getUTCMinutes())}:${pad(dateObj.getUTCSeconds())}`;
                 } else if (typeof rawDT === 'string') {
-                  const parsed = new Date(rawDT);
-                  if (!isNaN(parsed.getTime())) {
-                    punchIso = parsed.toISOString();
+                  const cleanStr = rawDT.trim().replace(/^"|"$/g, '');
+                  const ymdMatch = cleanStr.match(/^(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})[T\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+                  if (ymdMatch) {
+                    const pad = (n: string | number) => String(n).padStart(2, '0');
+                    punchIso = `${ymdMatch[1]}-${pad(ymdMatch[2])}-${pad(ymdMatch[3])}T${pad(ymdMatch[4])}:${pad(ymdMatch[5])}:${pad(ymdMatch[6] || '00')}`;
+                  } else {
+                    const parsed = new Date(cleanStr);
+                    if (!isNaN(parsed.getTime())) {
+                      punchIso = toExactLocalIso(parsed);
+                    }
                   }
                 }
                 
@@ -371,7 +559,8 @@ export function Import() {
                 const rawDate = row[rowDateKey];
                 if (typeof rawDate === 'number') {
                   const dateObj = new Date(Math.round((rawDate - 25569) * 864e5));
-                  datePart = format(dateObj, 'yyyy-MM-dd');
+                  const pad = (n: number) => String(n).padStart(2, '0');
+                  datePart = `${dateObj.getUTCFullYear()}-${pad(dateObj.getUTCMonth() + 1)}-${pad(dateObj.getUTCDate())}`;
                 } else if (typeof rawDate === 'string') {
                   try {
                     const parsedDate = new Date(rawDate);
@@ -400,15 +589,14 @@ export function Import() {
                       if (isNaN(Number(tStr))) {
                         // It's a string time like "1:10 PM" or "13:10"
                         const parsed = new Date(`${datePart} ${tStr}`);
-                        if (!isNaN(parsed.getTime())) pIso = parsed.toISOString();
+                        if (!isNaN(parsed.getTime())) pIso = toExactLocalIso(parsed);
                       } else {
                         // It's an Excel numeric time
                         const t = Number(tStr);
                         const hours = Math.floor(t * 24);
                         const minutes = Math.floor((t * 24 - hours) * 60);
                         const seconds = Math.floor(((t * 24 - hours) * 60 - minutes) * 60);
-                        const parsed = new Date(`${datePart} ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`);
-                        if (!isNaN(parsed.getTime())) pIso = parsed.toISOString();
+                        pIso = `${datePart}T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
                       }
                       if (pIso) {
                         finalNewPunchesRaw.push({
@@ -436,17 +624,64 @@ export function Import() {
           }
 
           // Deduplicate new punches based on ID
-          const uniqueNewPunchesMap = new Map();
+          const uniqueNewPunchesMap = new Map<string, RawPunch>();
           finalNewPunchesRaw.forEach(p => uniqueNewPunchesMap.set(p.id, p));
           const finalNewPunches = Array.from(uniqueNewPunchesMap.values());
 
-          setMessage(`Saving ${finalNewPunches.length} punches to workspace...`);
-          setPunches(finalNewPunches, (msg) => setMessage(msg));
-          
-          setCalculationSource('all');
-          setStatus('success');
-          setMessage(`Successfully imported ${finalNewPunches.length} records.`);
-          toast.success(`Successfully imported ${finalNewPunches.length} records.`);
+          const uniqueEmps = new Set(finalNewPunches.map(p => p.employeeId));
+          const minDate = finalNewPunches.reduce((min, p) => !min || p.punchDatetime < min ? p.punchDatetime : min, '');
+          const maxDate = finalNewPunches.reduce((max, p) => !max || p.punchDatetime > max ? p.punchDatetime : max, '');
+
+          await executeWithStatus(
+            {
+              title: `Import ${finalNewPunches.length} Punch Records from ${file.name}?`,
+              subtitle: `Validate and commit biometric punch records to local SQLite database (E:\\SHRM_HRIS\\Database.db)`,
+              module: 'Punch & Directory Import',
+              actionType: 'import',
+              affectedCount: finalNewPunches.length,
+              details: {
+                'Source File': file.name,
+                'Total Valid Punches': `${finalNewPunches.length} punches`,
+                'Employees Matched': `${uniqueEmps.size} staff members`,
+                'Date Span': `${minDate ? minDate.slice(0, 10) : 'N/A'} → ${maxDate ? maxDate.slice(0, 10) : 'N/A'}`,
+                'Destination Table': 'E:\\SHRM_HRIS\\Database.db (punches)'
+              },
+              confirmText: `Import ${finalNewPunches.length} Punches`
+            },
+            async (updateProgress) => {
+              updateProgress({ percent: 30, message: `Writing ${finalNewPunches.length} records to local SQLite database...` });
+              const saveRes = await saveLocalTableDetailed('punches', finalNewPunches);
+              
+              if (!saveRes.success) {
+                return {
+                  success: false,
+                  error: saveRes.error || 'Failed to save punches into SQLite database'
+                };
+              }
+
+              updateProgress({ percent: 75, message: 'Updating memory workspace and recalculating shifts...' });
+              await setPunches(finalNewPunches, (msg) => setMessage(msg));
+              
+              setCalculationSource('all');
+              setStatus('success');
+              setMessage(`Successfully imported ${finalNewPunches.length} records.`);
+              toast.success(`Successfully imported ${finalNewPunches.length} records.`);
+
+              return {
+                success: true,
+                affectedCount: finalNewPunches.length,
+                verificationStatus: saveRes.verificationStatus,
+                transaction: saveRes.transaction,
+                dbPath: saveRes.dbPath,
+                breakdown: {
+                  'Imported Punches': `${finalNewPunches.length} records`,
+                  'Matched Staff': `${uniqueEmps.size} employees`,
+                  'Database Target': 'E:\\SHRM_HRIS\\Database.db',
+                  'Verification Status': saveRes.verificationStatus === 'PASSED' ? 'PASSED (Readback verified)' : 'Completed'
+                }
+              };
+            }
+          );
         } else {
           // Roster Import Process
           const aoa = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
@@ -597,84 +832,115 @@ export function Import() {
   // Confirm and Save Roster Batch to SQLite Database
   const confirmAndSaveRoster = async () => {
     if (!file || rosterAuditRecords.length === 0 || isRosterSaving) return;
-    setIsRosterSaving(true);
-    setRosterSaveProgress('Initializing SQLite roster batch save...');
-
-    try {
-      const nowIso = new Date().toISOString();
-      const batchId = `ROSTER_${Date.now()}`;
-      
-      const validRecords = rosterAuditRecords.filter(r => r.status === 'valid' || r.status === 'unknown_shift');
-      if (validRecords.length === 0) {
-        toast.error("No valid roster records to save.");
-        setIsRosterSaving(false);
-        return;
-      }
-
-      // 1. Prepare Roster Batch Record
-      const rosterBatch: RosterBatch = {
-        id: batchId,
-        rosterName: `${file.name.replace(/\.[^/.]+$/, "")} (${rosterBatchMeta.periodStart} to ${rosterBatchMeta.periodEnd})`,
-        periodStart: rosterBatchMeta.periodStart,
-        periodEnd: rosterBatchMeta.periodEnd,
-        totalDays: rosterBatchMeta.totalDays,
-        importedAt: nowIso,
-        importedBy: 'Admin',
-        sourceFileName: file.name,
-        status: 'Active',
-        createdAt: nowIso,
-        updatedAt: nowIso
-      };
-
-      // 2. Prepare Roster Assignments Records for SQLite
-      setRosterSaveProgress(`Saving ${validRecords.length} roster assignments to SQLite Database (Database.db)...`);
-      const rosterAssignments: RosterAssignment[] = validRecords.map(r => ({
-        id: `ra_${r.employeeId}_${r.date}_${batchId}`,
-        rosterBatchId: batchId,
-        employeeId: r.employeeId,
-        rosterDate: r.date,
-        shiftCode: r.shiftCode,
-        shiftStart: r.shiftIn,
-        shiftEnd: r.shiftOut,
-        source: 'Imported Roster',
-        status: 'Active',
-        createdAt: nowIso,
-        updatedAt: nowIso
-      }));
-
-      // 3. Save Batch & Assignments to SQLite Database via local API
-      await saveLocalTable('roster_batches', [rosterBatch]);
-      await saveLocalTable('roster_assignments', rosterAssignments);
-
-      // 4. Update ShiftAssignments in active Store
-      setRosterSaveProgress('Updating active shift assignments & recalculating attendance...');
-      const storeShiftAssignments: ShiftAssignment[] = validRecords.map(r => ({
-        id: `${r.employeeId}_${r.date}`,
-        employeeId: r.employeeId,
-        date: r.date,
-        shiftId: r.resolvedShiftId || r.shiftCode,
-        shiftCode: r.shiftCode,
-        source: 'Imported Roster',
-        rosterBatchId: batchId,
-        status: 'Active'
-      }));
-
-      await setShiftAssignments(storeShiftAssignments);
-
-      // 5. Reload SQLite roster batches
-      await loadRosterBatches();
-
-      toast.success(`Roster Batch Saved! ${validRecords.length} roster assignments permanently saved to SQLite database (Database.db).`);
-      setRosterAuditModalOpen(false);
-      setFile(null);
-      setStatus('success');
-      setMessage(`Successfully saved roster batch with ${validRecords.length} assignments.`);
-    } catch (e: any) {
-      toast.error(e.message || "Failed to save roster batch to SQLite.");
-    } finally {
-      setIsRosterSaving(false);
-      setRosterSaveProgress('');
+    const validRecords = rosterAuditRecords.filter(r => r.status === 'valid' || r.status === 'unknown_shift');
+    if (validRecords.length === 0) {
+      toast.error("No valid roster records to save.");
+      return;
     }
+
+    const batchName = `${file.name.replace(/\.[^/.]+$/, "")} (${rosterBatchMeta.periodStart} to ${rosterBatchMeta.periodEnd})`;
+
+    await executeWithStatus(
+      {
+        title: `Save Roster Batch to Database?`,
+        subtitle: `Saving ${validRecords.length} verified roster assignments to local SQLite database (E:\\SHRM_HRIS\\Database.db)`,
+        module: 'Punch & Directory Import',
+        actionType: 'import',
+        affectedCount: validRecords.length,
+        details: {
+          'Roster File': file.name,
+          'Batch Period': `${rosterBatchMeta.periodStart} → ${rosterBatchMeta.periodEnd}`,
+          'Total Duration': `${rosterBatchMeta.totalDays} Days`,
+          'Valid Assignments': `${validRecords.length} records`,
+          'Destination': 'E:\\SHRM_HRIS\\Database.db (roster_batches, roster_assignments)'
+        },
+        confirmText: `Save ${validRecords.length} Roster Records`
+      },
+      async (updateProgress) => {
+        setIsRosterSaving(true);
+        const nowIso = new Date().toISOString();
+        const batchId = `ROSTER_${Date.now()}`;
+
+        // 1. Prepare Roster Batch Record
+        const rosterBatch: RosterBatch = {
+          id: batchId,
+          rosterName: batchName,
+          periodStart: rosterBatchMeta.periodStart,
+          periodEnd: rosterBatchMeta.periodEnd,
+          totalDays: rosterBatchMeta.totalDays,
+          importedAt: nowIso,
+          importedBy: 'Admin',
+          sourceFileName: file.name,
+          status: 'Active',
+          createdAt: nowIso,
+          updatedAt: nowIso
+        };
+
+        // 2. Prepare Roster Assignments Records for SQLite
+        updateProgress({ percent: 30, message: `Preparing ${validRecords.length} roster assignments...` });
+        const rosterAssignments: RosterAssignment[] = validRecords.map(r => ({
+          id: `ra_${r.employeeId}_${r.date}_${batchId}`,
+          rosterBatchId: batchId,
+          employeeId: r.employeeId,
+          rosterDate: r.date,
+          shiftCode: r.shiftCode,
+          shiftStart: r.shiftIn,
+          shiftEnd: r.shiftOut,
+          source: 'Imported Roster',
+          status: 'Active',
+          createdAt: nowIso,
+          updatedAt: nowIso
+        }));
+
+        // 3. Save Batch & Assignments to SQLite Database via local API
+        updateProgress({ percent: 65, message: 'Writing batch and assignments to SQLite Database...' });
+        await saveLocalTable('roster_batches', [rosterBatch]);
+        const saveRes = await saveLocalTableDetailed('roster_assignments', rosterAssignments);
+
+        if (!saveRes.success) {
+          setIsRosterSaving(false);
+          return {
+            success: false,
+            error: saveRes.error || 'Failed to commit roster assignments to SQLite'
+          };
+        }
+
+        // 4. Update ShiftAssignments in active Store
+        updateProgress({ percent: 85, message: 'Updating active shift assignments & recalculating attendance...' });
+        const storeShiftAssignments: ShiftAssignment[] = validRecords.map(r => ({
+          id: `${r.employeeId}_${r.date}`,
+          employeeId: r.employeeId,
+          date: r.date,
+          shiftId: r.resolvedShiftId || r.shiftCode,
+          shiftCode: r.shiftCode,
+          source: 'Imported Roster',
+          rosterBatchId: batchId,
+          status: 'Active'
+        }));
+
+        await setShiftAssignments(storeShiftAssignments);
+        await loadRosterBatches();
+
+        setRosterAuditModalOpen(false);
+        setFile(null);
+        setStatus('success');
+        setIsRosterSaving(false);
+
+        return {
+          success: true,
+          affectedCount: validRecords.length,
+          verificationStatus: saveRes.verificationStatus,
+          transaction: saveRes.transaction,
+          dbPath: saveRes.dbPath,
+          breakdown: {
+            'Batch ID': batchId,
+            'Roster Name': batchName,
+            'Committed Assignments': `${validRecords.length} records`,
+            'Database Path': 'E:\\SHRM_HRIS\\Database.db'
+          }
+        };
+      }
+    );
   };
 
   return (
@@ -872,12 +1138,7 @@ export function Import() {
                                <Button 
                                  variant="danger" 
                                  size="sm" 
-                                 onClick={async () => {
-                                   if (window.confirm(`Delete batch with ${s.count} records?`)) {
-                                     await deletePunchBatch(s.id);
-                                     toast.success("Batch deleted");
-                                   }
-                                 }}
+                                 onClick={() => handleDeletePunchBatch(s)}
                                >
                                  <Trash2 size={12} />
                                </Button>
@@ -921,12 +1182,7 @@ export function Import() {
                                <Button 
                                  variant="danger" 
                                  size="sm" 
-                                 onClick={async () => {
-                                   if (window.confirm("Delete this individual record?")) {
-                                     await deletePunch(p.id);
-                                     toast.success("Record deleted");
-                                   }
-                                 }}
+                                 onClick={() => handleDeleteSinglePunch(p)}
                                >
                                  <Trash2 size={12} />
                                </Button>
@@ -991,13 +1247,7 @@ export function Import() {
                           <Button 
                             variant="danger" 
                             size="sm" 
-                            onClick={async () => {
-                              if (window.confirm(`Delete Roster Batch '${b.rosterName}' from SQLite database?`)) {
-                                await deleteLocalTableRecords('roster_batches', [b.id]);
-                                toast.success("Roster batch deleted from SQLite database.");
-                                loadRosterBatches();
-                              }
-                            }}
+                            onClick={() => handleDeleteRosterBatch(b)}
                           >
                             <Trash2 size={12} />
                           </Button>
@@ -1033,7 +1283,7 @@ export function Import() {
                <Button 
                  variant="danger" 
                  className="w-full gap-2"
-                 onClick={() => setIsConfirmingPurge(true)}
+                 onClick={handlePurgeAllPunches}
                  disabled={punches.length === 0}
                >
                  <Trash2 size={14} /> Purge Database

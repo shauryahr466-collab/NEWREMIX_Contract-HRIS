@@ -15,7 +15,7 @@ import {
 import { Card, Button, Input } from '../ui';
 import { MusterCellModal } from './MusterCellModal';
 import { Employee, ProcessedAttendance, ShiftMaster, RawPunch } from '../../types';
-import { formatAMPM, cn } from '../../lib/utils';
+import { formatAMPM, cn, toDeviceWallClockIso } from '../../lib/utils';
 import { parseISO, format, isWithinInterval, parse } from 'date-fns';
 
 export function AttendanceCalendar() {
@@ -120,10 +120,12 @@ export function AttendanceCalendar() {
   const punchesByEmpDate = useMemo(() => {
     const map = new Map<string, RawPunch[]>();
     punches.forEach(p => {
-      const datePart = p.punchDatetime.split(/[ T]/)[0];
+      const cleanDt = toDeviceWallClockIso(p.punchDatetime);
+      if (!cleanDt) return;
+      const datePart = cleanDt.split(/[ T]/)[0];
       const key = `${p.employeeId}_${datePart}`;
       if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(p);
+      map.get(key)!.push({ ...p, punchDatetime: cleanDt });
     });
     return map;
   }, [punches]);
@@ -372,10 +374,10 @@ export function AttendanceCalendar() {
           </div>
 
           <div className="flex items-center gap-2">
-            <Button size="xs" className="bg-sky-600 hover:bg-sky-700 text-white font-bold gap-1">
+            <Button size="sm" className="bg-sky-600 hover:bg-sky-700 text-white font-bold gap-1">
               <Pin size={12} /> Unpin
             </Button>
-            <Button size="xs" className="bg-amber-600 hover:bg-amber-700 text-white font-bold gap-1">
+            <Button size="sm" className="bg-amber-600 hover:bg-amber-700 text-white font-bold gap-1">
               <X size={12} /> Close
             </Button>
           </div>

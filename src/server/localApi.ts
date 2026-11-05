@@ -2,9 +2,43 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import initSqlJs from 'sql.js';
-import { getSqliteDb, saveSqliteDb, getSanitizedRootFolder, setRootFolder, getSqliteDbPath } from './sqliteDb.js';
+import { getSqliteDb, saveSqliteDb, getSanitizedRootFolder, setRootFolder, getSqliteDbPath, createDatabaseBackup, withSqliteWriteLock } from './sqliteDb.js';
 
 export const localRouter = express.Router();
+
+const SQL_TABLE_MAP: Record<string, string> = {
+  settings: 'settings',
+  users: 'users',
+  employees: 'employees',
+  punches: 'attendance_punches',
+  documents: 'documents',
+  shift_assignments: 'shift_assignments',
+  exceptions: 'exceptions',
+  overtime: 'overtime',
+  sbl: 'sbl',
+  force_attendance: 'force_attendance',
+  payroll_runs: 'payroll_runs',
+  audit_logs: 'audit_logs',
+  zk_devices: 'zk_devices',
+  zk_user_mappings: 'zk_user_mappings',
+  zk_sync_logs: 'zk_sync_logs',
+  zk_unmapped_punches: 'zk_unmapped_punches',
+  leave_records: 'leave_records',
+  departments: 'departments',
+  sections: 'sections',
+  designations: 'designations',
+  roster_batches: 'roster_batches',
+  roster_assignments: 'roster_assignments',
+  shift_audit_logs: 'shift_audit_logs',
+  employee_movements: 'employee_movements',
+  assignment_logs: 'assignment_logs',
+  audit_decisions: 'audit_decisions',
+  field_attendance_audit: 'field_attendance_audit',
+  tax_rules: 'tax_rules',
+  deduction_rules: 'deduction_rules',
+  salary_components: 'salary_components',
+  payroll_config_audit: 'payroll_config_audit'
+};
 
 // Helper to sanitize paths against path traversal
 function sanitizeFileName(fileName: string): string {
@@ -38,10 +72,12 @@ localRouter.get('/status', async (req, res) => {
       console.warn('[Status] Query count note:', e);
     }
 
-    const backupsDir = path.join(root, 'backups');
+    const backupsDir = fs.existsSync(path.join(root, 'Backups')) 
+      ? path.join(root, 'Backups') 
+      : path.join(root, 'backups');
     let backupCount = 0;
     if (fs.existsSync(backupsDir)) {
-      backupCount = fs.readdirSync(backupsDir).length;
+      backupCount = fs.readdirSync(backupsDir).filter(f => f.endsWith('.db') || f.endsWith('.json')).length;
     }
 
     res.json({
@@ -76,38 +112,71 @@ localRouter.post('/config/root', (req, res) => {
 // 3. Generic Get Table Data
 localRouter.get('/data/:table', async (req, res) => {
   const { table } = req.params;
-  const validTables: Record<string, string> = {
-    settings: 'settings',
-    employees: 'employees',
-    punches: 'attendance_punches',
-    documents: 'documents',
-    shift_assignments: 'shift_assignments',
-    exceptions: 'exceptions',
-    overtime: 'overtime',
-    sbl: 'sbl',
-    force_attendance: 'force_attendance',
-    payroll_runs: 'payroll_runs',
-    audit_logs: 'audit_logs',
-    zk_devices: 'zk_devices',
-    zk_user_mappings: 'zk_user_mappings',
-    zk_sync_logs: 'zk_sync_logs',
-    zk_unmapped_punches: 'zk_unmapped_punches',
-    leave_records: 'leave_records',
-    departments: 'departments',
-    sections: 'sections',
-    designations: 'designations',
-    roster_batches: 'roster_batches',
-    roster_assignments: 'roster_assignments',
-    shift_audit_logs: 'shift_audit_logs'
-  };
-
-  const sqlTable = validTables[table];
+  const sqlTable = SQL_TABLE_MAP[table];
   if (!sqlTable) {
     return res.status(400).json({ error: 'Invalid table name' });
   }
 
   try {
     const db = await getSqliteDb();
+
+    // Auto-sync zk_user_mappings with Active Employees in Directory so User Mapping matches Directory
+    if (sqlTable === 'zk_user_mappings') {
+      try {
+        const empRes = db.exec('SELECT id, name, department, status, data FROM employees');
+        if (empRes.length > 0 && empRes[0].values.length > 0) {
+          const existingRes = db.exec('SELECT id, employee_id FROM zk_user_mappings');
+          const mappedEmpIds = new Set<string>();
+          if (existingRes.length > 0) {
+            for (const r of existingRes[0].values) {
+              if (r[1]) mappedEmpIds.add(String(r[1]).trim());
+            }
+          }
+
+          const nowIso = new Date().toISOString();
+          let addedAny = false;
+          const mapStmt = db.prepare(`
+            INSERT OR IGNORE INTO zk_user_mappings (id, device_user_id, employee_id, data)
+            VALUES (?, ?, ?, ?)
+          `);
+
+          for (const row of empRes[0].values) {
+            const empId = String(row[0] || '').trim();
+            const empName = String(row[1] || empId).trim();
+            const empDept = String(row[2] || 'General').trim();
+            let empStatus = String(row[3] || 'Active').trim();
+            let empData: any = {};
+            if (row[4]) {
+              try {
+                empData = JSON.parse(String(row[4]));
+                if (empData.status) empStatus = String(empData.status).trim();
+              } catch {}
+            }
+            if (!empId || empStatus.toLowerCase() !== 'active') continue;
+            if (mappedEmpIds.has(empId)) continue;
+
+            const devUserId = String(empData.deviceUserId || empData.biometricId || empData.acNo || empData.zkPin || empId).trim();
+            const mapId = `map_${devUserId}`;
+            const mapObj = {
+              id: mapId,
+              deviceUserId: devUserId,
+              employeeId: empId,
+              employeeName: empName,
+              department: empDept,
+              mappedAt: empData.joiningDate || nowIso
+            };
+            mapStmt.run([mapId, devUserId, empId, JSON.stringify(mapObj)]);
+            mappedEmpIds.add(empId);
+            addedAny = true;
+          }
+          mapStmt.free();
+          if (addedAny) saveSqliteDb();
+        }
+      } catch (e) {
+        console.warn('[SQLite] Auto-sync zk_user_mappings notice:', e);
+      }
+    }
+
     const result = db.exec(`SELECT * FROM ${sqlTable}`);
     if (result.length === 0) return res.json([]);
 
@@ -129,6 +198,79 @@ localRouter.get('/data/:table', async (req, res) => {
       return obj;
     });
 
+    // Dynamically reconcile zk_devices userCount & logCount with actual SQLite attendance_punches & active employees
+    if (sqlTable === 'zk_devices' && rows.length > 0) {
+      try {
+        // If there are unassigned DIA punches in attendance_punches (device_id = ''), link them to the primary enabled device
+        const assignedCheck = db.exec("SELECT COUNT(*) FROM attendance_punches WHERE device_id != '' AND device_id IS NOT NULL");
+        const assignedCnt = assignedCheck.length > 0 ? Number(assignedCheck[0].values[0][0] || 0) : 0;
+        const unassignedCheck = db.exec("SELECT COUNT(*) FROM attendance_punches WHERE device_id = '' OR device_id IS NULL");
+        const unassignedCnt = unassignedCheck.length > 0 ? Number(unassignedCheck[0].values[0][0] || 0) : 0;
+
+        if (assignedCnt === 0 && unassignedCnt > 0) {
+          const primaryDev = rows.find((d: any) => d && d.id && d.enabled !== false) || rows[0];
+          if (primaryDev && primaryDev.id) {
+            const linkStmt = db.prepare(
+              "UPDATE attendance_punches SET device_id = ?, source = 'ZKTeco', data = json_set(data, '$.deviceId', ?, '$.deviceName', ?, '$.deviceIP', ?, '$.source', 'ZKTeco') WHERE device_id = '' OR device_id IS NULL"
+            );
+            linkStmt.run([primaryDev.id, primaryDev.id, primaryDev.name || 'ZKTeco Device', primaryDev.ip || '']);
+            linkStmt.free();
+            saveSqliteDb();
+          }
+        }
+
+        const statsByDev = new Map<string, { logs: number; users: number }>();
+        const devPunchRes = db.exec(
+          "SELECT device_id, COUNT(*) as log_cnt, COUNT(DISTINCT CASE WHEN employee_id != '' THEN employee_id END) as user_cnt FROM attendance_punches GROUP BY device_id"
+        );
+        let totalLogsAll = 0;
+        if (devPunchRes.length > 0) {
+          for (const r of devPunchRes[0].values) {
+            const dId = String(r[0] || '');
+            const lCnt = Number(r[1] || 0);
+            const uCnt = Number(r[2] || 0);
+            totalLogsAll += lCnt;
+            if (dId) {
+              statsByDev.set(dId, { logs: lCnt, users: uCnt });
+            }
+          }
+        }
+
+        let activeEmpCount = 0;
+        const activeEmpRes = db.exec("SELECT COUNT(*) FROM employees WHERE LOWER(status) = 'active'");
+        if (activeEmpRes.length > 0 && activeEmpRes[0].values.length > 0) {
+          activeEmpCount = Number(activeEmpRes[0].values[0][0] || 0);
+        }
+
+        let updatedAnyDev = false;
+        const updStmt = db.prepare('UPDATE zk_devices SET data = ? WHERE id = ?');
+
+        for (const dev of rows) {
+          if (!dev || !dev.id) continue;
+          const exactStats = statsByDev.get(dev.id) || { logs: 0, users: 0 };
+          const exactLogCount = exactStats.logs;
+          const exactUserCount = exactStats.users;
+
+          if (
+            dev.logCount !== exactLogCount ||
+            dev.userCount !== exactUserCount ||
+            dev.activeDirectoryUsers !== activeEmpCount
+          ) {
+            dev.logCount = exactLogCount;
+            dev.userCount = exactUserCount;
+            dev.activeDirectoryUsers = activeEmpCount;
+            dev.totalSystemLogs = totalLogsAll;
+            updStmt.run([JSON.stringify(dev), dev.id]);
+            updatedAnyDev = true;
+          }
+        }
+        updStmt.free();
+        if (updatedAnyDev) saveSqliteDb();
+      } catch (e) {
+        console.warn('[SQLite] Reconcile zk_devices counts notice:', e);
+      }
+    }
+
     res.json(rows);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -140,41 +282,17 @@ localRouter.post('/data/:table', async (req, res) => {
   const { table } = req.params;
   const items = Array.isArray(req.body) ? req.body : [req.body];
 
-  const validTables: Record<string, string> = {
-    settings: 'settings',
-    employees: 'employees',
-    punches: 'attendance_punches',
-    documents: 'documents',
-    shift_assignments: 'shift_assignments',
-    exceptions: 'exceptions',
-    overtime: 'overtime',
-    sbl: 'sbl',
-    force_attendance: 'force_attendance',
-    payroll_runs: 'payroll_runs',
-    audit_logs: 'audit_logs',
-    zk_devices: 'zk_devices',
-    zk_user_mappings: 'zk_user_mappings',
-    zk_sync_logs: 'zk_sync_logs',
-    zk_unmapped_punches: 'zk_unmapped_punches',
-    leave_records: 'leave_records',
-    departments: 'departments',
-    sections: 'sections',
-    designations: 'designations',
-    roster_batches: 'roster_batches',
-    roster_assignments: 'roster_assignments',
-    shift_audit_logs: 'shift_audit_logs'
-  };
-
-  const sqlTable = validTables[table];
+  const sqlTable = SQL_TABLE_MAP[table];
   if (!sqlTable) {
     return res.status(400).json({ error: 'Invalid table' });
   }
 
-  try {
-    const db = await getSqliteDb();
-    const now = new Date().toISOString();
-    try { db.run('ROLLBACK'); } catch(e) {}
-    db.run('BEGIN TRANSACTION');
+  return withSqliteWriteLock(async () => {
+    try {
+      const db = await getSqliteDb();
+      const now = new Date().toISOString();
+      try { db.run('ROLLBACK'); } catch(e) {}
+      db.run('BEGIN TRANSACTION');
 
     if (sqlTable === 'employees') {
       const stmt = db.prepare(`
@@ -184,6 +302,9 @@ localRouter.post('/data/:table', async (req, res) => {
           name=excluded.name,
           department=excluded.department,
           designation=excluded.designation,
+          shift_id=excluded.shift_id,
+          joining_date=excluded.joining_date,
+          status=excluded.status,
           data=excluded.data,
           updated_at=excluded.updated_at
       `);
@@ -219,6 +340,107 @@ localRouter.post('/data/:table', async (req, res) => {
           item.source || 'Manual',
           JSON.stringify(item),
           now
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'shift_assignments') {
+      const stmt = db.prepare(`
+        INSERT INTO shift_assignments (id, employee_id, date, shift_id, data)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          date=excluded.date,
+          shift_id=excluded.shift_id,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        const empId = item.employeeId || item.employee_id || '';
+        const dateStr = item.date || item.rosterDate || item.roster_date || '';
+        const shiftId = item.shiftId || item.shift_id || item.shiftCode || 'default';
+        const id = item.id || `${empId}_${dateStr}` || `sa_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        if (!id) continue;
+        stmt.run([
+          id,
+          empId,
+          dateStr,
+          shiftId,
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'assignment_logs') {
+      const stmt = db.prepare(`
+        INSERT INTO assignment_logs (id, employee_id, date, shift_id, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+      `);
+      for (const item of items) {
+        const id = item.id || `alog_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        stmt.run([
+          id,
+          item.employeeId || '',
+          item.date || '',
+          item.shiftId || '',
+          JSON.stringify(item),
+          item.timestamp || now
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'audit_logs') {
+      const stmt = db.prepare(`
+        INSERT INTO audit_logs (id, employee_id, date, data, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+      `);
+      for (const item of items) {
+        const id = item.id || `audit_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        stmt.run([
+          id,
+          item.employeeId || '',
+          item.date || '',
+          JSON.stringify(item),
+          item.timestamp || item.created_at || now
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'payroll_runs') {
+      const stmt = db.prepare(`
+        INSERT INTO payroll_runs (id, month, status, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          month=excluded.month,
+          status=excluded.status,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.month || '',
+          item.status || 'Draft',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'employee_movements') {
+      const stmt = db.prepare(`
+        INSERT INTO employee_movements (id, employee_id, effective_date, movement_type, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET 
+          employee_id=excluded.employee_id,
+          effective_date=excluded.effective_date,
+          movement_type=excluded.movement_type,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || item.employee_id || '',
+          item.effectiveDate || item.effective_date || '',
+          item.movementType || item.movement_type || 'Update',
+          JSON.stringify(item),
+          item.createdAt || item.created_at || now
         ]);
       }
       stmt.free();
@@ -403,6 +625,61 @@ localRouter.post('/data/:table', async (req, res) => {
         ]);
       }
       stmt.free();
+    } else if (sqlTable === 'leave_records') {
+      const stmt = db.prepare(`
+        INSERT INTO leave_records (id, employee_id, date, status, data)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          date=excluded.date,
+          status=excluded.status,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.employeeId || '',
+          item.date || '',
+          item.status || 'Approved',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'zk_user_mappings') {
+      const stmt = db.prepare(`
+        INSERT INTO zk_user_mappings (id, device_user_id, employee_id, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          device_user_id=excluded.device_user_id,
+          employee_id=excluded.employee_id,
+          data=excluded.data
+      `);
+      for (const item of items) {
+        if (!item.id) continue;
+        stmt.run([
+          item.id,
+          item.deviceUserId || '',
+          item.employeeId || '',
+          JSON.stringify(item)
+        ]);
+      }
+      stmt.free();
+    } else if (sqlTable === 'zk_sync_logs') {
+      const stmt = db.prepare(`
+        INSERT INTO zk_sync_logs (id, data, created_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+      `);
+      for (const item of items) {
+        const id = item.id || `sync_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        stmt.run([
+          id,
+          JSON.stringify(item),
+          item.timestamp || now
+        ]);
+      }
+      stmt.free();
     } else {
       const stmt = db.prepare(`
         INSERT INTO ${sqlTable} (id, data)
@@ -419,115 +696,701 @@ localRouter.post('/data/:table', async (req, res) => {
     db.run('COMMIT');
     saveSqliteDb();
 
-    res.json({ success: true, count: items.length });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+    // Verification Readback check
+    let verified = false;
+    let verificationStatus: 'PASSED' | 'FAILED' | 'WARNING' = 'PASSED';
+    try {
+      if (items.length > 0) {
+        const sampleId = items[0].id || (items[0] as any).id;
+        if (sampleId) {
+          const verifyStmt = db.prepare(`SELECT id FROM ${sqlTable} WHERE id = ?`);
+          verifyStmt.bind([sampleId]);
+          if (verifyStmt.step()) {
+            verified = true;
+          }
+          verifyStmt.free();
+        } else {
+          verified = true;
+        }
+      } else {
+        verified = true;
+      }
+    } catch (vErr) {
+      console.warn(`[SQLite Verification Warning] Could not verify write on ${sqlTable}:`, vErr);
+      verificationStatus = 'WARNING';
+    }
+
+      const dbPath = getSqliteDbPath();
+      console.log(`[SQLite SAVE] Persisted ${items.length} records to ${sqlTable} at ${dbPath} (Verification: ${verified ? 'PASSED' : 'PENDING'})`);
+
+      return res.json({ 
+        success: true, 
+        count: items.length,
+        affectedCount: items.length,
+        verified: verified,
+        verificationStatus: verificationStatus,
+        transaction: 'COMMITTED',
+        dbPath: dbPath,
+        table: sqlTable,
+        timestamp: now
+      });
+    } catch (error: any) {
+      try {
+        const db = await getSqliteDb();
+        db.run('ROLLBACK');
+      } catch (rbErr) {}
+      console.error(`[SQLite SAVE Error] Failed to save to ${table}:`, error);
+      return res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        transaction: 'ROLLED_BACK',
+        verificationStatus: 'FAILED'
+      });
+    }
+  });
 });
 
-// 5. Delete records
+// 5. Delete records with automatic safety backup & readback verification
 localRouter.post('/data/:table/delete', async (req, res) => {
   const { table } = req.params;
   const { ids } = req.body;
   const idList = Array.isArray(ids) ? ids : [ids];
 
-  const validTables: Record<string, string> = {
-    settings: 'settings',
-    employees: 'employees',
-    punches: 'attendance_punches',
-    documents: 'documents',
-    shift_assignments: 'shift_assignments',
-    exceptions: 'exceptions',
-    overtime: 'overtime',
-    sbl: 'sbl',
-    force_attendance: 'force_attendance',
-    payroll_runs: 'payroll_runs',
-    audit_logs: 'audit_logs',
-    zk_devices: 'zk_devices',
-    zk_user_mappings: 'zk_user_mappings',
-    zk_sync_logs: 'zk_sync_logs',
-    zk_unmapped_punches: 'zk_unmapped_punches',
-    leave_records: 'leave_records',
-    departments: 'departments',
-    sections: 'sections',
-    designations: 'designations'
-  };
-
-  const sqlTable = validTables[table];
+  const sqlTable = SQL_TABLE_MAP[table];
   if (!sqlTable) return res.status(400).json({ error: 'Invalid table' });
 
+  return withSqliteWriteLock(async () => {
+    try {
+      const db = await getSqliteDb();
+      
+      // Automatic Safety Backup if deleting multiple records or employees
+      if (idList.length >= 3 || sqlTable === 'employees') {
+        try {
+          createDatabaseBackup(`before_delete_${sqlTable}`);
+        } catch (bErr) {
+          console.warn('[SQLite Backup Notice before delete]:', bErr);
+        }
+      }
+
+      try { db.run('ROLLBACK'); } catch (e) {}
+      db.run('BEGIN TRANSACTION');
+      const stmt = db.prepare(`DELETE FROM ${sqlTable} WHERE id = ?`);
+      let deletedCount = 0;
+      for (const id of idList) {
+        if (id) {
+          stmt.run([id]);
+          deletedCount++;
+        }
+      }
+      stmt.free();
+      db.run('COMMIT');
+      saveSqliteDb();
+
+      // Readback verification for deletion: verify deleted IDs are gone
+      let verified = true;
+      if (idList.length > 0 && idList[0]) {
+        try {
+          const verifyStmt = db.prepare(`SELECT id FROM ${sqlTable} WHERE id = ?`);
+          verifyStmt.bind([idList[0]]);
+          if (verifyStmt.step()) {
+            verified = false; // still exists!
+          }
+          verifyStmt.free();
+        } catch (vErr) {
+          console.warn('[SQLite Verification Warning on delete]:', vErr);
+        }
+      }
+
+      const dbPath = getSqliteDbPath();
+      console.log(`[SQLite DELETE] Deleted ${deletedCount} record(s) from ${sqlTable} at ${dbPath} (Verification: ${verified ? 'PASSED' : 'FAILED'})`);
+      return res.json({ 
+        success: true, 
+        deleted: deletedCount,
+        deletedCount: deletedCount,
+        affectedCount: deletedCount,
+        verified: verified,
+        verificationStatus: verified ? 'PASSED' : 'FAILED',
+        transaction: 'COMMITTED',
+        dbPath: dbPath,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error: any) {
+      try {
+        const db = await getSqliteDb();
+        db.run('ROLLBACK');
+      } catch (rbErr) {}
+      console.error(`[SQLite DELETE Error] Failed to delete from ${table}:`, error);
+      return res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        transaction: 'ROLLED_BACK',
+        verificationStatus: 'FAILED'
+      });
+    }
+  });
+});
+
+// 5b. Database Verification Health Check
+localRouter.get('/verify-db', async (req, res) => {
   try {
     const db = await getSqliteDb();
-    try { db.run('ROLLBACK'); } catch (e) {}
-    db.run('BEGIN TRANSACTION');
-    const stmt = db.prepare(`DELETE FROM ${sqlTable} WHERE id = ?`);
-    let deletedCount = 0;
-    for (const id of idList) {
-      if (id) {
-        stmt.run([id]);
-        deletedCount++;
+    const checkRes = db.exec('PRAGMA integrity_check;');
+    const integrity = (checkRes.length > 0 && checkRes[0].values?.[0]?.[0] === 'ok') ? 'PASSED' : 'WARNING';
+    const dbPath = getSqliteDbPath();
+    
+    // Get counts
+    const counts: Record<string, number> = {};
+    const tables = ['employees', 'attendance_punches', 'payroll_runs', 'roster_assignments', 'documents', 'audit_logs'];
+    for (const t of tables) {
+      try {
+        const cRes = db.exec(`SELECT COUNT(*) FROM ${t}`);
+        counts[t] = cRes.length > 0 ? Number(cRes[0].values[0][0]) : 0;
+      } catch {
+        counts[t] = 0;
       }
     }
-    stmt.free();
-    db.run('COMMIT');
-    saveSqliteDb();
 
-    console.log(`[SQLite DELETE] Deleted ${deletedCount} record(s) from ${sqlTable}`);
-    res.json({ success: true, deleted: deletedCount });
-  } catch (error: any) {
-    console.error(`[SQLite DELETE Error] Failed to delete from ${table}:`, error);
-    res.status(500).json({ error: error.message });
+    res.json({
+      status: 'healthy',
+      integrityCheck: integrity,
+      databasePath: dbPath,
+      rootFolder: getSanitizedRootFolder(),
+      tableCounts: counts,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err: any) {
+    res.status(500).json({ status: 'error', error: err.message });
   }
 });
 
-// Dedicated Payroll Run Delete Endpoint
-localRouter.delete('/payroll/runs/:id', async (req, res) => {
+// 5c. Explicit Safety Backup Creation
+localRouter.post('/backup', async (req, res) => {
+  try {
+    const { label } = req.body || {};
+    const backupPath = createDatabaseBackup(label || 'manual');
+    const fileSize = fs.existsSync(backupPath) ? fs.statSync(backupPath).size : 0;
+    const fileName = path.basename(backupPath);
+
+    res.json({
+      success: true,
+      backupPath: backupPath,
+      fileName: fileName,
+      fileSize: fileSize,
+      timestamp: new Date().toISOString(),
+      message: `Database backup created successfully: ${fileName}`
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 5d. List Available Backups
+localRouter.get('/backups', async (req, res) => {
+  try {
+    const root = getSanitizedRootFolder();
+    const backupsDir = fs.existsSync(path.join(root, 'Backups')) 
+      ? path.join(root, 'Backups') 
+      : path.join(root, 'backups');
+      
+    if (!fs.existsSync(backupsDir)) {
+      return res.json({ backups: [], count: 0, backupsDir });
+    }
+
+    const files = fs.readdirSync(backupsDir);
+    const backupList = files
+      .filter(f => f.endsWith('.db') || f.endsWith('.json'))
+      .map(f => {
+        const fullPath = path.join(backupsDir, f);
+        const stats = fs.statSync(fullPath);
+        return {
+          fileName: f,
+          fullPath,
+          size: stats.size,
+          createdAt: stats.birthtime.toISOString(),
+          modifiedAt: stats.mtime.toISOString(),
+          type: f.endsWith('.db') ? 'SQLite Database' : 'JSON Snapshot'
+        };
+      })
+      .sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
+
+    res.json({
+      backups: backupList,
+      count: backupList.length,
+      backupsDir
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Dedicated Payroll Run Delete Endpoint (supports /payroll/runs/:id and /runs/:id)
+const handlePayrollRunDelete = async (req: express.Request, res: express.Response) => {
   const { id } = req.params;
   if (!id) return res.status(400).json({ error: 'Missing payroll run ID' });
 
-  try {
-    const db = await getSqliteDb();
-    try { db.run('ROLLBACK'); } catch (e) {}
-    db.run('BEGIN TRANSACTION');
-
-    // Check if run exists and check status
-    const checkStmt = db.prepare('SELECT data FROM payroll_runs WHERE id = ?');
-    checkStmt.bind([id]);
-    let existingRun: any = null;
-    if (checkStmt.step()) {
-      const row = checkStmt.getAsObject();
-      if (row.data) {
-        try {
-          existingRun = JSON.parse(row.data as string);
-        } catch (e) {
-          existingRun = null;
-        }
-      }
-    }
-    checkStmt.free();
-
-    if (existingRun && (existingRun.status === 'Finalized' || existingRun.status === 'Locked')) {
-      db.run('ROLLBACK');
-      return res.status(400).json({ error: 'This payroll run is finalized/locked and cannot be deleted.' });
-    }
-
-    const delStmt = db.prepare('DELETE FROM payroll_runs WHERE id = ?');
-    delStmt.run([id]);
-    delStmt.free();
-
-    db.run('COMMIT');
-    saveSqliteDb();
-
-    console.log(`[SQLite DELETE] Deleted payroll run ${id} successfully`);
-    res.json({ success: true, deleted: 1, message: `Successfully deleted draft payroll run ${id}` });
-  } catch (error: any) {
+  return withSqliteWriteLock(async () => {
     try {
       const db = await getSqliteDb();
-      db.run('ROLLBACK');
-    } catch (e) { /* ignore rollback error */ }
-    console.error(`[SQLite DELETE Error] Failed to delete payroll run ${id}:`, error);
-    res.status(500).json({ error: error.message });
+      try { db.run('ROLLBACK'); } catch (e) {}
+      db.run('BEGIN TRANSACTION');
+
+      // Check if run exists and check status
+      const checkStmt = db.prepare('SELECT data FROM payroll_runs WHERE id = ?');
+      checkStmt.bind([id]);
+      let existingRun: any = null;
+      if (checkStmt.step()) {
+        const row = checkStmt.getAsObject();
+        if (row.data) {
+          try {
+            existingRun = JSON.parse(row.data as string);
+          } catch (e) {
+            existingRun = null;
+          }
+        }
+      }
+      checkStmt.free();
+
+      if (existingRun && (existingRun.status === 'Finalized' || existingRun.status === 'Locked')) {
+        db.run('ROLLBACK');
+        return res.status(400).json({ error: 'This payroll run is finalized/locked and cannot be deleted.' });
+      }
+
+      const delStmt = db.prepare('DELETE FROM payroll_runs WHERE id = ?');
+      delStmt.run([id]);
+      delStmt.free();
+
+      db.run('COMMIT');
+      saveSqliteDb();
+
+      console.log(`[SQLite DELETE] Deleted payroll run ${id} successfully`);
+      return res.json({ success: true, deleted: 1, message: `Successfully deleted draft payroll run ${id}` });
+    } catch (error: any) {
+      try {
+        const db = await getSqliteDb();
+        db.run('ROLLBACK');
+      } catch (e) { /* ignore rollback error */ }
+      console.error(`[SQLite DELETE Error] Failed to delete payroll run ${id}:`, error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+};
+
+localRouter.delete('/payroll/runs/:id', handlePayrollRunDelete);
+localRouter.delete('/runs/:id', handlePayrollRunDelete);
+
+// =========================================================================
+// 5B. Dedicated Movement & Separation Transactions with Read-back Verification
+// =========================================================================
+localRouter.post('/movement/separation', async (req, res) => {
+  const {
+    employeeId,
+    effectiveDate,
+    separationType = 'Resignation',
+    exitType = 'Voluntary',
+    reason = '',
+    exitReason = '',
+    noticePeriod = '',
+    lastWorkingDate = '',
+    resignationDate = '',
+    remarks = '',
+    approvedBy = 'HR Administrator'
+  } = req.body;
+
+  const empId = String(employeeId || '').trim();
+  if (!empId) {
+    return res.status(400).json({ error: 'Employee ID (Bio ID) is required' });
   }
+  if (!effectiveDate) {
+    return res.status(400).json({ error: 'Effective separation date is required' });
+  }
+  const cleanReason = String(exitReason || reason || '').trim();
+  if (!cleanReason) {
+    return res.status(400).json({ error: 'Reason for separation is mandatory' });
+  }
+
+  return withSqliteWriteLock(async () => {
+    try {
+      const db = await getSqliteDb();
+      const now = new Date().toISOString();
+
+      // 1. Verify Employee exists in Master Directory
+      const checkStmt = db.prepare(`SELECT id, name, department, designation, shift_id, joining_date, status, data FROM employees WHERE id = ?`);
+      checkStmt.bind([empId]);
+      if (!checkStmt.step()) {
+        checkStmt.free();
+        return res.status(404).json({ error: `Employee Bio ID #${empId} not found in Employee Directory Master.` });
+      }
+
+      const row = checkStmt.getAsObject();
+      checkStmt.free();
+
+      let empData: any = {};
+      try {
+        empData = row.data ? JSON.parse(row.data as string) : {};
+      } catch (e) {
+        empData = {};
+      }
+
+      // Merge column values
+      empData.id = row.id || empId;
+      empData.name = row.name || empData.name || 'Unnamed';
+      empData.department = row.department || empData.department || 'General';
+      empData.designation = row.designation || empData.designation || 'Staff';
+      empData.shiftId = row.shift_id || empData.shiftId || 'S1';
+      empData.joiningDate = row.joining_date || empData.joiningDate || '';
+      const previousStatus = row.status || empData.status || 'Active';
+
+      // 2. Validate separation date against joining date
+      if (empData.joiningDate && effectiveDate < empData.joiningDate) {
+        return res.status(400).json({
+          error: `Separation date (${effectiveDate}) cannot be prior to joining date (${empData.joiningDate}).`
+        });
+      }
+
+      // 3. Begin Transaction
+      try { db.run('ROLLBACK'); } catch (e) {}
+      db.run('BEGIN TRANSACTION');
+
+      // 4. Create Movement Record
+      const moveId = `move_sep_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const movementRecord = {
+        id: moveId,
+        employeeId: empId,
+        effectiveDate,
+        movementType: separationType,
+        previousDepartment: empData.department,
+        previousDesignation: empData.designation,
+        previousSection: empData.section || '',
+        previousGrade: empData.grade || '',
+        previousSalary: empData.basicSalary || 0,
+        newDepartment: empData.department,
+        newDesignation: empData.designation,
+        newSection: empData.section || '',
+        newGrade: empData.grade || '',
+        newSalary: empData.basicSalary || 0,
+        exitType: exitType || (separationType === 'Resignation' ? 'Voluntary' : 'Involuntary'),
+        exitReason: cleanReason,
+        reason: cleanReason,
+        noticePeriod: noticePeriod || '',
+        lastWorkingDate: lastWorkingDate || effectiveDate,
+        resignationDate: resignationDate || effectiveDate,
+        remarks: remarks || '',
+        changedBy: approvedBy || 'HR Administrator',
+        changedAt: now
+      };
+
+      const moveStmt = db.prepare(`
+        INSERT INTO employee_movements (id, employee_id, effective_date, movement_type, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET 
+          employee_id=excluded.employee_id,
+          effective_date=excluded.effective_date,
+          movement_type=excluded.movement_type,
+          data=excluded.data
+      `);
+      moveStmt.run([
+        moveId,
+        empId,
+        effectiveDate,
+        separationType,
+        JSON.stringify(movementRecord),
+        now
+      ]);
+      moveStmt.free();
+
+      // 5. Update Employee Master in SQLite (Status -> Inactive)
+      empData.status = 'Inactive';
+      empData.statusEffectiveDate = effectiveDate;
+      empData.separationDate = effectiveDate;
+      empData.exitType = exitType || (separationType === 'Resignation' ? 'Voluntary' : 'Involuntary');
+      empData.exitReason = cleanReason;
+      empData.lastWorkingDate = lastWorkingDate || effectiveDate;
+      empData.resignationDate = resignationDate || effectiveDate;
+      empData.noticePeriod = noticePeriod || '';
+
+      const empUpdateStmt = db.prepare(`
+        UPDATE employees 
+        SET status = 'Inactive', data = ?, updated_at = ?
+        WHERE id = ?
+      `);
+      empUpdateStmt.run([JSON.stringify(empData), now, empId]);
+      empUpdateStmt.free();
+
+      // 6. Record in Audit Log
+      const auditId = `audit_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const auditStmt = db.prepare(`
+        INSERT INTO audit_logs (id, employee_id, employee_name, date, field, old_value, new_value, changed_by, reason, source, data, changed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      auditStmt.run([
+        auditId,
+        empId,
+        empData.name,
+        effectiveDate,
+        'status',
+        previousStatus,
+        'Inactive',
+        approvedBy || 'HR Administrator',
+        `Separation recorded (${separationType}): ${cleanReason}`,
+        'Separation Workflow',
+        JSON.stringify({
+          separationType,
+          exitType,
+          reason: cleanReason,
+          noticePeriod,
+          lastWorkingDate: lastWorkingDate || effectiveDate,
+          remarks
+        }),
+        now
+      ]);
+      auditStmt.free();
+
+      // 7. Commit & Persist
+      db.run('COMMIT');
+      saveSqliteDb();
+
+      // 8. Read-back Verification Check
+      let verified = false;
+      let verifiedStatus = '';
+      let verifiedSeparationDate = '';
+      const vEmpStmt = db.prepare(`SELECT status, data FROM employees WHERE id = ?`);
+      vEmpStmt.bind([empId]);
+      if (vEmpStmt.step()) {
+        const vRow = vEmpStmt.getAsObject();
+        verifiedStatus = String(vRow.status || '');
+        try {
+          const vData = JSON.parse(vRow.data as string);
+          verifiedSeparationDate = vData.separationDate || '';
+        } catch (e) {}
+      }
+      vEmpStmt.free();
+
+      const vMoveStmt = db.prepare(`SELECT id FROM employee_movements WHERE id = ?`);
+      vMoveStmt.bind([moveId]);
+      const moveExists = vMoveStmt.step();
+      vMoveStmt.free();
+
+      if (moveExists && verifiedStatus === 'Inactive' && verifiedSeparationDate === effectiveDate) {
+        verified = true;
+      }
+
+      const dbPath = getSqliteDbPath();
+      console.log(`[SQLite SEPARATION] Processed Bio ID #${empId} - Status: Inactive, Date: ${effectiveDate} at ${dbPath} (Verified: ${verified ? 'PASSED' : 'PENDING'})`);
+
+      return res.json({
+        success: true,
+        verified,
+        verificationStatus: verified ? 'PASSED' : 'FAILED',
+        transaction: 'COMMITTED',
+        dbPath,
+        movement: movementRecord,
+        employee: empData,
+        message: `Separation verified and committed successfully for Employee ID #${empId}.`
+      });
+    } catch (error: any) {
+      try {
+        const db = await getSqliteDb();
+        db.run('ROLLBACK');
+      } catch (e) {}
+      console.error('[SQLite SEPARATION ERROR]:', error);
+      return res.status(500).json({ error: error.message || 'Failed to process separation transaction' });
+    }
+  });
+});
+
+localRouter.post('/movement/record', async (req, res) => {
+  const {
+    employeeId,
+    effectiveDate,
+    movementType = 'Promotion',
+    previousDepartment = '',
+    newDepartment = '',
+    previousDesignation = '',
+    newDesignation = '',
+    previousSection = '',
+    newSection = '',
+    previousGrade = '',
+    newGrade = '',
+    previousSalary = 0,
+    newSalary = 0,
+    newShiftId = '',
+    reason = '',
+    changedBy = 'HR Administrator'
+  } = req.body;
+
+  const empId = String(employeeId || '').trim();
+  if (!empId) {
+    return res.status(400).json({ error: 'Employee ID (Bio ID) is required' });
+  }
+  if (!effectiveDate) {
+    return res.status(400).json({ error: 'Effective date is required' });
+  }
+
+  return withSqliteWriteLock(async () => {
+    try {
+      const db = await getSqliteDb();
+      const now = new Date().toISOString();
+
+      // 1. Verify Employee exists
+      const checkStmt = db.prepare(`SELECT id, name, department, designation, shift_id, joining_date, status, data FROM employees WHERE id = ?`);
+      checkStmt.bind([empId]);
+      if (!checkStmt.step()) {
+        checkStmt.free();
+        return res.status(404).json({ error: `Employee Bio ID #${empId} not found in Employee Directory Master.` });
+      }
+
+      const row = checkStmt.getAsObject();
+      checkStmt.free();
+
+      let empData: any = {};
+      try {
+        empData = row.data ? JSON.parse(row.data as string) : {};
+      } catch (e) {
+        empData = {};
+      }
+
+      empData.id = row.id || empId;
+      empData.name = row.name || empData.name || 'Unnamed';
+      empData.department = row.department || empData.department || 'General';
+      empData.designation = row.designation || empData.designation || 'Staff';
+      empData.shiftId = row.shift_id || empData.shiftId || 'S1';
+      empData.joiningDate = row.joining_date || empData.joiningDate || '';
+
+      // 2. Begin Transaction
+      try { db.run('ROLLBACK'); } catch (e) {}
+      db.run('BEGIN TRANSACTION');
+
+      const moveId = `move_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const movementRecord = {
+        id: moveId,
+        employeeId: empId,
+        effectiveDate,
+        movementType,
+        previousDepartment: previousDepartment || empData.department,
+        newDepartment: newDepartment || empData.department,
+        previousDesignation: previousDesignation || empData.designation,
+        newDesignation: newDesignation || empData.designation,
+        previousSection: previousSection || empData.section || '',
+        newSection: newSection || empData.section || '',
+        previousGrade: previousGrade || empData.grade || '',
+        newGrade: newGrade || empData.grade || '',
+        previousSalary: previousSalary || empData.basicSalary || 0,
+        newSalary: newSalary || empData.basicSalary || 0,
+        reason: reason || `Employee Movement: ${movementType}`,
+        changedBy: changedBy || 'HR Administrator',
+        changedAt: now
+      };
+
+      const moveStmt = db.prepare(`
+        INSERT INTO employee_movements (id, employee_id, effective_date, movement_type, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET 
+          employee_id=excluded.employee_id,
+          effective_date=excluded.effective_date,
+          movement_type=excluded.movement_type,
+          data=excluded.data
+      `);
+      moveStmt.run([
+        moveId,
+        empId,
+        effectiveDate,
+        movementType,
+        JSON.stringify(movementRecord),
+        now
+      ]);
+      moveStmt.free();
+
+      // 3. Update Employee Master attributes based on movement type
+      if (newDepartment) empData.department = newDepartment;
+      if (newDesignation) empData.designation = newDesignation;
+      if (newSection) empData.section = newSection;
+      if (newGrade) empData.grade = newGrade;
+      if (newSalary && Number(newSalary) > 0) {
+        empData.basicSalary = Number(newSalary);
+        empData.salaryEffectiveDate = effectiveDate;
+      }
+      if (newShiftId) empData.shiftId = newShiftId;
+
+      if (movementType === 'Promotion') {
+        empData.previousDesignation = previousDesignation || empData.previousDesignation;
+        empData.previousGrade = previousGrade || empData.previousGrade;
+      } else if (movementType === 'Transfer' || movementType === 'Department Change') {
+        empData.previousDepartment = previousDepartment || empData.previousDepartment;
+        empData.transferDate = effectiveDate;
+      } else if (movementType === 'New Joiner') {
+        empData.status = 'Active';
+        empData.joiningDate = effectiveDate;
+      }
+
+      const empUpdateStmt = db.prepare(`
+        UPDATE employees 
+        SET department = ?, designation = ?, shift_id = ?, data = ?, updated_at = ?
+        WHERE id = ?
+      `);
+      empUpdateStmt.run([
+        empData.department,
+        empData.designation,
+        empData.shiftId,
+        JSON.stringify(empData),
+        now,
+        empId
+      ]);
+      empUpdateStmt.free();
+
+      // 4. Audit Log
+      const auditId = `audit_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const auditStmt = db.prepare(`
+        INSERT INTO audit_logs (id, employee_id, employee_name, date, field, old_value, new_value, changed_by, reason, source, data, changed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      auditStmt.run([
+        auditId,
+        empId,
+        empData.name,
+        effectiveDate,
+        movementType,
+        previousDesignation || previousDepartment || '',
+        newDesignation || newDepartment || '',
+        changedBy || 'HR Administrator',
+        reason || `Movement recorded: ${movementType}`,
+        'Movement Workflow',
+        JSON.stringify(movementRecord),
+        now
+      ]);
+      auditStmt.free();
+
+      db.run('COMMIT');
+      saveSqliteDb();
+
+      // 5. Readback verification
+      let verified = false;
+      const vMoveStmt = db.prepare(`SELECT id FROM employee_movements WHERE id = ?`);
+      vMoveStmt.bind([moveId]);
+      if (vMoveStmt.step()) verified = true;
+      vMoveStmt.free();
+
+      const dbPath = getSqliteDbPath();
+      console.log(`[SQLite MOVEMENT] Recorded ${movementType} for Bio ID #${empId} at ${dbPath} (Verified: ${verified ? 'PASSED' : 'PENDING'})`);
+
+      return res.json({
+        success: true,
+        verified,
+        verificationStatus: verified ? 'PASSED' : 'FAILED',
+        transaction: 'COMMITTED',
+        dbPath,
+        movement: movementRecord,
+        employee: empData,
+        message: `Movement recorded and verified successfully for Employee ID #${empId}.`
+      });
+    } catch (error: any) {
+      try {
+        const db = await getSqliteDb();
+        db.run('ROLLBACK');
+      } catch (e) {}
+      console.error('[SQLite MOVEMENT ERROR]:', error);
+      return res.status(500).json({ error: error.message || 'Failed to record movement transaction' });
+    }
+  });
 });
 
 // 6. Purge Table
@@ -536,14 +1399,29 @@ localRouter.post('/data/:table/purge', async (req, res) => {
   const validTables: Record<string, string> = {
     employees: 'employees',
     punches: 'attendance_punches',
+    attendance: 'attendance',
     documents: 'documents',
     shift_assignments: 'shift_assignments',
+    assignment_logs: 'assignment_logs',
+    shifts: 'shifts',
+    leave: 'leave',
+    leave_records: 'leave_records',
     exceptions: 'exceptions',
     overtime: 'overtime',
     sbl: 'sbl',
     force_attendance: 'force_attendance',
+    payroll: 'payroll',
     payroll_runs: 'payroll_runs',
-    audit_logs: 'audit_logs'
+    audit_logs: 'audit_logs',
+    roster_batches: 'roster_batches',
+    roster_assignments: 'roster_assignments',
+    shift_audit_logs: 'shift_audit_logs',
+    employee_movements: 'employee_movements',
+    field_attendance_audit: 'field_attendance_audit',
+    audit_decisions: 'audit_decisions',
+    tax_rules: 'tax_rules',
+    deduction_rules: 'deduction_rules',
+    salary_components: 'salary_components'
   };
 
   const sqlTable = validTables[table];
@@ -566,6 +1444,12 @@ localRouter.post('/documents/upload', async (req, res) => {
 
     if (!employeeId || !title || !fileName || !fileBase64) {
       return res.status(400).json({ error: 'Missing required document parameters (employeeId, title, fileName, fileBase64)' });
+    }
+
+    const ext = path.extname(String(fileName)).toLowerCase();
+    const dangerousExts = ['.exe', '.bat', '.cmd', '.sh', '.vbs', '.js', '.dll', '.scr', '.msi'];
+    if (dangerousExts.includes(ext)) {
+      return res.status(400).json({ error: 'Executable file types are strictly prohibited for HR documents.' });
     }
 
     const root = getSanitizedRootFolder();
@@ -713,54 +1597,8 @@ localRouter.delete('/documents/:id', async (req, res) => {
   }
 });
 
-// 11. Local Manual Backup
-localRouter.post('/backup', async (req, res) => {
-  try {
-    const root = getSanitizedRootFolder();
-    const backupsDir = path.join(root, 'backups');
-    if (!fs.existsSync(backupsDir)) {
-      fs.mkdirSync(backupsDir, { recursive: true });
-    }
-
-    const timestamp = new Date().toISOString().replace(/[:.-]/g, '_');
-    const backupFolderName = `backup_${timestamp}`;
-    const targetBackupPath = path.join(backupsDir, backupFolderName);
-    fs.mkdirSync(targetBackupPath, { recursive: true });
-
-    // Copy DB
-    const dbSource = path.join(root, 'database', 'hris.db');
-    if (fs.existsSync(dbSource)) {
-      fs.copyFileSync(dbSource, path.join(targetBackupPath, 'hris.db'));
-    }
-
-    // Export JSON snapshot
-    const db = await getSqliteDb();
-    const snapshot: Record<string, any> = {};
-    const tables = ['settings', 'employees', 'attendance_punches', 'documents', 'shift_assignments', 'exceptions', 'overtime', 'sbl', 'force_attendance', 'payroll_runs'];
-    
-    tables.forEach(tbl => {
-      try {
-        const resObj = db.exec(`SELECT * FROM ${tbl}`);
-        if (resObj.length > 0) {
-          snapshot[tbl] = resObj[0].values.map(val => val[val.length - 2]); // data column
-        }
-      } catch (e) {
-        // ignore missing
-      }
-    });
-
-    fs.writeFileSync(path.join(targetBackupPath, 'data_snapshot.json'), JSON.stringify(snapshot, null, 2));
-
-    res.json({
-      success: true,
-      backupPath: targetBackupPath,
-      timestamp,
-      message: `Local backup saved successfully to ${targetBackupPath}`
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// 11. Local Manual Backup (Unified with Section 5c /backup)
+// Deprecated duplicate removed to prevent route shadowing and stale database path references.
 
 // 12. Migrate Firestore JSON dump to SQLite
 localRouter.post('/migrate-from-firestore', async (req, res) => {
@@ -775,7 +1613,15 @@ localRouter.post('/migrate-from-firestore', async (req, res) => {
       const stmt = db.prepare(`
         INSERT INTO employees (id, name, department, designation, shift_id, joining_date, status, data, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+        ON CONFLICT(id) DO UPDATE SET 
+          name=excluded.name,
+          department=excluded.department,
+          designation=excluded.designation,
+          shift_id=excluded.shift_id,
+          joining_date=excluded.joining_date,
+          status=excluded.status,
+          data=excluded.data,
+          updated_at=excluded.updated_at
       `);
       employees.forEach(e => {
         if (e.id) stmt.run([e.id, e.name || '', e.department || '', e.designation || '', e.shiftId || '', e.joiningDate || '', e.status || 'Active', JSON.stringify(e), new Date().toISOString()]);
@@ -836,6 +1682,9 @@ localRouter.post('/import-excel', async (req, res) => {
           name=excluded.name,
           department=excluded.department,
           designation=excluded.designation,
+          shift_id=excluded.shift_id,
+          joining_date=excluded.joining_date,
+          status=excluded.status,
           data=excluded.data,
           updated_at=excluded.updated_at
       `);

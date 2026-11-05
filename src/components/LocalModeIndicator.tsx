@@ -1,25 +1,34 @@
 import React, { useState, useEffect } from 'react';
-import { Database, HardDrive, WifiOff, CheckCircle2, RefreshCw, Folder, ShieldAlert, ArrowDownToLine, DownloadCloud, Settings, X, Cpu, Activity, Loader2, ShieldCheck } from 'lucide-react';
+import { Database, HardDrive, CheckCircle2, RefreshCw, ShieldAlert, ArrowDownToLine, DownloadCloud, X, Activity, Loader2, ShieldCheck, Radio, Zap } from 'lucide-react';
 import { fetchLocalStatus, setLocalRootFolder, triggerLocalBackup, migrateFirestoreToLocal, runPersistenceTest } from '../lib/localClient';
 import { useAppStore } from '../store';
 import { toast } from 'sonner';
 
 export function LocalModeIndicator() {
   const [status, setStatus] = useState<any>(null);
+  const [autoPollStatus, setAutoPollStatus] = useState<any>({ enabled: true, intervalSeconds: 60 });
   const [isOpen, setIsOpen] = useState(false);
   const [newRoot, setNewRoot] = useState('');
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [isMigrating, setIsMigrating] = useState(false);
   const [isDiagRunning, setIsDiagRunning] = useState(false);
   const [isPersistTestRunning, setIsPersistTestRunning] = useState(false);
+  const [isFetchingBio, setIsFetchingBio] = useState(false);
+  const [isTogglingPoll, setIsTogglingPoll] = useState(false);
 
-  const { employees, punches, settings, shiftAssignments, exceptions, overtimeRecords, sblRecords, forceAttendanceRecords, payrollRuns } = useAppStore();
+  const { employees, punches, settings, shiftAssignments, exceptions, overtimeRecords, sblRecords, forceAttendanceRecords, payrollRuns, recalculate } = useAppStore();
 
   const loadStatus = async () => {
     const res = await fetchLocalStatus();
     if (res) {
       setStatus(res);
       setNewRoot(res.rootFolder);
+    }
+    try {
+      const pollRes = await fetch('/api/zk/auto-poll/status').then(r => r.json());
+      if (pollRes) setAutoPollStatus(pollRes);
+    } catch {
+      // ignore
     }
   };
 
@@ -28,6 +37,48 @@ export function LocalModeIndicator() {
     const interval = setInterval(loadStatus, 30000); // refresh every 30s
     return () => clearInterval(interval);
   }, []);
+
+  const handleToggleAutoPoll = async () => {
+    setIsTogglingPoll(true);
+    try {
+      const nextEnabled = !autoPollStatus?.enabled;
+      const res = await fetch('/api/zk/auto-poll/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: nextEnabled })
+      }).then(r => r.json());
+      if (res.success) {
+        setAutoPollStatus(res);
+        toast.success(nextEnabled ? 'ZKT Auto-Polling Enabled (Direct SQLite Sync)' : 'ZKT Auto-Polling Paused');
+      }
+    } catch (e: any) {
+      toast.error('Failed to toggle ZKT Auto-Polling');
+    } finally {
+      setIsTogglingPoll(false);
+    }
+  };
+
+  const handleFetchBioNow = async () => {
+    setIsFetchingBio(true);
+    const tId = toast.loading('Fetching biometric punches from ZKTeco devices & local disk into SQLite...');
+    try {
+      const res = await fetch('/api/zk/fetch-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      }).then(r => r.json());
+      if (res.success) {
+        toast.success(res.message || `Fetched ${res.totalRead} punches (${res.totalNew} new saved to SQLite)`, { id: tId });
+        await recalculate();
+        await loadStatus();
+      } else {
+        toast.error(res.error || 'Failed to fetch from biometric device', { id: tId });
+      }
+    } catch (e: any) {
+      toast.error('Biometric fetch error: ' + e.message, { id: tId });
+    } finally {
+      setIsFetchingBio(false);
+    }
+  };
 
   const handleUpdateRoot = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,7 +106,6 @@ export function LocalModeIndicator() {
   };
 
   const handleMigrateFromFirestore = async () => {
-    if (!confirm('Migrate all current active records from workspace into local SQLite database?')) return;
     setIsMigrating(true);
     try {
       const snapshot = {
@@ -70,10 +120,10 @@ export function LocalModeIndicator() {
         payrollRuns
       };
       const res = await migrateFirestoreToLocal(snapshot);
-      toast.success(res.message || 'Firestore data migrated to local SQLite database!');
+      toast.success(res.message || 'All workspace data saved to local SQLite database!');
       await loadStatus();
     } catch (e: any) {
-      toast.error(e.message || 'Migration failed');
+      toast.error(e.message || 'Sync failed');
     } finally {
       setIsMigrating(false);
     }
@@ -84,11 +134,11 @@ export function LocalModeIndicator() {
       <button
         onClick={() => { setIsOpen(true); loadStatus(); }}
         className="px-2.5 py-1 bg-emerald-500/10 border border-emerald-500/30 hover:bg-emerald-500/20 rounded-full text-emerald-700 dark:text-emerald-400 text-[11px] font-bold flex items-center gap-2 transition-all cursor-pointer shadow-xs"
-        title="Click to view Local Storage & SQLite Database details"
+        title="Click to view Local SQLite Database & ZKT Auto-Polling controls"
       >
         <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-        <span className="hidden sm:inline uppercase tracking-wider font-extrabold">LOCAL MODE</span>
-        <span className="text-[10px] opacity-80 border-l border-emerald-500/30 pl-2 hidden md:inline">SQLite • Disk Storage</span>
+        <span className="hidden sm:inline uppercase tracking-wider font-extrabold">SQLITE ACTIVE</span>
+        <span className="text-[10px] opacity-80 border-l border-emerald-500/30 pl-2 hidden md:inline">ZKT Auto-Poll • ON</span>
       </button>
 
       {isOpen && (
@@ -110,7 +160,7 @@ export function LocalModeIndicator() {
                   Local-First Operating Mode
                   <span className="px-2 py-0.5 bg-emerald-500 text-white text-[10px] font-black uppercase rounded-full">Active</span>
                 </h3>
-                <p className="text-xs text-slate-500">100% Free SQLite Database & Local Disk File Storage</p>
+                <p className="text-xs text-slate-500">100% SQLite Database (No Firestore/Firebase) & Direct ZKTeco Biometric Sync</p>
               </div>
             </div>
 
@@ -122,10 +172,25 @@ export function LocalModeIndicator() {
                 </span>
               </div>
 
-              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
-                <span className="text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">ZKT Auto-Polling</span>
-                <span className="font-bold text-rose-600 dark:text-rose-400 flex items-center gap-1.5">
-                  <ShieldAlert size={14} className="text-rose-500 shrink-0" /> Disabled (Manual Fetch Only)
+              <div className="p-3 bg-emerald-50/70 dark:bg-emerald-950/30 rounded-xl border border-emerald-200 dark:border-emerald-800/60 flex flex-col justify-between">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-emerald-700 dark:text-emerald-400 font-bold block text-[10px] uppercase tracking-wider">ZKT Auto-Polling</span>
+                  <button
+                    type="button"
+                    onClick={handleToggleAutoPoll}
+                    disabled={isTogglingPoll}
+                    className={`px-2 py-0.5 rounded text-[9px] font-black uppercase cursor-pointer transition-colors ${
+                      autoPollStatus?.enabled !== false
+                        ? 'bg-emerald-600 text-white hover:bg-emerald-700'
+                        : 'bg-slate-300 text-slate-700 hover:bg-slate-400'
+                    }`}
+                  >
+                    {autoPollStatus?.enabled !== false ? 'ENABLED' : 'PAUSED'}
+                  </button>
+                </div>
+                <span className="font-bold text-emerald-700 dark:text-emerald-300 flex items-center gap-1.5">
+                  <Radio size={14} className="text-emerald-500 shrink-0 animate-pulse" />
+                  {autoPollStatus?.enabled !== false ? 'Enabled (Auto + Manual Fetch)' : 'Paused (Click to Enable)'}
                 </span>
               </div>
 
@@ -144,6 +209,18 @@ export function LocalModeIndicator() {
               </div>
             </div>
 
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={handleFetchBioNow}
+                disabled={isFetchingBio}
+                className="w-full py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white text-xs font-extrabold rounded-xl shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+              >
+                {isFetchingBio ? <Loader2 size={15} className="animate-spin" /> : <Zap size={15} />}
+                Fetch Bio From ZKTeco Device Now (Direct to SQLite)
+              </button>
+            </div>
+
             <form onSubmit={handleUpdateRoot} className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800">
               <label className="block text-xs font-bold text-slate-700 dark:text-slate-300">
                 Local Storage Root Directory
@@ -153,7 +230,7 @@ export function LocalModeIndicator() {
                   type="text"
                   value={newRoot}
                   onChange={e => setNewRoot(e.target.value)}
-                  placeholder="D:\SHRM-HRIS"
+                  placeholder="E:\SHRM_HRIS"
                   className="flex-1 px-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-mono text-slate-800 dark:text-slate-200"
                 />
                 <button
@@ -164,7 +241,7 @@ export function LocalModeIndicator() {
                 </button>
               </div>
               <p className="text-[10px] text-slate-400">
-                Subfolders: \database\hris.db, \data\documents, \imports, \exports, \backups
+                Database: E:\SHRM_HRIS\Database.db • Subfolders: \data\documents, \imports, \exports, \backups
               </p>
             </form>
 

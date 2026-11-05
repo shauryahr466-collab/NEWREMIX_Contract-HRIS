@@ -137,7 +137,7 @@ export default function SBL() {
 
         // PWO condition: Attendance marked as PWO or worked on Weekly Off/Holiday
         const isPWOStatus = att.status === 'PWO';
-        const isWorkedOffday = (att.status === 'Weekly Off' || att.status === 'Off') && (att.workingHours > 0 || !!att.firstPunch);
+        const isWorkedOffday = ((att.status as string) === 'Weekly Off' || (att.status as string) === 'Off') && (att.workingHours > 0 || !!att.firstPunch);
         const isPresentOnOff = (att.status === 'Present' || att.status === 'Late' || att.status === 'On Time') && (att.workingHours > 0) && (att.shiftName?.toLowerCase().includes('off') || att.shiftCode === 'WO');
 
         if (!isPWOStatus && !isWorkedOffday && !isPresentOnOff) {

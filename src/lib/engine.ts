@@ -129,13 +129,45 @@ export function processPunches(
   const shiftMap = new Map(settings.shifts?.map(s => [s.id, s]) || []);
   const shiftNameMap = new Map(settings.shifts?.map(s => [s.name?.toLowerCase() || '', s]) || []);
 
+  // Helper to ensure every punch timestamp is in exact local device wall-clock time (DIA accuracy).
+  // Note: Legacy Excel imports created via new Date("YYYY-MM-DD HH:mm").toISOString() in Nepal (+05:45)
+  // stored UTC strings ending in ".000Z" (shifted back by 5h 45m, e.g. 07:40 NPT -> 01:55:00.000Z).
+  // Convert those legacy UTC strings back to Nepal local wall-clock time (+05:45 = +345 minutes),
+  // while keeping non-Z local timestamps untouched!
+  const toExactLocalTimeString = (dt: string | undefined | null): string => {
+    if (!dt) return '';
+    const trimmed = String(dt).trim().replace(' ', 'T');
+    if (/Z$/i.test(trimmed)) {
+      const utcMs = Date.parse(trimmed);
+      if (!isNaN(utcMs)) {
+        // Shift UTC timestamp by +05:45 (345 minutes) to restore exact Nepal device wall-clock time
+        const nptDate = new Date(utcMs + 345 * 60 * 1000);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        return `${nptDate.getUTCFullYear()}-${pad(nptDate.getUTCMonth() + 1)}-${pad(nptDate.getUTCDate())}T${pad(nptDate.getUTCHours())}:${pad(nptDate.getUTCMinutes())}:${pad(nptDate.getUTCSeconds())}`;
+      }
+    }
+    return trimmed.replace(/(\.\d+)?Z$/i, '');
+  };
+
   // Deduplicate and sort all punches globally first for optimization
-  const sortedPunches = Array.from(new Map(punches.map(p => [p.employeeId + p.punchDatetime, p])).values())
+  const sortedPunches = Array.from(new Map(punches.map(p => [p.employeeId + toExactLocalTimeString(p.punchDatetime), p])).values())
     .map(p => {
-      const cleanIso = p.punchDatetime ? String(p.punchDatetime).replace(' ', 'T') : '';
-      let t = Date.parse(cleanIso);
-      if (isNaN(t)) t = new Date(cleanIso).getTime();
-      return { ...p, _time: isNaN(t) ? 0 : t };
+      const cleanIso = toExactLocalTimeString(p.punchDatetime);
+      const m = cleanIso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+      let t = NaN;
+      if (m) {
+        t = new Date(
+          Number(m[1]),
+          Number(m[2]) - 1,
+          Number(m[3]),
+          Number(m[4]),
+          Number(m[5]),
+          Number(m[6] || 0)
+        ).getTime();
+      } else {
+        t = new Date(cleanIso).getTime();
+      }
+      return { ...p, punchDatetime: cleanIso, _time: isNaN(t) ? 0 : t };
     })
     .filter(p => p._time > 0)
     .sort((a, b) => a._time - b._time);
@@ -145,7 +177,7 @@ export function processPunches(
   sortedPunches.forEach(p => {
     const normId = normalizeEmployeeId(p.employeeId);
     const empPunches = punchesByEmpAndDate.get(normId) || new Map<string, typeof sortedPunches>();
-    const cleanIso = p.punchDatetime ? String(p.punchDatetime).replace(' ', 'T') : '';
+    const cleanIso = p.punchDatetime;
     const dateStr = cleanIso.includes('T') ? cleanIso.split('T')[0] : cleanIso.split(' ')[0];
     
     // We need to be careful with night shifts - a punch at 1 AM on the 10th might belong to the 9th.
@@ -172,11 +204,10 @@ export function processPunches(
     endMs = Math.max(todayEnd, lastPunchTime);
   }
 
-  const maxLookbackMs = 180 * 86400 * 1000; // Default max lookback of 180 days unless configured
   if (finalStartDate) {
     startMs = finalStartDate.getTime();
   } else if (sortedPunches.length > 0) {
-    startMs = Math.max(sortedPunches[0]._time, endMs - maxLookbackMs);
+    startMs = sortedPunches[0]._time;
   } else {
     startMs = Date.now() - (30 * 86400 * 1000);
   }

@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, DollarSign, Cpu, TrendingUp } from 'lucide-react';
+import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, Cpu, TrendingUp } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { NepaliRupeeIcon } from './ui';
 import { useAppStore } from '../store';
 import { useZkSync } from '../hooks/useZkSync';
 import { auth } from '../lib/firebase';
@@ -69,7 +70,7 @@ export function Layout() {
     { to: '/overtime', icon: Clock, label: 'OT Audit Log' },
     { to: '/sbl', icon: CalendarRange, label: 'SBL Management' },
     { to: '/force-attendance', icon: UserCheck, label: 'Manual Corrections' },
-    { to: '/payroll', icon: DollarSign, label: 'Payroll & Disburse' },
+    { to: '/payroll', icon: NepaliRupeeIcon, label: 'Payroll & Disburse' },
     { to: '/reports', icon: FileText, label: 'Analytic Reports' },
     { to: '/settings', icon: Settings, label: 'Configuration' },
   ];

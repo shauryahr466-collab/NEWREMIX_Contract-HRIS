@@ -1,6 +1,6 @@
 {
   "name": "Remix Remix Attendance Manager2",
-  "description": "Biometric raw punch data processing and attendance reporting system.",
+  "description": "Biometric raw punch data processing, attendance reporting, and Nepal Labor Act & SSF statutory payroll system with IRD tax rules and PDF payslip generator.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

@@ -20,7 +20,11 @@ import {
   calculatePercentile 
 } from '../../utils/salaryCalculations';
 import { 
-  Users, DollarSign, TrendingUp, AlertTriangle, ShieldAlert,
+  formatUniversalDate, 
+  getNepaliDate 
+} from '../../utils/dateHelper';
+import { 
+  Users, TrendingUp, AlertTriangle, ShieldAlert,
   BarChart2, Settings2, Search, ArrowUpDown, ChevronRight, HelpCircle
 } from 'lucide-react';
 import { 
@@ -401,6 +405,7 @@ export function SalaryAnalysisTab({
                   <th className="p-3">Designation</th>
                   <th className="p-3">Grade</th>
                   <th className="p-3">DOJ</th>
+                  <th className="p-3 text-center">Experience</th>
                   <th className="p-3 text-right">Basic Salary</th>
                   <th className="p-3 text-right">Dearness Allow.</th>
                   <th className="p-3 text-right">Other Allow.</th>
@@ -420,7 +425,25 @@ export function SalaryAnalysisTab({
                     <td className="p-3">{row.department}</td>
                     <td className="p-3">{row.designation}</td>
                     <td className="p-3">{row.grade}</td>
-                    <td className="p-3">{row.joiningDate}</td>
+                    <td className="p-3 font-mono text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                      <div className="font-semibold text-slate-800 dark:text-slate-200">
+                        {formatUniversalDate(row.joiningDate, 'yyyy-MM-dd')}
+                      </div>
+                      {row.joiningDateBS ? (
+                        <div className="text-[10px] text-slate-400 font-sans tracking-tight">
+                          BS {row.joiningDateBS}
+                        </div>
+                      ) : (getNepaliDate(row.joiningDate) !== '0000-00-00' ? (
+                        <div className="text-[10px] text-slate-400 font-sans tracking-tight">
+                          BS {getNepaliDate(row.joiningDate)}
+                        </div>
+                      ) : null)}
+                    </td>
+                    <td className="p-3 text-center">
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 dark:bg-indigo-950/50 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800/60 whitespace-nowrap">
+                        {row.experience || `${row.experienceYears || 0} yrs`}
+                      </span>
+                    </td>
                     <td className="p-3 text-right font-mono">Rs. {row.basicSalary.toLocaleString()}</td>
                     <td className="p-3 text-right font-mono text-slate-500">Rs. {row.dearnessAllowance.toLocaleString()}</td>
                     <td className="p-3 text-right font-mono text-slate-500">Rs. {row.otherAllowance.toLocaleString()}</td>
@@ -1010,12 +1033,12 @@ export function SalaryAnalysisTab({
                       <td className="p-3 font-bold text-slate-900 dark:text-white">{risk.designation}</td>
                       <td className="p-3">
                         <span className="font-bold">{risk.seniorEmployeeName}</span> ({risk.seniorEmployeeId})
-                        <div className="text-[10px] text-slate-400">DOJ: {risk.seniorDOJ} ({risk.seniorExpYears} yrs)</div>
+                        <div className="text-[10px] text-slate-400">DOJ: {formatUniversalDate(risk.seniorDOJ, 'yyyy-MM-dd')} ({risk.seniorExpYears} yrs)</div>
                       </td>
                       <td className="p-3 text-right font-mono font-bold text-slate-700 dark:text-slate-300">Rs. {risk.seniorGross.toLocaleString()}</td>
                       <td className="p-3">
                         <span className="font-bold">{risk.juniorEmployeeName}</span> ({risk.juniorEmployeeId})
-                        <div className="text-[10px] text-slate-400">DOJ: {risk.juniorDOJ} ({risk.juniorExpYears} yrs)</div>
+                        <div className="text-[10px] text-slate-400">DOJ: {formatUniversalDate(risk.juniorDOJ, 'yyyy-MM-dd')} ({risk.juniorExpYears} yrs)</div>
                       </td>
                       <td className="p-3 text-right font-mono font-bold text-rose-600 dark:text-rose-400">Rs. {risk.juniorGross.toLocaleString()}</td>
                       <td className="p-3 text-right font-mono font-bold text-rose-600">+Rs. {risk.salaryDiff.toLocaleString()}</td>

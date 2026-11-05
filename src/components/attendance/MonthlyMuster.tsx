@@ -14,7 +14,7 @@ import { Card, Button, Input } from '../ui';
 import { MultiSelect } from '../MultiSelect';
 import { MusterCellModal } from './MusterCellModal';
 import { Employee, ProcessedAttendance, ShiftMaster, RawPunch } from '../../types';
-import { formatDuration, cn, formatAMPM } from '../../lib/utils';
+import { formatDuration, cn, formatAMPM, toDeviceWallClockIso } from '../../lib/utils';
 import { parseISO, format } from 'date-fns';
 import * as XLSX from 'xlsx';
 
@@ -101,10 +101,12 @@ export function MonthlyMuster() {
   const punchesByEmpDate = useMemo(() => {
     const map = new Map<string, RawPunch[]>();
     punches.forEach(p => {
-      const datePart = p.punchDatetime.split(/[ T]/)[0];
+      const cleanDt = toDeviceWallClockIso(p.punchDatetime);
+      if (!cleanDt) return;
+      const datePart = cleanDt.split(/[ T]/)[0];
       const key = `${p.employeeId}_${datePart}`;
       if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(p);
+      map.get(key)!.push({ ...p, punchDatetime: cleanDt });
     });
     return map;
   }, [punches]);

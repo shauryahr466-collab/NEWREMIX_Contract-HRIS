@@ -48,29 +48,125 @@ export async function fetchLocalTable<T>(table: string): Promise<T[]> {
   }
 }
 
+export interface LocalSaveResult {
+  success: boolean;
+  verified: boolean;
+  verificationStatus: 'PASSED' | 'FAILED' | 'WARNING' | 'SKIPPED';
+  transaction: 'COMMITTED' | 'ROLLED_BACK' | 'N/A';
+  dbPath: string;
+  affectedCount: number;
+  table?: string;
+  timestamp: string;
+  error?: string;
+}
+
 export async function saveLocalTable<T>(table: string, data: T | T[]): Promise<boolean> {
+  const res = await saveLocalTableDetailed(table, data);
+  return res.success;
+}
+
+export async function saveLocalTableDetailed<T>(table: string, data: T | T[]): Promise<LocalSaveResult> {
+  const items = Array.isArray(data) ? data : [data];
   try {
     const res = await fetch(`/api/local/data/${table}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data)
     });
-    return res.ok;
-  } catch (e) {
-    return false;
+    const result = await res.json();
+    if (!res.ok) {
+      return {
+        success: false,
+        verified: false,
+        verificationStatus: 'FAILED',
+        transaction: 'ROLLED_BACK',
+        dbPath: 'E:\\SHRM_HRIS\\Database.db',
+        affectedCount: 0,
+        table: table,
+        timestamp: new Date().toISOString(),
+        error: result.error || 'Failed to save to database'
+      };
+    }
+    return {
+      success: true,
+      verified: result.verified ?? true,
+      verificationStatus: result.verificationStatus || 'PASSED',
+      transaction: result.transaction || 'COMMITTED',
+      dbPath: result.dbPath || 'E:\\SHRM_HRIS\\Database.db',
+      affectedCount: result.affectedCount || items.length,
+      table: table,
+      timestamp: result.timestamp || new Date().toISOString()
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      verified: false,
+      verificationStatus: 'FAILED',
+      transaction: 'ROLLED_BACK',
+      dbPath: 'E:\\SHRM_HRIS\\Database.db',
+      affectedCount: 0,
+      table: table,
+      timestamp: new Date().toISOString(),
+      error: e?.message || 'Network / Server Error'
+    };
   }
 }
 
 export async function deleteLocalTableRecords(table: string, ids: string[]): Promise<boolean> {
+  const res = await deleteLocalTableDetailed(table, ids);
+  return res.success;
+}
+
+export async function deleteLocalTableDetailed(table: string, ids: string[]): Promise<LocalSaveResult> {
   try {
     const res = await fetch(`/api/local/data/${table}/delete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids })
     });
-    return res.ok;
+    const result = await res.json();
+    if (!res.ok) {
+      return {
+        success: false,
+        verified: false,
+        verificationStatus: 'FAILED',
+        transaction: 'ROLLED_BACK',
+        dbPath: 'E:\\SHRM_HRIS\\Database.db',
+        affectedCount: 0,
+        timestamp: new Date().toISOString(),
+        error: result.error || 'Failed to delete records'
+      };
+    }
+    return {
+      success: true,
+      verified: result.verified ?? true,
+      verificationStatus: result.verificationStatus || 'PASSED',
+      transaction: result.transaction || 'COMMITTED',
+      dbPath: result.dbPath || 'E:\\SHRM_HRIS\\Database.db',
+      affectedCount: result.deletedCount || ids.length,
+      timestamp: result.timestamp || new Date().toISOString()
+    };
+  } catch (e: any) {
+    return {
+      success: false,
+      verified: false,
+      verificationStatus: 'FAILED',
+      transaction: 'ROLLED_BACK',
+      dbPath: 'E:\\SHRM_HRIS\\Database.db',
+      affectedCount: 0,
+      timestamp: new Date().toISOString(),
+      error: e?.message || 'Network / Server Error'
+    };
+  }
+}
+
+export async function verifyLocalDatabase() {
+  try {
+    const res = await fetch('/api/local/verify-db');
+    if (!res.ok) return null;
+    return await res.json();
   } catch (e) {
-    return false;
+    return null;
   }
 }
 

@@ -1,7 +1,7 @@
 import React from 'react';
 import { X, Clock, Calendar, ShieldCheck, UserCheck, CheckCircle2, AlertTriangle, Fingerprint, FileText } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
-import { formatAMPM, formatMinutes, formatDuration } from '../../lib/utils';
+import { formatAMPM, formatMinutes, formatDuration, toDeviceWallClockIso } from '../../lib/utils';
 import { ProcessedAttendance, Employee, ShiftMaster, RawPunch } from '../../types';
 import { useAppStore } from '../../store';
 import { toast } from 'sonner';
@@ -249,7 +249,8 @@ export function MusterCellModal({
             {rawPunches.length > 0 ? (
               <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
                 {rawPunches.map((punch, idx) => {
-                  const pDate = parseISO(punch.punchDatetime);
+                  const cleanDt = toDeviceWallClockIso(punch.punchDatetime) || punch.punchDatetime;
+                  const pDate = parseISO(cleanDt);
                   return (
                     <div 
                       key={punch.id || idx} 
@@ -260,7 +261,7 @@ export function MusterCellModal({
                           {idx + 1}
                         </span>
                         <span className="font-bold font-mono text-slate-800 dark:text-slate-200">
-                          {format(pDate, 'hh:mm:ss a')}
+                          {!isNaN(pDate.getTime()) ? format(pDate, 'hh:mm:ss a') : formatAMPM(cleanDt)}
                         </span>
                       </div>
                       <span className="text-[10px] text-slate-400 font-mono">

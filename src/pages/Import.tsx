@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import { processRosterUpload, generateRosterTemplate } from '../lib/roster';
 import { PageHeader, Card, Button, Input, Badge } from '../components/ui';
 import { fetchLocalTable, saveLocalTable, saveLocalTableDetailed, deleteLocalTableDetailed } from '../lib/localClient';
+import { validatePunchesAgainstHolidays } from '../lib/holidayValidation';
 import { useActionStatus } from '../context/ActionStatusContext';
 
 export function Import() {
@@ -604,7 +605,30 @@ export function Import() {
           // Deduplicate new punches based on ID
           const uniqueNewPunchesMap = new Map<string, RawPunch>();
           finalNewPunchesRaw.forEach(p => uniqueNewPunchesMap.set(p.id, p));
-          const finalNewPunches = Array.from(uniqueNewPunchesMap.values());
+          const deduplicatedPunches = Array.from(uniqueNewPunchesMap.values());
+
+          // Cross-reference against Public Holiday Master DB to prevent holiday overlaps
+          const incomingIdSet = new Set(deduplicatedPunches.map(p => p.id));
+          const holidayCheck = validatePunchesAgainstHolidays({
+            incomingPunches: deduplicatedPunches,
+            existingPunches: punches.filter(p => !incomingIdSet.has(p.id)),
+            holidays: settings.holidays || [],
+            employees,
+            shifts: settings.shifts,
+            shiftAssignments,
+            mergeMinutes: settings.duplicateMergeTime ?? 5,
+            policy: settings.holidayPunchPolicy || 'prevent_overlaps',
+          });
+          const finalNewPunches = holidayCheck.acceptedPunches;
+          const preventedOverlaps = holidayCheck.rejectedOverlaps.length;
+
+          if (finalNewPunches.length === 0) {
+            const firstReason = holidayCheck.conflicts[0]?.message || 'All punches matched Public Holiday overlap or block rules.';
+            toast.warning(`Import prevented: ${firstReason}`);
+            setStatus('error');
+            setMessage(`Import blocked: ${firstReason}`);
+            return;
+          }
 
           const uniqueEmps = new Set(finalNewPunches.map(p => p.employeeId));
           const minDate = finalNewPunches.reduce((min, p) => !min || p.punchDatetime < min ? p.punchDatetime : min, '');
@@ -613,13 +637,16 @@ export function Import() {
           await executeWithStatus(
             {
               title: `Store ${finalNewPunches.length} Punch Records from ${file.name} into SQLite?`,
-              subtitle: `Persists parsed punch records into SQLite (E:\\SHRM_HRIS\\Database.db) and recalculates attendance.`,
+              subtitle: preventedOverlaps > 0
+                ? `Holiday validation prevented ${preventedOverlaps} overlapping holiday punch(es). Commits remaining records into SQLite.`
+                : `Persists parsed punch records into SQLite (E:\\SHRM_HRIS\\Database.db) and recalculates attendance.`,
               module: 'Punch & Directory Import',
               actionType: 'import',
               affectedCount: finalNewPunches.length,
               details: {
                 'Source File': file.name,
-                'Total Valid Punches': `${finalNewPunches.length} punches`,
+                'Validated Punches': `${finalNewPunches.length} punches`,
+                ...(preventedOverlaps > 0 ? { 'Holiday Overlaps Blocked': `${preventedOverlaps} overlapping logs` } : {}),
                 'Employees Matched': `${uniqueEmps.size} staff members`,
                 'Date Span': `${minDate ? minDate.slice(0, 10) : 'N/A'} → ${maxDate ? maxDate.slice(0, 10) : 'N/A'}`,
                 'Persistence Mode': 'SQLite Database Storage'
@@ -627,12 +654,12 @@ export function Import() {
               confirmText: `Save ${finalNewPunches.length} Punches to SQLite`
             },
             async (updateProgress) => {
-              updateProgress({ percent: 60, message: 'Persisting punches to SQLite & recalculating shifts...' });
+              updateProgress({ percent: 60, message: 'Persisting validated punches to SQLite & recalculating shifts...' });
               await setPunches(finalNewPunches, (msg) => setMessage(msg));
               
               setCalculationSource('all');
               setStatus('success');
-              setMessage(`Saved ${finalNewPunches.length} records to SQLite.`);
+              setMessage(`Saved ${finalNewPunches.length} records to SQLite${preventedOverlaps > 0 ? ` (${preventedOverlaps} holiday overlaps prevented)` : ''}.`);
               toast.success(`Saved ${finalNewPunches.length} punch records to SQLite.`);
 
               return {
@@ -643,6 +670,7 @@ export function Import() {
                 dbPath: 'E:\\SHRM_HRIS\\Database.db',
                 breakdown: {
                   'Saved Punches': `${finalNewPunches.length} records`,
+                  ...(preventedOverlaps > 0 ? { 'Holiday Overlaps Prevented': `${preventedOverlaps} blocked` } : {}),
                   'Matched Staff': `${uniqueEmps.size} employees`,
                   'SQLite Database.db': 'Committed'
                 }

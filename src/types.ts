@@ -363,6 +363,9 @@ export interface ZkDevice {
   lastProtocolUsed?: string;
   lastConnection?: string;
   lastSync?: string;
+  lastSuccessfulSync?: string;
+  lastLatencyMs?: number;
+  lastProbeAt?: string;
   userCount?: number;
   logCount?: number;
   autoSyncMinutes?: number; // 5, 15, 30, 60, 0 (0 = manual)
@@ -372,6 +375,8 @@ export interface ZkDevice {
   adminCount?: number;
   fpCount?: number;
   faceCount?: number;
+  palmCount?: number;
+  userFaceCount?: number;
   passwordCount?: number;
   opLogCount?: number;
   activeDirectoryUsers?: number;
@@ -403,6 +408,7 @@ export interface ZkSyncLog {
   durationMs: number;
   unmappedCount?: number;
   inactiveSkipped?: number;
+  holidayOverlapsSkipped?: number;
   mode?: string;
   message?: string;
   errorMessage?: string;
@@ -418,6 +424,66 @@ export interface ZkUnmappedPunch {
   punchDateTime: string;
   syncTime: string;
   status: 'pending' | 'resolved' | 'ignored';
+}
+
+export interface HolidayMasterRecord {
+  id?: string;
+  date: string; // YYYY-MM-DD
+  name: string;
+  type?: 'National' | 'Festival' | 'Restricted' | 'Company';
+  preventPunches?: boolean;
+  allowWorkedPph?: boolean;
+}
+
+export type HolidayPunchPolicy = 'prevent_overlaps' | 'block_all' | 'allow_worked_pph';
+
+export type HolidayOverlapReason =
+  | 'BLOCKED_HOLIDAY_PUNCH'
+  | 'HOLIDAY_DUPLICATE_OVERLAP'
+  | 'HOLIDAY_CROSS_SOURCE_OVERLAP'
+  | 'FORCE_ATTENDANCE_HOLIDAY_CONFLICT';
+
+export interface HolidayOverlapConflict {
+  id: string;
+  employeeId: string;
+  employeeName?: string;
+  department?: string;
+  date: string;
+  holidayName: string;
+  reason: HolidayOverlapReason;
+  message: string;
+  incomingPunchDatetime?: string;
+  conflictingPunchDatetime?: string;
+  source?: string;
+  conflictingSource?: string;
+  redundantPunchIds?: string[];
+  severity: 'high' | 'medium';
+}
+
+export interface HolidayValidationReport {
+  generatedAt: string;
+  policy: HolidayPunchPolicy;
+  totalMasterHolidays: number;
+  holidaysSyncedToTable: number;
+  activeEmployeesCovered: number;
+  punchesOnHolidays: number;
+  autoMarkedPublicHolidayDays: number;
+  workedHolidayPphDays: number;
+  overlapConflictsCount: number;
+  statusMismatchCount: number;
+  redundantPunchIdsToClean: string[];
+  holidayBreakdown: Array<{
+    date: string;
+    name: string;
+    type?: string;
+    preventPunches: boolean;
+    punchCount: number;
+    employeeCount: number;
+    publicHolidayCount: number;
+    pphCount: number;
+    overlapCount: number;
+  }>;
+  conflicts: HolidayOverlapConflict[];
 }
 
 export interface ProcessedAttendance {
@@ -511,7 +577,8 @@ export type ExceptionType =
   | 'Short Hours' 
   | 'Long Hours' 
   | 'Punch Outside Shift'
-  | 'No Punch Attendance';
+  | 'No Punch Attendance'
+  | 'Holiday Punch Overlap';
 
 export interface AttendanceException {
   id: string;
@@ -747,7 +814,8 @@ export interface Settings {
   shifts: ShiftMaster[];
   calculationStartDate?: string; // YYYY-MM-DD
   calculationEndDate?: string; // YYYY-MM-DD
-  holidays?: { date: string; name: string }[];
+  holidays?: HolidayMasterRecord[];
+  holidayPunchPolicy?: HolidayPunchPolicy;
   payrollConfig?: PayrollConfig;
 }
 

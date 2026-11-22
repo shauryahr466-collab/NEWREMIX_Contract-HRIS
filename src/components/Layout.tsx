@@ -1,20 +1,19 @@
 import React, { useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, Cpu, TrendingUp, UserCog, Eye } from 'lucide-react';
+import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, User as UserIcon, Menu, Moon, Sun, RefreshCw, Cpu, TrendingUp, UserCog, Eye } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { NepaliRupeeIcon } from './ui';
 import { useAppStore } from '../store';
 import { useZkSync } from '../hooks/useZkSync';
-import { auth } from '../lib/firebase';
-import { signOut } from 'firebase/auth';
+import { useRealtimeSync } from '../hooks/useRealtimeSync';
+import { authFetch, clearInMemorySession } from '../lib/authSession';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { EmployeeDrawer } from './EmployeeDrawer';
 import { LocalModeIndicator } from './LocalModeIndicator';
+import { ConflictModal } from './ConflictModal';
 import { formatUserScopeSummary } from '../lib/accessControl';
 import type { ModuleKey } from '../types';
-
-const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
 
 function HeaderButton({ children, onClick, title, disabled, className }: { children: React.ReactNode, onClick?: () => void, title?: string, disabled?: boolean, className?: string }) {
   return (
@@ -35,11 +34,12 @@ function HeaderButton({ children, onClick, title, disabled, className }: { child
 
 export function Layout() {
   useZkSync();
+  const { connectionStatus, connectedUsersCount, reconcileFromServer } = useRealtimeSync();
   const { 
     settings, selectedEmployeeId, employees, 
     openEmployeeProfile, closeEmployeeProfile, 
     theme, setTheme, globalSearchTerm, setGlobalSearchTerm, 
-    recalculate, isInitializing, quotaExceeded, resetError,
+    recalculate, refreshZkTablesFromSqlite, isInitializing, quotaExceeded, resetError,
     setIsOtpVerified, user, setUser, setIsAdmin,
     isSuperAdmin, effectiveUserProfile, previewUserProfile, setPreviewUserProfile,
     setCurrentUserProfile, canAccessModule
@@ -47,20 +47,23 @@ export function Layout() {
   const location = useLocation();
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isMobileOpen, setIsMobileOpen] = useState(false);
+  const [isRefreshingAll, setIsRefreshingAll] = useState(false);
+  const [conflictData, setConflictData] = useState<any>(null);
   
-  const currentUserEmail = effectiveUserProfile?.email || user?.email || auth.currentUser?.email || '';
-  const isAdmin = isSuperAdmin || ADMIN_EMAILS.some(email => currentUserEmail.toLowerCase() === email.toLowerCase());
+  const isAdmin = isSuperAdmin;
 
   const handleSignOut = async () => {
-    sessionStorage.removeItem('local_session_user');
-    sessionStorage.removeItem('local_user_profile');
-    sessionStorage.removeItem('is_otp_verified');
+    try {
+      await authFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore network error on logout
+    }
+    clearInMemorySession();
     setIsOtpVerified(false);
     setPreviewUserProfile(null);
     setCurrentUserProfile(null);
     setIsAdmin(false);
     setUser(null);
-    await signOut(auth).catch(() => {});
   };
 
   const selectedEmployee = employees.find(e => e.id === selectedEmployeeId) || null;
@@ -82,7 +85,6 @@ export function Layout() {
     { to: '/reports', icon: FileText, label: 'Analytic Reports', moduleKey: 'reports' },
     { to: '/settings', icon: Settings, label: 'Configuration', moduleKey: 'settings' },
     { to: '/user-access', icon: UserCog, label: 'User & Role Config', moduleKey: 'userAccess' },
-    { to: '/admin', icon: Shield, label: 'System Admin', moduleKey: 'admin' },
   ];
 
   const navItems = allNavItems.filter(item => canAccessModule(item.moduleKey));
@@ -145,26 +147,36 @@ export function Layout() {
         </div>
         
         <nav className="flex-1 p-3 space-y-1 overflow-y-auto custom-scrollbar">
-          <ul className="space-y-0.5">
-            {navItems.map((item) => (
-              <li key={item.to}>
-                <NavLink
-                  to={item.to}
-                  title={isCollapsed ? item.label : undefined}
-                  className={({ isActive }) =>
-                    cn(
-                      'flex items-center gap-3 px-3 py-2 rounded text-[13px] font-medium transition-all duration-200 group',
-                      isActive 
-                        ? 'bg-primary text-white' 
-                        : 'text-slate-400 hover:bg-slate-800 hover:text-white'
-                    )
-                  }
-                >
-                  <item.icon className={cn("w-[18px] h-[18px] shrink-0", isCollapsed ? "mx-auto" : "")} />
-                  {!isCollapsed && <span className="truncate">{item.label}</span>}
-                </NavLink>
-              </li>
-            ))}
+          <ul className="space-y-1 relative">
+            {navItems.map((item) => {
+              const isActive = location.pathname === item.to;
+              return (
+                <li key={item.to} className="relative">
+                  {isActive && (
+                    <motion.div
+                      layoutId="sidebarActiveIndicator"
+                      className="absolute inset-0 bg-primary rounded-lg shadow-md shadow-primary/30 z-0"
+                      transition={{ type: 'spring', stiffness: 350, damping: 30 }}
+                    />
+                  )}
+                  <NavLink
+                    to={item.to}
+                    title={isCollapsed ? item.label : undefined}
+                    className={({ isActive }) =>
+                      cn(
+                        'flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-semibold transition-all duration-200 relative z-10',
+                        isActive 
+                          ? 'text-white' 
+                          : 'text-slate-400 hover:bg-slate-800/60 hover:text-white'
+                      )
+                    }
+                  >
+                    <item.icon className={cn("w-[18px] h-[18px] shrink-0", isCollapsed ? "mx-auto" : "")} />
+                    {!isCollapsed && <span className="truncate">{item.label}</span>}
+                  </NavLink>
+                </li>
+              );
+            })}
           </ul>
         </nav>
 
@@ -175,12 +187,12 @@ export function Layout() {
           )}>
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 shrink-0 rounded bg-slate-700 flex items-center justify-center font-semibold text-slate-300 text-xs">
-                {(effectiveUserProfile?.username || auth.currentUser?.displayName || auth.currentUser?.email || 'U').charAt(0).toUpperCase()}
+                {(effectiveUserProfile?.username || user?.displayName || user?.email || 'U').charAt(0).toUpperCase()}
               </div>
               {!isCollapsed && (
                 <div className="flex-1 min-w-0">
                   <p className="text-[12px] font-semibold text-white truncate">
-                    {effectiveUserProfile?.username || auth.currentUser?.displayName || auth.currentUser?.email?.split('@')[0]}
+                    {effectiveUserProfile?.username || user?.displayName || user?.email?.split('@')[0]}
                   </p>
                   <p className="text-[10px] text-slate-400 truncate mt-0.5" title={formatUserScopeSummary(effectiveUserProfile)}>
                     {effectiveUserProfile?.role || (isAdmin ? 'Super Admin' : 'Staff Member')}
@@ -249,6 +261,15 @@ export function Layout() {
           </div>
 
           <div className="flex items-center gap-4 flex-wrap justify-end">
+            <div className="flex items-center gap-2 px-2.5 py-1 bg-slate-100 dark:bg-slate-800 rounded-lg text-xs font-medium text-slate-600 dark:text-slate-300">
+              <span className={cn(
+                "w-2 h-2 rounded-full shrink-0",
+                connectionStatus === 'Connected' ? "bg-emerald-500 animate-pulse" : connectionStatus === 'Reconnecting' ? "bg-amber-500 animate-ping" : "bg-red-500"
+              )} />
+              <span className="hidden sm:inline font-bold">{connectionStatus}</span>
+              <span className="text-slate-300 dark:text-slate-700">·</span>
+              <span className="tabular-nums font-semibold">{connectedUsersCount} online</span>
+            </div>
             {isAdmin && <LocalModeIndicator />}
             <div className="relative hidden md:block">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -279,26 +300,26 @@ export function Layout() {
             <div className="flex items-center gap-1.5">
               <HeaderButton 
                 onClick={async () => {
+                  if (isRefreshingAll) return;
+                  setIsRefreshingAll(true);
                   try {
-                    await recalculate();
-                    toast.success("System data synchronized and recalculated successfully!");
-                  } catch (err) {
-                    toast.error("Failed to sync system data.");
+                    await Promise.all([recalculate(), refreshZkTablesFromSqlite()]);
+                  } catch {
+                    toast.error('Failed to refresh system data.');
+                  } finally {
+                    setIsRefreshingAll(false);
                   }
                 }}
-                disabled={isInitializing}
-                title="Sync Data"
+                disabled={isInitializing || isRefreshingAll}
+                title="Refresh Data"
               >
-                <RefreshCw size={16} className={isInitializing ? "animate-spin" : ""} />
+                <RefreshCw size={16} className={isInitializing || isRefreshingAll ? 'animate-spin' : ''} />
               </HeaderButton>
               <HeaderButton 
                 onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}
                 title="Toggle Theme"
               >
                 {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
-              </HeaderButton>
-              <HeaderButton title="Notifications">
-                <Bell size={16} />
               </HeaderButton>
               
               <div className="h-6 w-[1px] bg-slate-200 dark:bg-slate-700 mx-2"></div>
@@ -394,6 +415,17 @@ export function Layout() {
         employee={selectedEmployee}
         isOpen={!!selectedEmployeeId}
         onClose={closeEmployeeProfile}
+      />
+
+      <ConflictModal 
+        isOpen={!!conflictData}
+        conflictData={conflictData}
+        onRefreshLatest={async () => {
+          setConflictData(null);
+          await reconcileFromServer();
+          toast.success('Refreshed to latest server state.');
+        }}
+        onDismiss={() => setConflictData(null)}
       />
     </div>
   );

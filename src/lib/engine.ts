@@ -1,6 +1,12 @@
 import { differenceInMinutes, parseISO, format, subHours, addMinutes, isAfter, isBefore, addHours, subMinutes, startOfDay, endOfDay, startOfWeek, endOfWeek } from 'date-fns';
 import type { RawPunch, ProcessedAttendance, Settings, Employee, ShiftAssignment, AttendanceException } from '../types';
 import { generateId, normalizeEmployeeId } from './utils';
+import {
+  buildHolidayMasterMap,
+  extractPunchDateKey,
+  isNightShiftOvernightOutPunch,
+  toExactLocalWallClock,
+} from './holidayValidation';
 
 export function detectExceptions(
   processed: ProcessedAttendance[],
@@ -9,8 +15,46 @@ export function detectExceptions(
 ): AttendanceException[] {
   const exceptions: AttendanceException[] = [];
   const shiftMap = new Map(settings.shifts?.map(s => [s.id, s]) || []);
+  const holidayMasterMap = buildHolidayMasterMap([], settings.holidays || []);
+  const holidayPolicy = settings.holidayPunchPolicy || 'prevent_overlaps';
 
   processed.forEach(p => {
+    const holiday = holidayMasterMap.get(p.date);
+    if (holiday) {
+      const isLocked = holidayPolicy === 'block_all' || Boolean(holiday.preventPunches);
+      if (isLocked && p.rawLogs.length > 0) {
+        exceptions.push({
+          id: `ex_${p.id}_hol_locked`,
+          employeeId: p.employeeId,
+          date: p.date,
+          type: 'Holiday Punch Overlap',
+          description: `${p.rawLogs.length} punch log(s) blocked on locked Public Holiday "${holiday.name}". Auto-marked Public Holiday.`,
+          severity: 'high',
+          status: 'pending'
+        });
+      } else if (p.rawLogs.length > p.logs.length) {
+        const dropped = p.rawLogs.length - p.logs.length;
+        exceptions.push({
+          id: `ex_${p.id}_hol_dup`,
+          employeeId: p.employeeId,
+          date: p.date,
+          type: 'Holiday Punch Overlap',
+          description: `Prevented ${dropped} overlapping duplicate/colliding punch(es) on Public Holiday "${holiday.name}".`,
+          severity: 'medium',
+          status: 'pending'
+        });
+      } else if (p.status !== 'Public Holiday' && p.status !== 'Holiday' && p.status !== 'PPH') {
+        exceptions.push({
+          id: `ex_${p.id}_hol_stat`,
+          employeeId: p.employeeId,
+          date: p.date,
+          type: 'Holiday Punch Overlap',
+          description: `Status "${p.status}" conflicts with Public Holiday "${holiday.name}" (${p.date}).`,
+          severity: 'high',
+          status: 'pending'
+        });
+      }
+    }
     // 1. SPF (Single Punch Found)
     if (p.status === 'SPF') {
       exceptions.push({
@@ -128,31 +172,10 @@ export function processPunches(
   const assignmentMap = new Map(shiftAssignments.map(a => [`${normalizeEmployeeId(a.employeeId)}_${a.date}`, a]));
   const shiftMap = new Map(settings.shifts?.map(s => [s.id, s]) || []);
   const shiftNameMap = new Map(settings.shifts?.map(s => [s.name?.toLowerCase() || '', s]) || []);
-  const holidayMap = new Map<string, string>(
-    (settings.holidays || [])
-      .filter(h => h && h.date)
-      .map(h => [String(h.date).trim().slice(0, 10), String(h.name || 'Public Holiday').trim() || 'Public Holiday'])
-  );
+  const holidayMasterMap = buildHolidayMasterMap([], settings.holidays || []);
+  const holidayPolicy = settings.holidayPunchPolicy || 'prevent_overlaps';
 
-  // Helper to ensure every punch timestamp is in exact local device wall-clock time (DIA accuracy).
-  // Note: Legacy Excel imports created via new Date("YYYY-MM-DD HH:mm").toISOString() in Nepal (+05:45)
-  // stored UTC strings ending in ".000Z" (shifted back by 5h 45m, e.g. 07:40 NPT -> 01:55:00.000Z).
-  // Convert those legacy UTC strings back to Nepal local wall-clock time (+05:45 = +345 minutes),
-  // while keeping non-Z local timestamps untouched!
-  const toExactLocalTimeString = (dt: string | undefined | null): string => {
-    if (!dt) return '';
-    const trimmed = String(dt).trim().replace(' ', 'T');
-    if (/Z$/i.test(trimmed)) {
-      const utcMs = Date.parse(trimmed);
-      if (!isNaN(utcMs)) {
-        // Shift UTC timestamp by +05:45 (345 minutes) to restore exact Nepal device wall-clock time
-        const nptDate = new Date(utcMs + 345 * 60 * 1000);
-        const pad = (n: number) => String(n).padStart(2, '0');
-        return `${nptDate.getUTCFullYear()}-${pad(nptDate.getUTCMonth() + 1)}-${pad(nptDate.getUTCDate())}T${pad(nptDate.getUTCHours())}:${pad(nptDate.getUTCMinutes())}:${pad(nptDate.getUTCSeconds())}`;
-      }
-    }
-    return trimmed.replace(/(\.\d+)?Z$/i, '');
-  };
+  const toExactLocalTimeString = (dt: string | undefined | null): string => toExactLocalWallClock(dt);
 
   // Deduplicate and sort all punches globally first for optimization
   const sortedPunches = Array.from(new Map(punches.map(p => [p.employeeId + toExactLocalTimeString(p.punchDatetime), p])).values())
@@ -258,8 +281,12 @@ export function processPunches(
     allDatesList.forEach(dateStr => {
       const dateInfo = dateInfoMap.get(dateStr)!;
       const isWeeklyOff = empWO.includes(dateInfo.dayName);
-      const holidayName = holidayMap.get(dateStr);
-      const isPublicHoliday = Boolean(holidayName);
+      const holidayRecord = holidayMasterMap.get(dateStr);
+      const holidayName = holidayRecord?.name;
+      const isPublicHoliday = Boolean(holidayRecord);
+      const isLockedHoliday = Boolean(
+        holidayRecord && (holidayPolicy === 'block_all' || holidayRecord.preventPunches)
+      );
 
       const assignment = assignmentMap.get(`${normId}_${dateStr}`);
       
@@ -327,10 +354,58 @@ export function processPunches(
         ...(empData?.get(dateInfo.nextDate) || [])
       ];
 
-      const dayPunches = candidatePunches.filter(p => p._time >= windowStart && p._time < windowEnd);
+      const rawDayPunches = candidatePunches.filter(p => p._time >= windowStart && p._time < windowEnd);
 
-      // Generate the attendance record
-      if (dayPunches.length > 0) {
+      // If today is a Public Holiday, exclude legitimate early-morning overnight shift OUT punches
+      // that belong to the previous non-holiday working day's night shift.
+      const dayPunchesAll = isPublicHoliday
+        ? rawDayPunches.filter(p => {
+            const pDate = extractPunchDateKey(p.punchDatetime);
+            if (pDate !== dateStr) return true;
+            return !isNightShiftOvernightOutPunch({
+              punchDatetime: p.punchDatetime,
+              employeeId: p.employeeId,
+              holidayMap: holidayMasterMap,
+              allPunches: candidatePunches,
+              employees,
+              shifts: settings.shifts,
+              shiftAssignments,
+            });
+          })
+        : rawDayPunches;
+
+      // Under 'prevent_overlaps' on a Public Holiday, prevent manual/file punches from colliding
+      // with existing ZKTeco biometric logs on the same holiday.
+      const hasZktOnHoliday =
+        isPublicHoliday && dayPunchesAll.some(p => (p.source || 'ZKTeco') === 'ZKTeco');
+      const dayPunches =
+        isPublicHoliday && holidayPolicy === 'prevent_overlaps' && hasZktOnHoliday
+          ? dayPunchesAll.filter(p => (p.source || 'ZKTeco') === 'ZKTeco')
+          : dayPunchesAll;
+
+      // Locked Public Holiday: auto-mark Public Holiday and block punches from counting as attendance
+      if (isPublicHoliday && isLockedHoliday) {
+        processed.push({
+          id: `${emp.id}_${dateStr}`,
+          employeeId: emp.id,
+          date: dateStr,
+          firstPunch: null,
+          lastPunch: null,
+          workingHours: 0,
+          overtime: 0,
+          lateMinutes: 0,
+          earlyMinutes: 0,
+          shiftId: shift?.id,
+          shiftCode: shift?.id || 'DS',
+          shiftName: shift?.name || 'Day Shift',
+          shiftSource,
+          expectedHours: Number(shiftDuration.toFixed(2)),
+          status: 'Public Holiday',
+          remarks: holidayName,
+          logs: [],
+          rawLogs: dayPunchesAll.map(p => p.punchDatetime)
+        });
+      } else if (dayPunches.length > 0) {
         const firstPunchObj = dayPunches[0];
         const lastPunchObj = dayPunches[dayPunches.length - 1];
 
@@ -385,11 +460,11 @@ export function processPunches(
         const punchIn = firstPunchStr ? parseISO(firstPunchStr) : null;
         const punchOut = lastPunchStr ? parseISO(lastPunchStr) : null;
 
-        if (punchIn && isAfter(punchIn, lateLimit) && shift?.id !== 'DS') {
+        if (punchIn && isAfter(punchIn, lateLimit) && shift?.id !== 'DS' && !isPublicHoliday) {
           lateMinutes = Math.max(0, differenceInMinutes(punchIn, expectedStart));
         }
 
-        if (punchOut && isBefore(punchOut, expectedEnd) && shift?.id !== 'DS') {
+        if (punchOut && isBefore(punchOut, expectedEnd) && shift?.id !== 'DS' && !isPublicHoliday) {
           earlyMinutes = Math.max(0, differenceInMinutes(expectedEnd, punchOut));
         }
 
@@ -397,8 +472,8 @@ export function processPunches(
 
         if (isSameOrSinglePunch) {
           status = isPublicHoliday ? 'Public Holiday' : (isWeeklyOff ? 'Weekly Off' : 'SPF');
-        } else if (isPublicHoliday && workHours < 4) {
-          // Short duration on Public Holiday (< 4 hours) remains Public Holiday, not PPH
+        } else if (isPublicHoliday && (workHours < 4 || holidayRecord?.allowWorkedPph === false)) {
+          // Short duration (< 4 hours) or non-PPH holiday remains Public Holiday
           status = 'Public Holiday';
         } else if (isWeeklyOff && !isPublicHoliday && workHours < 4) {
           // Short duration on Weekly Off (< 4 hours) is counted as Weekly Off (WO), not PWO
@@ -444,7 +519,7 @@ export function processPunches(
           status,
           remarks: isPublicHoliday ? holidayName : undefined,
           logs: validLogs,
-          rawLogs: dayPunches.map(p => p.punchDatetime)
+          rawLogs: dayPunchesAll.map(p => p.punchDatetime)
         });
       } else {
         // Absent, Public Holiday, or Weekly Off
@@ -507,7 +582,7 @@ export function processPunches(
         for (let i = idx - 1; i >= 0; i--) {
           const prev = empRecords[i];
           const prevDayName = format(parseISO(prev.date), 'EEEE');
-          const isPrevScheduledWO = empWO.includes(prevDayName.toLowerCase()) || holidayMap.has(prev.date);
+          const isPrevScheduledWO = empWO.includes(prevDayName.toLowerCase()) || holidayMasterMap.has(prev.date);
           if (!isPrevScheduledWO) {
             prevWorkingDayRec = prev;
             break;
@@ -518,7 +593,7 @@ export function processPunches(
         for (let i = idx + 1; i < empRecords.length; i++) {
           const next = empRecords[i];
           const nextDayName = format(parseISO(next.date), 'EEEE');
-          const isNextScheduledWO = empWO.includes(nextDayName.toLowerCase()) || holidayMap.has(next.date);
+          const isNextScheduledWO = empWO.includes(nextDayName.toLowerCase()) || holidayMasterMap.has(next.date);
           if (!isNextScheduledWO) {
             nextWorkingDayRec = next;
             break;

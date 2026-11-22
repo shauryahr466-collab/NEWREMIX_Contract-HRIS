@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect, useDeferredValue } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useAppStore } from '../store';
 import { format, parseISO, startOfMonth, endOfMonth, eachDayOfInterval, isSameMonth, isToday, startOfWeek, endOfWeek, addMonths, subMonths, isSameDay, subDays, startOfYesterday, endOfYesterday, subWeeks } from 'date-fns';
-import { Calendar as CalendarIcon, Search, Filter, LayoutList, CalendarDays, ChevronLeft, ChevronRight, UserPlus, RefreshCw, X, Archive, Download, MoreVertical, Clock, Printer, ChevronDown, Wand2, FileText, History, Calculator, Trash2, AlertCircle, Info, Users, UserCheck, UserX, TrendingUp, Upload } from 'lucide-react';
+import { Calendar as CalendarIcon, Search, Filter, LayoutList, CalendarDays, ChevronLeft, ChevronRight, UserPlus, RefreshCw, X, Archive, Download, MoreVertical, Clock, Printer, ChevronDown, Wand2, FileText, History, Calculator, Trash2, AlertCircle, Info, Users, UserCheck, UserX, TrendingUp, Upload, ShieldCheck, CheckCircle2 } from 'lucide-react';
 import { cn, formatAMPM, formatDuration, formatMinutes, normalizeEmployeeId } from '../lib/utils';
 import { getNepaliDate } from '../utils/dateHelper';
 import { toast } from 'sonner';
@@ -19,7 +19,8 @@ import { MonthlyMuster } from '../components/attendance/MonthlyMuster';
 import { AttendanceCalendar } from '../components/attendance/AttendanceCalendar';
 import { FreshAttendanceAudit } from '../components/attendance/FreshAttendanceAudit';
 import { useActionStatus } from '../context/ActionStatusContext';
-import { saveLocalTableDetailed } from '../lib/localClient';
+import { saveLocalTableDetailed, fetchHolidayValidationReport, reconcileHolidaysAndOverlaps } from '../lib/localClient';
+import type { HolidayValidationReport } from '../types';
 import { ManualAttendanceImportModal } from '../components/ManualAttendanceImportModal';
 
 function AttendanceReconciliation() {
@@ -174,6 +175,10 @@ function AttendanceReconciliation() {
 
   const [selectedEmployees, setSelectedEmployees] = useState<string[]>([]);
   const [isManualImportOpen, setIsManualImportOpen] = useState(false);
+  const [isHolidayValidationOpen, setIsHolidayValidationOpen] = useState(false);
+  const [holidayReport, setHolidayReport] = useState<HolidayValidationReport | null>(null);
+  const [isLoadingHolidayReport, setIsLoadingHolidayReport] = useState(false);
+  const [isReconcilingHolidays, setIsReconcilingHolidays] = useState(false);
   const [bulkModal, setBulkModal] = useState({ 
     isOpen: false, 
     step: 1 as 1 | 2,
@@ -181,6 +186,45 @@ function AttendanceReconciliation() {
     startDate: format(new Date(), 'yyyy-MM-dd'), 
     endDate: format(new Date(), 'yyyy-MM-dd') 
   });
+
+  const loadHolidayReport = async () => {
+    setIsLoadingHolidayReport(true);
+    try {
+      const rep = await fetchHolidayValidationReport();
+      setHolidayReport(rep);
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to scan Public Holiday validation status');
+    } finally {
+      setIsLoadingHolidayReport(false);
+    }
+  };
+
+  const handleOpenHolidayValidation = () => {
+    setIsHolidayValidationOpen(true);
+    loadHolidayReport();
+  };
+
+  const handleReconcileHolidays = async () => {
+    if (quotaExceeded || isReconcilingHolidays) return;
+    setIsReconcilingHolidays(true);
+    try {
+      const res = await reconcileHolidaysAndOverlaps();
+      await fetchPunches();
+      await recalculate();
+      if (res?.reportAfter) {
+        setHolidayReport(res.reportAfter);
+      } else {
+        await loadHolidayReport();
+      }
+      toast.success(
+        `Holiday reconciliation complete: ${res.cleanedPunchCount || 0} overlap punch(es) removed, ${res.holidaysSynced || 0} holidays synced.`
+      );
+    } catch (err: any) {
+      toast.error(err?.message || 'Holiday reconciliation failed');
+    } finally {
+      setIsReconcilingHolidays(false);
+    }
+  };
 
   const handleBulkAssign = async () => {
     if (quotaExceeded) return;
@@ -724,9 +768,19 @@ function AttendanceReconciliation() {
             </Button>
             
             <Button
+              onClick={handleOpenHolidayValidation}
+              variant="outline"
+              size="sm"
+              className="gap-1.5 whitespace-nowrap shrink-0 border-sky-200 dark:border-sky-800 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-950/40"
+              title="Cross-reference attendance punches against Public Holiday master database and prevent punch overlaps"
+            >
+              <ShieldCheck size={14} /> Holiday Validation
+            </Button>
+
+            <Button
               onClick={() => setIsManualImportOpen(true)}
               size="sm"
-              className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs"
+              className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs whitespace-nowrap shrink-0"
               title="Import Excel attendance records to update Force Attendance and session punch logs, recalculating reconciliation, muster, and overtime"
             >
               <Upload size={14} /> Manual Attendance Import
@@ -1459,6 +1513,202 @@ function AttendanceReconciliation() {
         isOpen={isManualImportOpen} 
         onClose={() => setIsManualImportOpen(false)} 
       />
+
+      {/* Holiday Validation & Overlap Audit Modal */}
+      {isHolidayValidationOpen && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-2xl w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shrink-0">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5 text-sky-600" />
+                  Public Holiday Validation & Punch Overlap Guard
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Cross-references SQLite punch logs and overrides against the Public Holiday master table
+                </p>
+              </div>
+              <button
+                onClick={() => setIsHolidayValidationOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-lg"
+                aria-label="Close Holiday Validation Modal"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-6 flex-1">
+              {isLoadingHolidayReport && !holidayReport ? (
+                <div className="py-12 text-center text-xs text-slate-500 space-y-2">
+                  <RefreshCw className="w-5 h-5 animate-spin mx-auto text-sky-600" />
+                  <p>Cross-referencing SQLite punch logs with Public Holiday master table...</p>
+                </div>
+              ) : holidayReport ? (
+                <>
+                  {/* Summary Metrics */}
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                    <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
+                      <p className="text-[11px] font-medium text-slate-500">Master Holidays</p>
+                      <p className="text-xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">{holidayReport.totalMasterHolidays}</p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
+                      <p className="text-[11px] font-medium text-slate-500">SQLite Synced</p>
+                      <p className="text-xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">{holidayReport.holidaysSyncedToTable}</p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
+                      <p className="text-[11px] font-medium text-slate-500">Holiday Punches</p>
+                      <p className="text-xl font-bold text-slate-900 dark:text-white mt-1 tabular-nums">{holidayReport.punchesOnHolidays}</p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
+                      <p className="text-[11px] font-medium text-slate-500">Auto-Marked PH Days</p>
+                      <p className="text-xl font-bold text-sky-700 dark:text-sky-400 mt-1 tabular-nums">{holidayReport.autoMarkedPublicHolidayDays}</p>
+                    </div>
+                    <div className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/40">
+                      <p className="text-[11px] font-medium text-slate-500">Overlap Conflicts</p>
+                      <p className={cn(
+                        'text-xl font-bold mt-1 tabular-nums',
+                        holidayReport.overlapConflictsCount > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'
+                      )}>
+                        {holidayReport.overlapConflictsCount}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Policy Context */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 pb-2 border-b border-slate-100 dark:border-slate-800">
+                    <span>
+                      Active Policy: <strong className="text-slate-800 dark:text-slate-200">{holidayReport.policy}</strong>
+                      <span aria-hidden="true"> · </span>
+                      Active Workforce: <span className="font-mono tabular-nums">{holidayReport.activeEmployeesCovered}</span>
+                      <span aria-hidden="true"> · </span>
+                      Worked PPH Days: <span className="font-mono tabular-nums">{holidayReport.workedHolidayPphDays}</span>
+                    </span>
+                    <span className="font-mono text-[11px] tabular-nums">
+                      Scanned {format(parseISO(holidayReport.generatedAt), 'yyyy-MM-dd HH:mm')}
+                    </span>
+                  </div>
+
+                  {/* Public Holiday Breakdown Table */}
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                      Public Holiday Master Coverage
+                    </h4>
+                    {holidayReport.holidayBreakdown.length > 0 ? (
+                      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-x-auto">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead className="bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-800 text-[11px] font-semibold text-slate-500">
+                            <tr>
+                              <th className="px-4 py-2.5">Date</th>
+                              <th className="px-4 py-2.5">Holiday Name</th>
+                              <th className="px-4 py-2.5">Rule</th>
+                              <th className="px-4 py-2.5 text-right">Punches</th>
+                              <th className="px-4 py-2.5 text-right">Auto PH</th>
+                              <th className="px-4 py-2.5 text-right">Worked PPH</th>
+                              <th className="px-4 py-2.5 text-right">Overlaps</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                            {holidayReport.holidayBreakdown.map((row) => (
+                              <tr key={row.date} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                                <td className="px-4 py-2.5 font-mono font-semibold text-slate-900 dark:text-white tabular-nums">{row.date}</td>
+                                <td className="px-4 py-2.5 font-medium text-slate-800 dark:text-slate-200">{row.name}</td>
+                                <td className="px-4 py-2.5 text-slate-600 dark:text-slate-400">
+                                  {row.preventPunches ? 'Strict Block' : 'Overlap Guard'}
+                                </td>
+                                <td className="px-4 py-2.5 text-right font-mono tabular-nums">{row.punchCount}</td>
+                                <td className="px-4 py-2.5 text-right font-mono tabular-nums text-sky-700 dark:text-sky-400">{row.publicHolidayCount}</td>
+                                <td className="px-4 py-2.5 text-right font-mono tabular-nums">{row.pphCount}</td>
+                                <td className={cn(
+                                  'px-4 py-2.5 text-right font-mono tabular-nums font-semibold',
+                                  row.overlapCount > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'
+                                )}>
+                                  {row.overlapCount}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-6 text-center border border-dashed border-slate-200 dark:border-slate-800 rounded-xl text-xs text-slate-500">
+                        No public holidays are registered in Settings or SQLite holidays table.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Overlap Conflicts Table */}
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                      Detected Holiday Punch Overlaps & Conflicts
+                    </h4>
+                    {holidayReport.conflicts.length > 0 ? (
+                      <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-x-auto max-h-64">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead className="bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-800 text-[11px] font-semibold text-slate-500 sticky top-0">
+                            <tr>
+                              <th className="px-4 py-2.5">Employee</th>
+                              <th className="px-4 py-2.5">Holiday Date</th>
+                              <th className="px-4 py-2.5">Conflict Detail</th>
+                              <th className="px-4 py-2.5">Source</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                            {holidayReport.conflicts.slice(0, 100).map((conf) => (
+                              <tr key={conf.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                                <td className="px-4 py-2.5">
+                                  <span className="font-semibold text-slate-900 dark:text-white">{conf.employeeName}</span>
+                                  <span className="text-slate-400 font-mono text-[11px] ml-1.5">{conf.employeeId}</span>
+                                </td>
+                                <td className="px-4 py-2.5 font-mono tabular-nums text-slate-700 dark:text-slate-300">
+                                  {conf.date} · {conf.holidayName}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-600 dark:text-slate-300">{conf.message}</td>
+                                <td className="px-4 py-2.5 font-mono text-[11px] text-slate-500">
+                                  {conf.source || 'ZKTeco'}
+                                  {conf.conflictingSource ? ` / ${conf.conflictingSource}` : ''}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-5 border border-slate-200 dark:border-slate-800 rounded-xl flex items-center gap-3 text-xs text-emerald-700 dark:text-emerald-400 bg-emerald-50/40 dark:bg-emerald-950/20">
+                        <CheckCircle2 className="w-4 h-4 shrink-0" />
+                        <span>Zero holiday punch overlaps or status mismatches detected across SQLite records.</span>
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            <div className="px-6 py-4 bg-slate-50 dark:bg-slate-800/60 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3 shrink-0">
+              <Button variant="outline" size="sm" onClick={loadHolidayReport} disabled={isLoadingHolidayReport} className="gap-1.5 whitespace-nowrap">
+                <RefreshCw size={13} className={isLoadingHolidayReport ? 'animate-spin' : ''} /> Refresh Scan
+              </Button>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => setIsHolidayValidationOpen(false)}>
+                  Close
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={handleReconcileHolidays}
+                  disabled={quotaExceeded || isReconcilingHolidays || isLoadingHolidayReport}
+                  className="bg-sky-600 hover:bg-sky-700 text-white font-semibold gap-1.5 whitespace-nowrap"
+                >
+                  <ShieldCheck size={14} />
+                  {isReconcilingHolidays
+                    ? 'Reconciling...'
+                    : holidayReport && holidayReport.redundantPunchIdsToClean.length > 0
+                      ? `Reconcile & Clean ${holidayReport.redundantPunchIdsToClean.length} Overlaps`
+                      : 'Sync Master & Verify Holidays'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

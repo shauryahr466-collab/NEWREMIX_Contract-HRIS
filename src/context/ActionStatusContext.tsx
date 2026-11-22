@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import type { ActionState, ActionConfirmationConfig, ActionStatusResult, FieldDiff } from '../types';
 import { saveLocalTableDetailed } from '../lib/localClient';
+import { getInMemoryUserDisplayName } from '../lib/authSession';
 import { toast } from 'sonner';
 
 export interface ProgressUpdate {
@@ -40,7 +41,7 @@ interface ActionStatusContextType {
       breakdown?: Record<string, any>;
       data?: T;
     }>
-  ) => Promise<{ success: boolean; data?: T; result?: ActionStatusResult }>;
+  ) => Promise<{ success: boolean; data?: T; result?: ActionStatusResult; conflictData?: any }>;
   showSuccess: (result: Partial<ActionStatusResult> & { module: string }) => void;
   showError: (error: any, module: string, operation?: string, retryFn?: () => void) => void;
   closeModal: () => void;
@@ -238,6 +239,27 @@ export function ActionStatusProvider({ children }: { children: React.ReactNode }
 
       const taskRes = raceResult.res;
 
+      if ((taskRes as any).conflict) {
+        const conflictRes: ActionStatusResult = {
+          success: false,
+          verified: false,
+          verificationStatus: 'FAILED',
+          transaction: 'ROLLED_BACK',
+          dbPath: 'E:\\SHRM_HRIS\\Database.db',
+          affectedCount: 0,
+          module: conf.module,
+          recordId: conf.recordId,
+          recordName: conf.recordName,
+          timestamp: new Date().toLocaleTimeString('en-GB', { hour12: false }),
+          error: (taskRes as any).error || 'Concurrent update conflict (409). Record has been modified by another user.',
+          operationId: currentOpId
+        };
+        setResult(conflictRes);
+        setActionState('FAILED');
+        toast.error('Concurrent update conflict: Record was updated elsewhere. Please refresh.');
+        return { success: false, result: conflictRes, conflictData: (taskRes as any).conflictData } as any;
+      }
+
       if (taskRes.success) {
         const statusRes: ActionStatusResult = {
           success: true,
@@ -267,13 +289,7 @@ export function ActionStatusProvider({ children }: { children: React.ReactNode }
 
         // Automatically log audit entry in local SQLite
         try {
-          let actorName = 'System Admin';
-          try {
-            const profRaw = sessionStorage.getItem('local_user_profile');
-            const sessRaw = sessionStorage.getItem('local_session_user');
-            const parsedProf = profRaw ? JSON.parse(profRaw) : (sessRaw ? JSON.parse(sessRaw) : null);
-            actorName = parsedProf?.username || parsedProf?.displayName || parsedProf?.email || actorName;
-          } catch {}
+          const actorName = getInMemoryUserDisplayName();
           const nowIso = new Date().toISOString();
           const changedSummary = Array.isArray(conf.changedFields) && conf.changedFields.length > 0
             ? conf.changedFields.map((c: any) => c?.label || c?.field).filter(Boolean).join(', ')

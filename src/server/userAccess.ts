@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { getSqliteDb, saveSqliteDb, withSqliteWriteLock } from './sqliteDb.js';
+import { timingSafeSecretCompare } from './authSession.js';
 import {
   getDefaultPermissionsForRole,
   isEmployeeInUserScope,
@@ -8,10 +9,8 @@ import {
 } from '../lib/accessControl.js';
 import type { SystemRole, SystemUser } from '../types.js';
 
-export const SUPER_ADMIN_EMAILS = [
-  'hr.sandiprajak466@gmail.com',
-  'shauryahr466@gmail.com'
-];
+export const OWNER_ADMIN_EMAIL = 'hr.sandiprajak466@gmail.com';
+export const SUPER_ADMIN_EMAILS = [OWNER_ADMIN_EMAIL];
 
 export function isBootstrapSuperAdminEmail(email: string): boolean {
   const norm = String(email || '').trim().toLowerCase();
@@ -67,6 +66,133 @@ async function readRawUsersFromDb(): Promise<any[]> {
     .filter(Boolean);
 }
 
+export async function getOwnerBootstrapStatus(): Promise<{
+  setupRequired: boolean;
+  envOverrideActive: boolean;
+  hasOwnerPassword: boolean;
+  ownerHint: string;
+}> {
+  const envPass = process.env.ADMIN_PASSCODE?.trim() || '';
+  const envOverrideActive = envPass.length > 0;
+  const rows = await readRawUsersFromDb();
+  const ownerRow = rows.find(
+    r => String(r.email || '').trim().toLowerCase() === OWNER_ADMIN_EMAIL.toLowerCase() && Boolean(r.passwordHash)
+  );
+  const hasOwnerPassword = Boolean(ownerRow?.passwordHash);
+  const [localPart, domainPart] = OWNER_ADMIN_EMAIL.split('@');
+  const ownerHint = `${localPart.slice(0, 4)}***@${domainPart}`;
+
+  return {
+    setupRequired: !envOverrideActive && !hasOwnerPassword,
+    envOverrideActive,
+    hasOwnerPassword,
+    ownerHint
+  };
+}
+
+export async function claimOwnerAdminPassword(
+  email: string,
+  password: string
+): Promise<{ success: true; user: SystemUser } | { success: false; error: string; statusCode: number }> {
+  const cleanEmail = String(email || '').trim().toLowerCase();
+  const cleanPass = String(password || '');
+
+  if (!isBootstrapSuperAdminEmail(cleanEmail)) {
+    return {
+      success: false,
+      error: 'Access Denied: Only the registered company owner account can complete first-time setup.',
+      statusCode: 403
+    };
+  }
+
+  const status = await getOwnerBootstrapStatus();
+  if (!status.setupRequired) {
+    return {
+      success: false,
+      error: 'Owner password is already configured. Sign in with your password.',
+      statusCode: 403
+    };
+  }
+
+  if (cleanPass.length < 6) {
+    return {
+      success: false,
+      error: 'Owner password must be at least 6 characters long.',
+      statusCode: 400
+    };
+  }
+
+  const now = new Date().toISOString();
+  const ownerId = `super_admin_${cleanEmail.replace(/[^a-z0-9]/g, '_')}`;
+  const passwordHash = hashPassword(cleanPass);
+
+  const normalized = normalizeSystemUser({
+    id: ownerId,
+    username: cleanEmail.split('@')[0],
+    email: cleanEmail,
+    role: 'Super Admin',
+    status: 'Active',
+    assignedDepartments: [],
+    assignedSections: [],
+    permissions: getDefaultPermissionsForRole('Super Admin'),
+    createdBy: 'Owner Bootstrap',
+    createdAt: now,
+    updatedAt: now
+  });
+
+  const storedPayload = {
+    ...normalized,
+    passwordHash
+  };
+
+  await withSqliteWriteLock(async () => {
+    // Re-check inside lock to guarantee one-time atomic claim
+    const db = await getSqliteDb();
+    const check = db.exec('SELECT data FROM users WHERE LOWER(email) = LOWER(?)', [cleanEmail]);
+    if (check.length > 0) {
+      for (const row of check[0].values) {
+        try {
+          const parsed = JSON.parse(String(row[0] || '{}'));
+          if (parsed?.passwordHash) {
+            throw new Error('ALREADY_CLAIMED');
+          }
+        } catch (err: any) {
+          if (err?.message === 'ALREADY_CLAIMED') throw err;
+        }
+      }
+    }
+
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+
+    const delDup = db.prepare('DELETE FROM users WHERE LOWER(email) = LOWER(?) AND id != ?');
+    delDup.run([normalized.email, normalized.id]);
+    delDup.free();
+
+    const stmt = db.prepare(`
+      INSERT INTO users (id, email, role, data, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        email=excluded.email,
+        role=excluded.role,
+        data=excluded.data
+    `);
+    stmt.run([
+      normalized.id,
+      normalized.email,
+      normalized.role,
+      JSON.stringify(storedPayload),
+      now
+    ]);
+    stmt.free();
+
+    db.run('COMMIT');
+    saveSqliteDb();
+  });
+
+  return { success: true, user: normalized };
+}
+
 export async function listSystemUsers(): Promise<SystemUser[]> {
   const rows = await readRawUsersFromDb();
   const byEmail = new Map<string, any>();
@@ -74,7 +200,6 @@ export async function listSystemUsers(): Promise<SystemUser[]> {
   for (const r of rows) {
     const emailKey = String(r.email || r.id).trim().toLowerCase();
     const existing = byEmail.get(emailKey);
-    // Prefer richer records (with permissions / passwordHash / newer updatedAt)
     if (!existing) {
       byEmail.set(emailKey, r);
     } else {
@@ -98,7 +223,7 @@ export async function listSystemUsers(): Promise<SystemUser[]> {
         assignedDepartments: [],
         assignedSections: [],
         permissions: getDefaultPermissionsForRole('Super Admin'),
-        createdBy: 'System',
+        createdBy: 'Owner',
         createdAt: new Date().toISOString()
       });
     } else {
@@ -154,11 +279,25 @@ export async function resolveSessionProfile(identifier: string): Promise<SystemU
 export async function authenticateLocalUser(
   identifier: string,
   password: string
-): Promise<{ success: true; user: SystemUser } | { success: false; error: string; statusCode: number; noLocalPassword?: boolean }> {
+): Promise<{ success: true; user: SystemUser } | { success: false; error: string; statusCode: number; setupRequired?: boolean }> {
   const cleanId = String(identifier || '').trim().toLowerCase();
   const cleanPass = String(password || '');
   if (!cleanId || !cleanPass) {
-    return { success: false, error: 'Email/Login ID and password are required', statusCode: 400 };
+    return { success: false, error: 'Work Email / Login ID and Password are required', statusCode: 400 };
+  }
+
+  // 1. Owner Super Admin fast path (respects ADMIN_PASSCODE env var override first, else SQLite scrypt hash)
+  if (isBootstrapSuperAdminEmail(cleanId)) {
+    const envPass = process.env.ADMIN_PASSCODE?.trim() || '';
+    if (envPass) {
+      if (!timingSafeSecretCompare(cleanPass, envPass)) {
+        return { success: false, error: 'Invalid credentials', statusCode: 401 };
+      }
+      const ownerProfile = await resolveSessionProfile(cleanId);
+      if (ownerProfile) {
+        return { success: true, user: ownerProfile };
+      }
+    }
   }
 
   const rows = await readRawUsersFromDb();
@@ -169,24 +308,46 @@ export async function authenticateLocalUser(
       (r.linkedEmployeeId && String(r.linkedEmployeeId).trim().toLowerCase() === cleanId)
   );
 
-  // Pick row with passwordHash if multiple legacy rows share email
   const record = matchingRows.find(r => Boolean(r.passwordHash)) || matchingRows[0];
 
   if (!record) {
-    return { success: false, error: 'Account not found in local user directory', statusCode: 404 };
+    if (isBootstrapSuperAdminEmail(cleanId)) {
+      return {
+        success: false,
+        error: 'Complete First-Time Owner Setup to set your Super Admin password.',
+        statusCode: 403,
+        setupRequired: true
+      };
+    }
+    return {
+      success: false,
+      error: 'Access Denied: Your account has not been provisioned by the Administrator.',
+      statusCode: 403
+    };
   }
 
   const normalized = sanitizeUser(record);
-  if (normalized.status === 'Suspended') {
-    return { success: false, error: 'This user account is suspended. Contact Super Admin.', statusCode: 403 };
+  if (normalized.status === 'Suspended' && !isBootstrapSuperAdminEmail(normalized.email)) {
+    return {
+      success: false,
+      error: 'Access Denied: This account has been suspended by the Administrator.',
+      statusCode: 403
+    };
   }
 
   if (!record.passwordHash) {
+    if (isBootstrapSuperAdminEmail(normalized.email)) {
+      return {
+        success: false,
+        error: 'Complete First-Time Owner Setup to set your Super Admin password.',
+        statusCode: 403,
+        setupRequired: true
+      };
+    }
     return {
       success: false,
-      error: 'No local password set for this account. Sign in with Google/Instant Admin Access or ask Super Admin to set a password.',
-      statusCode: 401,
-      noLocalPassword: true
+      error: 'Access Denied: No login credentials configured for this account. Contact Super Admin.',
+      statusCode: 403
     };
   }
 
@@ -194,7 +355,94 @@ export async function authenticateLocalUser(
     return { success: false, error: 'Invalid password', statusCode: 401 };
   }
 
+  if (isBootstrapSuperAdminEmail(normalized.email)) {
+    return {
+      success: true,
+      user: {
+        ...normalized,
+        role: 'Super Admin',
+        status: 'Active',
+        permissions: getDefaultPermissionsForRole('Super Admin')
+      }
+    };
+  }
+
   return { success: true, user: normalized };
+}
+
+export async function updateUserPassword(
+  email: string,
+  currentPassword: string,
+  newPassword: string
+): Promise<{ success: true } | { success: false; error: string; statusCode: number }> {
+  const cleanEmail = String(email || '').trim().toLowerCase();
+  if (!cleanEmail) return { success: false, error: 'Email is required', statusCode: 400 };
+  if (String(newPassword || '').length < 6) {
+    return { success: false, error: 'New password must be at least 6 characters long.', statusCode: 400 };
+  }
+
+  if (isBootstrapSuperAdminEmail(cleanEmail) && process.env.ADMIN_PASSCODE?.trim()) {
+    return {
+      success: false,
+      error: 'Owner passcode is controlled by ADMIN_PASSCODE environment configuration.',
+      statusCode: 400
+    };
+  }
+
+  const rows = await readRawUsersFromDb();
+  const record = rows.find(r => String(r.email || '').trim().toLowerCase() === cleanEmail && Boolean(r.passwordHash));
+
+  if (record?.passwordHash) {
+    if (!verifyPassword(currentPassword, record.passwordHash)) {
+      return { success: false, error: 'Current password is incorrect.', statusCode: 401 };
+    }
+  } else if (!isBootstrapSuperAdminEmail(cleanEmail)) {
+    return { success: false, error: 'Account not found.', statusCode: 404 };
+  }
+
+  const now = new Date().toISOString();
+  const baseProfile = await resolveSessionProfile(cleanEmail);
+  if (!baseProfile) {
+    return { success: false, error: 'Account not found.', statusCode: 404 };
+  }
+
+  const payload = {
+    ...baseProfile,
+    updatedAt: now,
+    passwordHash: hashPassword(newPassword)
+  };
+
+  await withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+
+    const delDup = db.prepare('DELETE FROM users WHERE LOWER(email) = LOWER(?) AND id != ?');
+    delDup.run([baseProfile.email, baseProfile.id]);
+    delDup.free();
+
+    const stmt = db.prepare(`
+      INSERT INTO users (id, email, role, data, created_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        email=excluded.email,
+        role=excluded.role,
+        data=excluded.data
+    `);
+    stmt.run([
+      baseProfile.id,
+      baseProfile.email,
+      baseProfile.role,
+      JSON.stringify(payload),
+      typeof baseProfile.createdAt === 'string' ? baseProfile.createdAt : now
+    ]);
+    stmt.free();
+
+    db.run('COMMIT');
+    saveSqliteDb();
+  });
+
+  return { success: true };
 }
 
 export interface UpsertSystemUserInput {
@@ -252,9 +500,6 @@ export async function createOrUpdateSystemUser(
   const existingRecord = existingById || (explicitId ? undefined : existingByEmail);
 
   if (!explicitId && !existingById && existingByEmail && input.password && !input.id) {
-    // Allow intentional update or reject duplicate creation if another id wasn't passed
-    // Wait: bootstrap admin sync from App.tsx calls /api/admin/create-user without password.
-    // When Super Admin explicitly creates a new user with a password and email already exists, enforce clear duplicate message unless updating.
     if (existingByEmail.passwordHash || existingByEmail.permissions) {
       throw new Error(`A user account with email "${email}" already exists. Edit the existing user instead.`);
     }
@@ -303,7 +548,6 @@ export async function createOrUpdateSystemUser(
     try { db.run('ROLLBACK'); } catch {}
     db.run('BEGIN TRANSACTION');
 
-    // Remove older duplicate rows with same email if consolidating legacy records
     const delDup = db.prepare('DELETE FROM users WHERE LOWER(email) = LOWER(?) AND id != ?');
     delDup.run([normalized.email, normalized.id]);
     delDup.free();
@@ -339,7 +583,7 @@ export async function deleteSystemUser(id: string, requesterEmail?: string): Pro
     throw new Error('User not found');
   }
   if (isBootstrapSuperAdminEmail(target.email)) {
-    throw new Error('Primary system Super Admin account cannot be deleted');
+    throw new Error('Primary system Owner account cannot be deleted');
   }
   if (requesterEmail && target.email.toLowerCase() === requesterEmail.toLowerCase()) {
     throw new Error('You cannot delete your own active account');

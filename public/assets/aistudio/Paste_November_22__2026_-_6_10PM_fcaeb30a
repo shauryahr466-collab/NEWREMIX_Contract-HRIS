@@ -1,0 +1,1062 @@
+# MASTER HRIS MODERNIZATION — PROFESSIONAL UI/UX, PERFORMANCE, MULTI-USER SQLITE SYNCHRONIZATION, ZKTECO & CADDY LAN DEPLOYMENT
+
+I want to refine my existing HRIS into a professional, stable, fast, multi-user enterprise HR management system suitable for daily operations within our company network.
+
+The application must operate through Caddy on the company LAN/Wi-Fi so authorized users can access the same HRIS from their computers without accessing separate local copies.
+
+## 1. EXISTING ENVIRONMENT
+
+My existing environment is:
+
+**Application:** Existing Google AI Studio-developed HRIS  
+**Local application:** `http://localhost:3000`  
+**Source code:** `E:\Download\SHRM_HRIS\`  
+**Central production data directory:** `E:\SHRM_HRIS\`  
+**Production SQLite database:** `E:\SHRM_HRIS\Database.db`  
+**Documents:** `E:\SHRM_HRIS\Documents\`  
+**Backups:** `E:\SHRM_HRIS\Backups\`  
+**Network gateway:** Caddy  
+**Operating environment:** Windows  
+**Biometric system:** ZKTeco device / existing external biometric collector  
+**Database:** Existing SQLite database
+
+Keep the current database and existing employee, attendance, payroll, OT, salary and other HR information.
+
+## 2. STRICT INSPECT-BEFORE-EDIT WORKFLOW
+
+Do not immediately rewrite or modify the application.
+
+First inspect:
+
+- Complete project structure
+- Existing React components
+- Navigation and routing
+- All modules, sub-modules and tabs
+- Existing API services
+- Express server
+- SQLite/sql.js implementation
+- Database initialization and persistence
+- State-management architecture
+- Current Caddyfile and startup scripts
+- Local storage and caching
+- ZKT integration
+- Attendance and OT engines
+- Existing confirmation and operation managers
+- User authentication and permissions
+- Existing polling and synchronization
+- Current error-handling architecture
+- Existing performance issues
+
+Trace the actual application from the browser through the API to the production SQLite database.
+
+Identify any competing database paths, duplicated services, duplicate polling loops, redundant network requests or stale application states.
+
+Prepare a technical inspection report and minimal change plan before the first code edit.
+
+Do not invent features that already exist.
+
+Do not create duplicate components or services when existing ones can safely be improved.
+
+## 3. PRESERVE THE EXISTING HRIS STRUCTURE
+
+My HRIS already follows:
+
+HRIS SYSTEM  
+→ MODULE  
+→ SUB-MODULE  
+→ RELATED TAB / FUNCTION
+
+Preserve this existing hierarchy.
+
+Do not unnecessarily rename, reorganize, merge or remove existing modules.
+
+Improve the existing features and their connections.
+
+Every existing tab must remain functional after modernization.
+
+Do not change unrelated HR business rules.
+
+## 4. CENTRALIZED MULTI-USER ARCHITECTURE
+
+This is one of the most important requirements.
+
+I want ONE centralized HRIS application and ONE authoritative production database.
+
+Architecture:
+
+```text
+                 COMPANY LAN / WI-FI
+                          |
+          +---------------+---------------+
+          |               |               |
+        HR User 1       HR User 2       HR User 3
+          |               |               |
+          +---------------+---------------+
+                          |
+                          v
+                  CADDY GATEWAY
+                          |
+                          v
+                 CENTRAL HRIS SERVER
+                 Node.js / Express
+                    Port 3000
+                          |
+                          v
+                CENTRAL SQLITE DATABASE
+                E:\SHRM_HRIS\Database.db
+                          |
+                          v
+                 SHARED HRIS DATA
+```
+
+All users must access the same central server.
+
+All authorized data-changing operations must go through the central backend API.
+
+**Never allow individual browser clients to independently write to separate copies of the production database.**
+
+The SQLite database should remain on the central host machine's local disk.
+
+Do not place the active SQLite database on an ordinary shared network folder for simultaneous client access.
+
+Other computers must communicate through the application server, not directly open or manipulate the database file.
+
+## 5. MULTI-USER LIVE DATA SYNCHRONIZATION
+
+When any authorized user creates, edits, approves, updates or changes a record, that change must be saved to the central SQLite database.
+
+After the transaction commits, the central server must notify the relevant connected users.
+
+Example:
+
+```text
+USER 1:
+Updates Employee Department
+        |
+        v
+Backend API
+        |
+        v
+SQLite Transaction
+        |
+        v
+Database Commit
+        |
+        v
+Read-back Verification
+        |
+        v
+Broadcast Change Event
+        |
+        +----------------------+
+        |                      |
+        v                      v
+USER 2 SCREEN             MAIN HR USER SCREEN
+Updates automatically    Updates automatically
+```
+
+Implement a reliable real-time update mechanism using the existing architecture where possible.
+
+Options include:
+
+- WebSocket
+- Server-Sent Events (SSE)
+- Existing reliable real-time transport
+
+Choose the most suitable approach after inspecting the application.
+
+Requirements:
+
+1. Updates from User 1 must be visible to User 2 where permissions allow.
+2. Updates from User 2 must be visible to the main HR/admin user.
+3. Updates must appear without requiring a manual browser refresh.
+4. Relevant dashboards must refresh when dependent data changes.
+5. The current module and tab should remain open.
+6. Avoid sending full employee or payroll datasets when only one record changed.
+7. Notify clients which data changed, then retrieve the latest authorized record.
+8. Reconnect automatically after temporary network interruption.
+9. On reconnection, fetch the latest authoritative data.
+10. Do not claim synchronization succeeded before the central database transaction is committed.
+
+The main user's screen must receive updates regardless of which authorized computer initiated the change.
+
+## 6. CONCURRENT EDITING AND DATA CONFLICT PROTECTION
+
+Multiple users may work on the same records at the same time.
+
+Implement concurrency protection.
+
+Example:
+
+User 1 opens Employee ID 1256.
+
+User 2 also opens Employee ID 1256.
+
+User 1 updates the department and saves.
+
+User 2 attempts to save an older version of the same employee record.
+
+The application must not silently overwrite User 1's latest changes.
+
+Use record versioning, updated timestamps, optimistic concurrency or another suitable mechanism.
+
+Display:
+
+" This record has been updated by another user. Please refresh and review the latest information before saving."
+
+Where practical, show:
+
+- Last updated date/time
+- Updated by
+- Changed fields
+- Conflict status
+
+Use the latest database values as the source of truth.
+
+## 7. CENTRALIZED SQLITE PERSISTENCE
+
+The production database must remain:
+
+`E:\SHRM_HRIS\Database.db`
+
+All normal HRIS data changes must persist to that file.
+
+Examples:
+
+- Employee Directory
+- Employee profiles
+- Employee movement
+- Separation details
+- Salary master
+- Attendance adjustments where approved
+- Roster
+- Overtime
+- Supervisor OT
+- OT remarks
+- Leave
+- Payroll
+- Payroll approvals
+- Statutory reports
+- Contractor records
+- Settings
+- Other existing HR modules
+
+For every normal mutation:
+
+USER ACTION  
+→ CONFIRMATION  
+→ BACKEND REQUEST  
+→ DATABASE TRANSACTION  
+→ COMMIT  
+→ SQLITE PERSISTENCE  
+→ READ-BACK VERIFICATION  
+→ BROADCAST UPDATE  
+→ SUCCESS NOTIFICATION
+
+Do not save only into React state or browser localStorage and report success.
+
+Browser storage may be used for temporary preferences or session information, but not as the authoritative production HR database.
+
+## 8. IMPORTANT ZKTECO AND BIOMETRIC PUNCH OWNERSHIP RULE
+
+Follow the existing approved biometric architecture in the attached read-only punch polling plan.
+
+The external biometric collector owns writes to the raw biometric punch records.
+
+The HRIS must not silently take over ownership of raw punch records.
+
+Maintain this separation:
+
+**External biometric collector:**
+- Receives or retrieves device punches.
+- Writes raw punch data to the physical SQLite database.
+- Preserves original device timestamps.
+
+**HRIS:**
+- Reads fresh biometric punch records.
+- Reconciles them with employees, shifts and rosters.
+- Calculates attendance and OT.
+- Displays live punch information.
+- Does not write, update, delete or purge raw punch records during polling.
+
+The following existing decisions must remain intact unless separately and explicitly approved:
+
+1. External software is the sole writer of raw punch records.
+2. HRIS punch polling is read-only.
+3. Background polling must not generate SQLite writes.
+4. Device polling must not create unnecessary sync-log or metadata writes.
+5. Manual punch changes, additions, deletions and unmapped punch resolutions in the HRIS remain in session memory only.
+6. Non-punch HR records retain normal persistent SQLite write capability.
+
+In particular, do not mistake this punch-protection rule for a restriction on normal HR transactions.
+
+Employee, Payroll, OT approvals, Supervisor OT, Remarks and other authorized HR changes must persist centrally.
+
+If any existing implementation conflicts with this architecture, inspect it and report the exact conflict before changing it.
+
+## 9. ZKTECO NETWORK COMPATIBILITY
+
+Inspect the existing ZKTeco integration.
+
+Identify:
+
+- Exact device model
+- Device IP
+- Network communication method
+- Communication port
+- Pull or push mode
+- Existing biometric collector software
+- Existing database writer
+- Employee/Bio ID mapping
+- Device connection status
+- Last successful synchronization
+
+Do not assume that all ZKTeco models use the same protocol.
+
+Preserve the existing working device configuration.
+
+The central HRIS server must be able to communicate with the ZKTeco device or its existing collector through the company network.
+
+Support the existing connection method, including applicable options such as:
+
+- Device polling over LAN
+- ADMS/Push integration
+- Existing ZKTeco collector software
+- External database writer
+
+Do not change the device's IP, port, firmware, communication mode or attendance configuration without checking the actual hardware and existing setup.
+
+Show an accurate status:
+
+Connected  
+Disconnected  
+Connecting  
+Syncing  
+Last Successful Sync  
+Last Received Punch  
+Connection Error
+
+If disconnected:
+
+- HRIS must remain usable.
+- No infinite loading.
+- No white screen.
+- Reconnect automatically.
+- Recover missing punches safely according to the existing collector design.
+- Prevent duplicate punches.
+
+## 10. LIVE BIOMETRIC PUNCH REFRESH
+
+Implement a reliable read-only refresh mechanism.
+
+The existing plan specifies a periodic read cycle of approximately 15 seconds, with manual refresh available.
+
+Inspect whether this interval is appropriate for the existing system and device workload.
+
+Use fresh disk-backed data rather than relying on a stale long-lived in-memory SQLite snapshot.
+
+Detect actual database file changes and updated punch records.
+
+Do not compare only array length.
+
+Use a suitable lightweight change-detection method.
+
+When new punches are detected:
+
+External Collector Writes  
+→ SQLite File Changes  
+→ HRIS Reads Fresh Snapshot  
+→ Punch State Updates  
+→ Attendance Recalculates  
+→ OT Updates  
+→ Relevant payroll previews refresh
+
+Do not allow a stale in-memory database export to overwrite punches inserted by the external biometric collector.
+
+## 11. CRITICAL SQLITE CONCURRENCY AND DATA PROTECTION
+
+Inspect how the existing application handles SQLite using sql.js or any other installed database engine.
+
+Pay special attention to the risk of an in-memory database exporting a stale database snapshot over a file that has been changed by the external biometric collector.
+
+Before every non-punch HRIS write operation:
+
+- Acquire an appropriate central write lock.
+- Ensure the latest external punch data is preserved.
+- Execute the transaction safely.
+- Commit to the actual production database.
+- Verify the result.
+- Release the lock.
+
+Do not allow two conflicting HRIS write transactions to overwrite each other.
+
+Use a safe single-writer or serialized transaction strategy.
+
+Consider the existing SQLite transaction and journaling mode before changing it.
+
+If a native on-disk SQLite driver would be materially safer or faster, assess the migration carefully.
+
+Do not migrate simply for preference.
+
+Any database migration requires:
+
+- verified backup
+- schema inspection
+- data preservation
+- migration testing
+- rollback plan
+- validation of external collector compatibility
+
+Never drop or reset existing tables.
+
+## 12. CADDY-BASED COMPANY NETWORK DEPLOYMENT
+
+I want authorized users to access the HRIS through Caddy from company computers and company Wi-Fi.
+
+The server should operate on one designated Windows machine.
+
+The application architecture should be:
+
+```text
+Company Computer / Wi-Fi
+          |
+          v
+Internal HRIS Hostname or Static LAN IP
+          |
+          v
+         CADDY
+          |
+          v
+Node.js / Express
+          |
+          v
+SQLite on Server's Local Disk
+```
+
+The server machine should have a stable LAN IP or hostname.
+
+Replace user-facing `localhost:3000` access with the centrally configured LAN address.
+
+Important:
+
+`localhost` on another computer refers to that other computer, not the central HRIS server.
+
+Example placeholders:
+
+`http://HRIS-SERVER-NAME`
+
+or
+
+`https://hris.internal.company`
+
+Inspect the actual company network and existing Caddy configuration before selecting the final address.
+
+Do not invent an IP address or hostname.
+
+Configure Caddy as the reverse proxy to the existing Node.js application.
+
+Example architectural intention:
+
+Caddy receives authorized LAN requests and forwards them to the local application server on port 3000.
+
+Do not expose the Node.js development port unnecessarily to all client machines.
+
+Allow Caddy to handle the required HTTP/HTTPS and WebSocket/SSE traffic.
+
+Check Windows Firewall rules.
+
+Only allow the network traffic actually required.
+
+Do not expose the HRIS or database directly to the public internet.
+
+## 13. INTERNAL SECURITY
+
+Company-network access does not mean every user should have unrestricted access.
+
+Inspect the existing authentication and role architecture.
+
+Implement or strengthen:
+
+- User authentication
+- Session management
+- Role-based access control
+- Module-level permissions
+- Read permissions
+- Edit permissions
+- Approval permissions
+- Delete permissions
+- Administrative permissions
+
+All API permissions must be checked server-side.
+
+Do not rely only on hiding buttons in React.
+
+Use secure password storage and appropriate session protection.
+
+Use HTTPS where the company network configuration supports it.
+
+Use Caddy internal TLS or an appropriate company-managed certificate when suitable, ensuring client computers trust the certificate.
+
+Restrict sensitive employee, salary, bank and payroll information to authorized roles.
+
+Do not log passwords, tokens, bank account numbers or unnecessary personal information.
+
+## 14. PROFESSIONAL MODERN UI/UX
+
+Refine the complete existing HRIS interface into a professional enterprise-grade HR application.
+
+Maintain the existing functional hierarchy.
+
+Improve:
+
+- Navigation
+- Sidebar behavior
+- Page transitions
+- Tables
+- Forms
+- Filters
+- Search
+- Dropdowns
+- Date selectors
+- Dialogs
+- Notifications
+- Dashboard cards
+- Responsive layouts
+- Status indicators
+
+Design objectives:
+
+- Clean enterprise interface.
+- Consistent spacing.
+- Clear typography.
+- Proper visual hierarchy.
+- Professional light/dark mode.
+- Consistent colors and status meanings.
+- Easy-to-read tables.
+- Proper alignment and responsive behavior.
+- Less visual clutter.
+- Keyboard accessibility.
+- Clear focus indicators.
+
+Avoid unnecessarily decorative animations, excessive gradients, oversized cards, confusing icons and multiple overlapping dialogs.
+
+The UI must be suitable for daily HR operations in a manufacturing plant.
+
+## 15. SMOOTH CLICK AND RESPONSE BEHAVIOR
+
+Every button must respond reliably.
+
+Fix:
+
+- Buttons that require multiple clicks.
+- Buttons that do not respond.
+- Unnecessary loading delays.
+- Double submissions.
+- Dead click handlers.
+- Stale modal states.
+- Dropdowns that do not open correctly.
+- Forms that freeze.
+- Search input lag.
+- Filters that respond slowly.
+- Broken keyboard interactions.
+- Repeated API calls.
+
+Use appropriate loading states and disable only the action that is currently processing.
+
+Use short, meaningful interface transitions.
+
+Do not add arbitrary waiting periods.
+
+The application should feel responsive even when it is processing larger datasets.
+
+## 16. APPLICATION PERFORMANCE OPTIMIZATION
+
+Profile the actual performance before optimizing.
+
+Inspect:
+
+- Large React components
+- Unnecessary re-renders
+- Duplicate useEffect execution
+- Repeated database reads
+- Excessive API requests
+- Entire-table loading
+- Expensive calculations in the browser
+- Large Excel imports
+- Unbounded history queries
+- Memory leaks
+- Stale subscriptions
+- Duplicate polling loops
+- Inefficient SQL joins
+- Missing indexes
+- Unnecessary database serialization
+
+Use appropriate improvements:
+
+- Server-side pagination.
+- Server-side search and filtering.
+- SQL indexes based on actual query patterns.
+- Debounced search.
+- Lazy loading of modules.
+- Virtualized large tables where appropriate.
+- Cached read-only data with correct invalidation.
+- Efficient API payloads.
+- Reusable components.
+- Controlled background refresh.
+- Efficient calculation services.
+
+Do not load thousands of employees, punches or payroll records into React when only one filtered page is needed.
+
+Do not sacrifice data accuracy for speed.
+
+## 17. REAL-TIME CLIENT UPDATE MANAGEMENT
+
+Use a central event mechanism to notify connected browser sessions after successful database commits.
+
+Events may include:
+
+- EmployeeUpdated
+- EmployeeCreated
+- EmployeeDeactivated
+- MovementUpdated
+- SeparationRecorded
+- RosterUpdated
+- AttendanceUpdated
+- OvertimeUpdated
+- SupervisorOTUpdated
+- PayrollUpdated
+- LeaveUpdated
+- ContractorUpdated
+- SettingsUpdated
+
+Use only events relevant to the existing modules.
+
+The client must:
+
+1. Receive the event.
+2. Check whether the currently displayed screen depends on that data.
+3. Retrieve the updated authorized record or refresh the relevant query.
+4. Update the interface.
+5. Preserve unrelated unsaved edits.
+6. Display a small notification where useful.
+
+Do not unnecessarily reload the entire application.
+
+If a client misses events while disconnected, it must reconcile its state with the central database after reconnection.
+
+## 18. OPERATION LIFECYCLE
+
+Apply the existing universal operation-management architecture to all mutations.
+
+The required lifecycle is:
+
+IDLE  
+→ CONFIRMATION  
+→ PROCESSING  
+→ VERIFYING  
+→ SUCCESS / FAILED / CANCELLED
+
+For every data-changing operation:
+
+- Confirm before destructive or important actions.
+- Prevent duplicate clicks.
+- Use an operation ID where appropriate.
+- Show meaningful progress.
+- Persist through the central database.
+- Verify the stored result.
+- Broadcast the committed change.
+- Close the processing modal automatically.
+- Keep the current module and tab open.
+- Refresh affected data.
+- Show success or an actionable error.
+
+No operation may remain stuck indefinitely.
+
+Do not close the browser tab or unnecessarily navigate the user away.
+
+## 19. MULTI-USER AUDIT TRAIL
+
+Record legitimate user-initiated changes using the existing audit architecture.
+
+Where supported, record:
+
+- Operation ID
+- User ID
+- User name
+- Module
+- Sub-module
+- Record ID
+- Action
+- Previous value
+- New value
+- Timestamp
+- Result
+- Source workstation/session
+
+Keep audit records in the central SQLite database.
+
+Do not create audit writes from read-only punch polling.
+
+The main HR administrator should be able to identify who updated which important HR record and when, subject to permissions.
+
+## 20. NETWORK INTERRUPTION AND RECOVERY
+
+If company Wi-Fi or LAN disconnects:
+
+Show:
+
+"Connection to the central HRIS server has been interrupted."
+
+Do not report a successful save if the server has not confirmed the transaction.
+
+Show connection status:
+
+Connected  
+Reconnecting  
+Disconnected
+
+When the network returns:
+
+- Reconnect automatically.
+- Reauthenticate if necessary.
+- Fetch latest server data.
+- Resolve stale data conflicts.
+- Restore real-time event subscriptions.
+- Keep the user informed.
+
+Do not blindly replay destructive or financial mutations.
+
+Use idempotency keys and check the actual database state before retrying an uncertain operation.
+
+## 21. BACKUP AND RECOVERY
+
+The central SQLite database is business-critical.
+
+Implement a reliable backup and restore strategy.
+
+Preserve:
+
+`E:\SHRM_HRIS\Database.db`
+
+Use a transactionally consistent backup method appropriate to the actual SQLite implementation.
+
+Account for external biometric writes.
+
+Do not copy an actively changing database file using an unsafe process.
+
+Keep dated backup files.
+
+Verify backups can be opened and restored.
+
+Provide an understandable backup status inside the existing system.
+
+A failed required backup must stop the associated destructive action.
+
+## 22. NO WHITE SCREEN / ERROR RECOVERY
+
+The application must never become a completely blank white screen because one component fails.
+
+Strengthen:
+
+- Global Error Boundary
+- Module-level error handling
+- Component-level loading states
+- Empty states
+- API error states
+- Database error states
+- Retry functions
+- Network connection indicators
+
+A failure in Payroll must not make Employee Directory unusable.
+
+A failure in ZKT synchronization must not crash the HRIS.
+
+Log technical details securely while displaying understandable user messages.
+
+## 23. DAILY STARTUP AND SERVICE RELIABILITY
+
+Inspect and refine the existing Windows startup process.
+
+The intended arrangement is:
+
+1. Start the central HRIS Node.js service.
+2. Confirm the production SQLite path.
+3. Confirm the application is healthy.
+4. Start or verify Caddy.
+5. Confirm the reverse proxy is reachable.
+6. Confirm the ZKT integration/collector connectivity.
+7. Allow authorized company computers to connect.
+
+Do not run multiple competing server instances.
+
+Do not silently create an empty database if the production database is missing.
+
+Do not run `npm install` every time users start the application.
+
+Provide reliable startup and recovery scripts only after inspecting the existing scripts and services.
+
+## 24. SYSTEM HEALTH DASHBOARD
+
+Add or improve an appropriate administration/system-status screen within the current hierarchy.
+
+Show:
+
+- Application status
+- Node.js server status
+- Caddy status
+- Database connection status
+- Actual active SQLite path
+- Database accessibility
+- Last successful database verification
+- ZKT device connection
+- Last punch polling time
+- External punch record count
+- Connected user count
+- Active application version
+- Latest backup status
+- Recent system errors
+
+Do not expose sensitive technical configuration to unauthorized users.
+
+All displayed health information must be based on actual checks, not hard-coded green indicators.
+
+## 25. DATA INTEGRITY ACROSS HR MODULES
+
+Preserve the existing Employee Directory as the central employee master.
+
+Maintain the numeric Bio ID as the actual Employee ID.
+
+Examples:
+
+Bio ID 2 = Employee ID 2  
+Bio ID 1256 = Employee ID 1256
+
+Do not introduce artificial employee identifiers.
+
+Maintain the existing data relationships across:
+
+- Employee Directory
+- Attendance
+- Shift and Roster
+- Reconciliation
+- OT
+- Supervisor OT
+- Leave
+- Payroll
+- Movement & Attrition
+- Documents
+- Contractor Management
+- Salary Analysis
+- Statutory Reports
+
+Any normal authorized record change must persist and update relevant dependent screens.
+
+Historical records must remain historically accurate.
+
+## 26. AUTOMATED FUNCTIONAL TESTING
+
+Test the actual centralized environment.
+
+Minimum tests:
+
+**Test 1 — Central Access**
+
+Open the HRIS from the server machine and from another company computer using the Caddy address.
+
+Both must access the same central system.
+
+**Test 2 — Multi-User Employee Update**
+
+User 1 updates an employee's department.
+
+User 2 and the main HR user must see the updated record without a full browser refresh.
+
+Verify SQLite persistence.
+
+**Test 3 — Multi-User OT Update**
+
+User 1 updates Supervisor OT and Remarks.
+
+User 2 opens the OT Tab and sees the latest values.
+
+Verify the final OT calculation follows existing rules.
+
+**Test 4 — Simultaneous Editing**
+
+Two users edit the same employee.
+
+Verify stale updates do not silently overwrite newer data.
+
+**Test 5 — Payroll**
+
+Calculate and update payroll.
+
+Verify consistent results, database persistence and synchronized visibility according to permissions.
+
+**Test 6 — ZKT New Punch**
+
+External biometric collector inserts a punch.
+
+HRIS must read the fresh record and update attendance without writing to raw punch tables.
+
+**Test 7 — ZKT Disconnection**
+
+Disconnect the device or collector.
+
+HRIS must remain usable and reconnect safely.
+
+**Test 8 — Network Interruption**
+
+Disconnect one client during an update.
+
+Reconnect and verify the latest authoritative database state is shown.
+
+**Test 9 — Concurrent Database Writes**
+
+Run simultaneous authorized operations from different clients.
+
+Verify no data is lost or overwritten.
+
+**Test 10 — Caddy Restart**
+
+Restart Caddy and verify access recovers.
+
+**Test 11 — Node.js Restart**
+
+Restart the application server.
+
+Verify SQLite records remain intact and clients reconnect.
+
+**Test 12 — Browser Refresh**
+
+Refresh all connected clients.
+
+Verify they retrieve the same authoritative data.
+
+**Test 13 — Backup Restore**
+
+Create a backup, verify it and test a safe restore procedure against a test copy.
+
+**Test 14 — Responsive UI**
+
+Test large tables, filters, forms, dialogs and module navigation.
+
+**Test 15 — No White Screen**
+
+Simulate recoverable API, component and device errors.
+
+Verify proper recovery states.
+
+## 27. PERFORMANCE ACCEPTANCE CRITERIA
+
+After modernization, verify:
+
+- Normal buttons respond promptly.
+- No unnecessary multiple clicks are required.
+- No duplicate mutations occur.
+- Search and filters remain responsive.
+- Large tables do not freeze the browser.
+- Data refresh does not reload the whole application.
+- Client synchronization does not create continuous unnecessary database writes.
+- No stale employee or payroll values remain after successful updates.
+- No infinite processing dialogs occur.
+- No uncontrolled polling loops occur.
+- No conflicting SQLite writes occur.
+- ZKT disconnection does not block normal HR operations.
+
+Measure actual response times before and after changes rather than declaring the software "fast" without evidence.
+
+## 28. STRICT PRODUCTION SAFETY
+
+Never:
+
+- Reset the existing database.
+- Delete historical employee information.
+- Replace the existing production database with a newly created empty file.
+- Create a competing production database inside the source directory.
+- Allow individual clients to edit the production SQLite file directly.
+- Let stale sql.js exports overwrite externally inserted biometric punches.
+- Change the approved read-only biometric ownership arrangement silently.
+- Disable authentication for LAN convenience.
+- Expose the database to the public internet.
+- Claim success before database verification.
+- Apply unrelated payroll or attendance rule changes.
+
+All production modifications must have a rollback plan.
+
+## 29. IMPLEMENTATION PRIORITY
+
+Work in these stages:
+
+**Phase 1 — Inspection and Risk Assessment**
+Understand the complete application, database, Caddy configuration, network, ZKT and current user workflows.
+
+**Phase 2 — Critical Architecture and Data Safety**
+Protect SQLite, resolve stale database issues, ensure centralized writes and concurrency control.
+
+**Phase 3 — Multi-User Synchronization**
+Implement committed change broadcasting, client refresh, conflict protection and reconnect handling.
+
+**Phase 4 — ZKT Integration**
+Verify real device/collector communication and reliable read-only punch ingestion.
+
+**Phase 5 — Performance and UI/UX**
+Optimize the existing interface, queries, rendering, navigation and responsiveness.
+
+**Phase 6 — Network Deployment**
+Configure Caddy, LAN hostname/IP, HTTPS where appropriate, Windows Firewall and startup reliability.
+
+**Phase 7 — Testing and Production Validation**
+Test multi-user operations, real database persistence, ZKT data, network recovery and regression.
+
+Do not start broad refactoring before completing the inspection.
+
+## 30. FINAL COMPLETION REPORT
+
+Provide an honest technical report with:
+
+1. Existing architecture discovered.
+2. Actual production database path.
+3. Existing SQLite engine and data-protection method.
+4. Caddy configuration reviewed.
+5. LAN access configuration.
+6. ZKT device and collector compatibility findings.
+7. Multi-user synchronization implementation.
+8. SQLite persistence and concurrency improvements.
+9. Performance changes.
+10. UI/UX changes.
+11. Security and permission changes.
+12. Startup and service changes.
+13. Files modified.
+14. Database schema changes, if any.
+15. Tests actually executed.
+16. Multi-user test results.
+17. ZKT test results.
+18. Network access test results.
+19. Measured performance improvements.
+20. Remaining issues and deployment limitations.
+
+Do not state that the system is production-ready merely because the code compiles.
+
+The actual application must be tested from multiple company computers through Caddy, using the real central SQLite database and the actual biometric integration wherever the hardware is available.
+
+# FINAL OBJECTIVE
+
+I want one professional, centralized HRIS that:
+
+- Runs on one designated company server.
+- Is accessible through Caddy over company LAN and Wi-Fi.
+- Uses one authoritative SQLite database.
+- Supports multiple authorized users simultaneously.
+- Reflects successful updates from any user on the main HR user's screen.
+- Persists normal HR transactions in SQLite.
+- Protects raw biometric punches using the approved external-writer/read-only-HRIS architecture.
+- Connects reliably with the actual ZKTeco device/collector.
+- Has smooth navigation and responsive buttons.
+- Does not freeze or display a white screen.
+- Protects against simultaneous edits and data loss.
+- Recovers from network/device interruption.
+- Preserves all existing employee and HR records.
+- Maintains the current HRIS Module → Sub-Module → Tab hierarchy.
+
+The goal is not to create a new HRIS. The goal is to transform my existing HRIS into a stable, professional, secure, centralized and genuinely multi-user company HR management system.

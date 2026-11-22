@@ -2,12 +2,14 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '../store';
 import { Save, Plus, Trash2, AlertTriangle, Database, Download, CheckCircle2, XCircle, X, Info, Settings, Clock, Building2, Calendar, ShieldAlert, History, Loader2, Activity, FileCheck, Server, HardDrive } from 'lucide-react';
 import { format } from 'date-fns';
-import { ShiftMaster } from '../types';
+import { ShiftMaster, HolidayPunchPolicy } from '../types';
 import { generateId, cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { PageHeader, Card, Button, Input, Badge } from '../components/ui';
 import { toast } from 'sonner';
 import { useActionStatus } from '../context/ActionStatusContext';
+import { authFetch } from '../lib/authSession';
+import { fetchSystemHealth, verifyBackupFile, testRestoreBackup } from '../lib/localClient';
 
 export function SettingsPage() {
   const { settings, setSettings, employees, setEmployees, punches, setPunches, shiftAssignments, setShiftAssignments, clearAllData, quotaExceeded } = useAppStore();
@@ -22,13 +24,24 @@ export function SettingsPage() {
   const [diagData, setDiagData] = useState<any>(null);
   const [isRunningDiag, setIsRunningDiag] = useState(false);
   const [showDiagModal, setShowDiagModal] = useState(false);
+  const [systemHealth, setSystemHealth] = useState<any>(null);
+  const [isTestingBackup, setIsTestingBackup] = useState(false);
   const [newHolidayDate, setNewHolidayDate] = useState('');
   const [newHolidayName, setNewHolidayName] = useState('');
+  const [newHolidayPreventPunches, setNewHolidayPreventPunches] = useState(false);
+
+  useEffect(() => {
+    fetchSystemHealth().then(h => { if (h) setSystemHealth(h); }).catch(() => {});
+    const timer = setInterval(() => {
+      fetchSystemHealth().then(h => { if (h) setSystemHealth(h); }).catch(() => {});
+    }, 20000);
+    return () => clearInterval(timer);
+  }, []);
 
   const handleRunDiagnostics = async () => {
     setIsRunningDiag(true);
     try {
-      const res = await fetch('/api/local/diagnostics').then(r => r.json());
+      const res = await authFetch('/api/local/diagnostics').then(r => r.json());
       setDiagData(res);
       setShowDiagModal(true);
       toast.success('Local backend diagnostic complete!');
@@ -297,7 +310,14 @@ export function SettingsPage() {
     const existing = localSettings.holidays || [];
     const nextHolidays = [
       ...existing.filter(h => h.date !== cleanDate),
-      { date: cleanDate, name: cleanName }
+      {
+        id: `hol_${cleanDate.replace(/-/g, '')}`,
+        date: cleanDate,
+        name: cleanName,
+        type: 'National' as const,
+        preventPunches: newHolidayPreventPunches,
+        allowWorkedPph: true
+      }
     ].sort((a, b) => a.date.localeCompare(b.date));
 
     const updatedSettings = {
@@ -308,7 +328,39 @@ export function SettingsPage() {
     await setSettings(updatedSettings);
     setNewHolidayDate('');
     setNewHolidayName('');
-    toast.success(`Public Holiday "${cleanName}" (${cleanDate}) saved and reflected in Attendance.`);
+    setNewHolidayPreventPunches(false);
+    toast.success(`Public Holiday "${cleanName}" (${cleanDate}) synced to SQLite holidays master.`);
+  };
+
+  const handleToggleHolidayLock = async (dateToToggle: string) => {
+    if (quotaExceeded) {
+      toast.error('Database write limit reached.');
+      return;
+    }
+    const nextHolidays = (localSettings.holidays || []).map(h =>
+      h.date === dateToToggle ? { ...h, preventPunches: !h.preventPunches } : h
+    );
+    const updatedSettings = {
+      ...localSettings,
+      holidays: nextHolidays
+    };
+    setLocalSettings(updatedSettings);
+    await setSettings(updatedSettings);
+    toast.success(`Updated punch lock rule for holiday ${dateToToggle}.`);
+  };
+
+  const handleHolidayPolicyChange = async (policy: HolidayPunchPolicy) => {
+    if (quotaExceeded) {
+      toast.error('Database write limit reached.');
+      return;
+    }
+    const updatedSettings = {
+      ...localSettings,
+      holidayPunchPolicy: policy
+    };
+    setLocalSettings(updatedSettings);
+    await setSettings(updatedSettings);
+    toast.success('Holiday validation & overlap prevention policy saved.');
   };
 
   const handleRemoveHoliday = async (dateToRemove: string) => {
@@ -323,7 +375,7 @@ export function SettingsPage() {
     };
     setLocalSettings(updatedSettings);
     await setSettings(updatedSettings);
-    toast.success(`Removed Public Holiday on ${dateToRemove}. Attendance updated.`);
+    toast.success(`Removed Public Holiday on ${dateToRemove} from SQLite holidays master.`);
   };
 
   const shiftWarnings = useMemo(() => {
@@ -590,40 +642,70 @@ export function SettingsPage() {
           </Card>
 
           <Card className="p-0 overflow-hidden">
-             <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+             <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
                <div className="flex items-center gap-2">
                  <Calendar size={16} className="text-sky-500" />
                  <div>
-                   <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest">Public Holidays Calendar</h3>
-                   <p className="text-[10px] text-slate-500">Holidays automatically reflect across Attendance Logs, Monthly Muster, Overtime, and Payroll</p>
+                   <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest">Public Holidays Master & Validation Policy</h3>
+                   <p className="text-[10px] text-slate-500">Synchronized with SQLite holidays table · auto-marks Public Holiday & prevents punch overlaps</p>
                  </div>
                </div>
                <span className="text-[11px] font-semibold text-slate-500 tabular-nums">{sortedHolidays.length} configured</span>
              </div>
-             <div className="p-6 space-y-4">
+             <div className="p-6 space-y-5">
+               <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center pb-4 border-b border-slate-100 dark:border-slate-800">
+                 <div className="sm:col-span-5">
+                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block">Holiday Punch Overlap Policy</label>
+                   <p className="text-[11px] text-slate-500 mt-0.5">Controls biometric ingestion, manual imports & attendance overrides on holidays</p>
+                 </div>
+                 <div className="sm:col-span-7">
+                   <select
+                     value={localSettings.holidayPunchPolicy || 'prevent_overlaps'}
+                     onChange={e => handleHolidayPolicyChange(e.target.value as HolidayPunchPolicy)}
+                     disabled={quotaExceeded}
+                     className="w-full h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs font-semibold text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500/30"
+                   >
+                     <option value="prevent_overlaps">Prevent Punch Overlaps & Cross-Source Collisions (Auto-Mark PH / Worked PPH)</option>
+                     <option value="block_all">Strict Lock — Block All Punches on Holidays (Always Auto-Mark Public Holiday)</option>
+                     <option value="allow_worked_pph">Allow Worked Holiday Duty (Auto-Mark PH / PPH, Duplicate Bounces Blocked)</option>
+                   </select>
+                 </div>
+               </div>
+
                <form onSubmit={handleAddHoliday} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
-                 <div className="sm:col-span-4 space-y-1.5">
+                 <div className="sm:col-span-3 space-y-1.5">
                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Holiday Date</label>
                    <Input
                      type="date"
                      value={newHolidayDate}
                      onChange={e => setNewHolidayDate(e.target.value)}
-                     className="text-[12px]"
+                     className="text-[12px] tabular-nums"
                      required
                    />
                  </div>
-                 <div className="sm:col-span-5 space-y-1.5">
+                 <div className="sm:col-span-4 space-y-1.5">
                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Holiday Name</label>
                    <Input
                      type="text"
                      value={newHolidayName}
                      onChange={e => setNewHolidayName(e.target.value)}
-                     placeholder="e.g., Dashain / May Day / Republic Day"
+                     placeholder="e.g., Dashain / May Day"
                      required
                    />
                  </div>
+                 <div className="sm:col-span-2 flex items-center h-9">
+                   <label className="flex items-center gap-2 cursor-pointer text-xs font-medium text-slate-600 dark:text-slate-300 select-none">
+                     <input
+                       type="checkbox"
+                       checked={newHolidayPreventPunches}
+                       onChange={e => setNewHolidayPreventPunches(e.target.checked)}
+                       className="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                     />
+                     Strict Lock
+                   </label>
+                 </div>
                  <div className="sm:col-span-3">
-                   <Button type="submit" className="w-full gap-1.5" disabled={quotaExceeded}>
+                   <Button type="submit" className="w-full gap-1.5 whitespace-nowrap" disabled={quotaExceeded}>
                      <Plus size={14} /> Add Holiday
                    </Button>
                  </div>
@@ -637,6 +719,7 @@ export function SettingsPage() {
                          <th className="px-4 py-2.5">Date</th>
                          <th className="px-4 py-2.5">Day</th>
                          <th className="px-4 py-2.5">Holiday Name</th>
+                         <th className="px-4 py-2.5">Punch Lock</th>
                          <th className="px-4 py-2.5 text-right">Action</th>
                        </tr>
                      </thead>
@@ -646,11 +729,26 @@ export function SettingsPage() {
                          try {
                            dayLabel = format(new Date(`${h.date}T00:00:00`), 'EEE');
                          } catch {}
+                         const isLocked = Boolean(h.preventPunches || localSettings.holidayPunchPolicy === 'block_all');
                          return (
                            <tr key={h.date} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
                              <td className="px-4 py-2.5 font-mono font-semibold text-slate-900 dark:text-white tabular-nums">{h.date}</td>
                              <td className="px-4 py-2.5 text-slate-500">{dayLabel}</td>
                              <td className="px-4 py-2.5 font-medium text-slate-800 dark:text-slate-200">{h.name}</td>
+                             <td className="px-4 py-2.5">
+                               <label className="inline-flex items-center gap-2 cursor-pointer text-[11px] font-medium text-slate-600 dark:text-slate-300">
+                                 <input
+                                   type="checkbox"
+                                   checked={isLocked}
+                                   disabled={quotaExceeded || localSettings.holidayPunchPolicy === 'block_all'}
+                                   onChange={() => handleToggleHolidayLock(h.date)}
+                                   className="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                 />
+                                 <span className={isLocked ? 'text-rose-600 dark:text-rose-400 font-semibold' : 'text-slate-500'}>
+                                   {isLocked ? 'Strict Block' : 'Overlap Guard'}
+                                 </span>
+                               </label>
+                             </td>
                              <td className="px-4 py-2.5 text-right">
                                <Button
                                  type="button"
@@ -729,22 +827,70 @@ export function SettingsPage() {
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest flex items-center gap-2">
                   <Activity size={14} className="text-primary" />
-                  System Health & Diagnostics
+                  System Health Monitor (14 Metrics)
                 </h3>
-                <Badge variant="success" className="text-[8px] h-4">Active</Badge>
+                <Badge variant={systemHealth?.databaseAccessible ? "success" : "danger"} className="text-[8px] h-4">
+                  {systemHealth?.databaseAccessible ? 'Healthy' : 'Degraded'}
+                </Badge>
               </div>
-              <div className="space-y-3 mb-4">
-                 <div className="flex justify-between items-center text-[10px]">
-                   <span className="text-slate-400 font-bold uppercase">System Version</span>
-                   <span className="text-slate-900 dark:text-white font-mono">v1.4.2-enterprise</span>
+              <div className="space-y-2 mb-4 text-[10px] font-mono">
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">App Status</span>
+                   <span className="font-bold text-emerald-600">{systemHealth?.appStatus || 'Active'}</span>
                  </div>
-                 <div className="flex justify-between items-center text-[10px]">
-                   <span className="text-slate-400 font-bold uppercase">Database Engine</span>
-                   <span className="text-indigo-600 dark:text-indigo-400 font-mono font-bold">SQLite (Local DB)</span>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Node.js Server</span>
+                   <span className="font-bold text-slate-900 dark:text-white">{systemHealth?.nodeStatus || 'Running'}</span>
                  </div>
-                 <div className="flex justify-between items-center text-[10px]">
-                   <span className="text-slate-400 font-bold uppercase">Storage Path</span>
-                   <span className="text-slate-700 dark:text-slate-300 font-mono font-bold">E:\SHRM_HRIS\</span>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Caddy Proxy</span>
+                   <span className="font-bold text-slate-900 dark:text-white">{systemHealth?.caddyStatus || 'Active (:844)'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Database Engine</span>
+                   <span className="font-bold text-indigo-600 dark:text-indigo-400">{systemHealth?.databaseStatus || 'SQLite'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Active SQLite Path</span>
+                   <span className="font-bold text-slate-700 dark:text-slate-300 truncate max-w-[180px]" title={systemHealth?.activeSqlitePath}>{systemHealth?.activeSqlitePath || 'Database.db'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">DB Accessible</span>
+                   <span className={cn("font-bold", systemHealth?.databaseAccessible ? "text-emerald-600" : "text-rose-600")}>
+                     {systemHealth?.databaseAccessible ? 'YES (PRAGMA ok)' : 'NO'}
+                   </span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Last DB Verification</span>
+                   <span className="font-bold text-slate-700 dark:text-slate-300">{systemHealth?.lastSuccessfulDbVerification ? new Date(systemHealth.lastSuccessfulDbVerification).toLocaleTimeString() : 'Verified on startup'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">ZKT Terminal State</span>
+                   <span className="font-bold text-slate-900 dark:text-white">{systemHealth?.zkDeviceConnection || 'Connected'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Last Punch Polling</span>
+                   <span className="font-bold text-slate-700 dark:text-slate-300">{systemHealth?.lastPunchPollingTime ? new Date(systemHealth.lastPunchPollingTime).toLocaleTimeString() : 'Active (15s read-only)'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">External Punch Count</span>
+                   <span className="font-bold text-indigo-600 dark:text-indigo-400 tabular-nums">{(systemHealth?.externalPunchRecordCount ?? punches.length).toLocaleString()}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Connected Users</span>
+                   <span className="font-bold text-emerald-600 tabular-nums">{systemHealth?.connectedUserCount ?? 1}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">App Version</span>
+                   <span className="font-bold text-slate-900 dark:text-white">{systemHealth?.activeAppVersion || 'v1.4.2-enterprise'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Latest Backup Status</span>
+                   <span className="font-bold text-emerald-600">{systemHealth?.latestBackupStatus || 'Secured'}</span>
+                 </div>
+                 <div className="flex justify-between items-center">
+                   <span className="text-slate-400 uppercase">Punch Mode</span>
+                   <span className="font-bold text-amber-600">{systemHealth?.punchMode || 'READ_ONLY'}</span>
                  </div>
               </div>
 
@@ -775,7 +921,7 @@ export function SettingsPage() {
               <div className="space-y-2">
                 <Button 
                   onClick={async () => {
-                    const res = await fetch('/api/local/backup', { method: 'POST' }).then(r => r.json());
+                    const res = await authFetch('/api/local/backup', { method: 'POST' }).then(r => r.json());
                     toast.success(res.message || 'Local backup saved to E:\\SHRM_HRIS\\backups\\');
                   }}
                   variant="outline"

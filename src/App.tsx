@@ -3,10 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useState } from 'react';
+import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { onAuthStateChanged, User } from 'firebase/auth';
-import { auth } from './lib/firebase';
 import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { Employees } from './pages/Employees';
@@ -23,147 +21,29 @@ import { DeviceSetup } from './pages/DeviceSetup';
 import { SettingsPage } from './pages/Settings';
 import { SalaryAnalysisPage } from './pages/SalaryAnalysisPage';
 import { MovementAttritionPage } from './pages/MovementAttritionPage';
-import { AdminDashboard } from './pages/Admin';
 import { UserAccess } from './pages/UserAccess';
 import { Login } from './pages/Login';
-import { SignUp } from './pages/SignUp';
 import { StoreProvider, useAppStore } from './store';
 import { ActionStatusProvider } from './context/ActionStatusContext';
 import { GlobalActionModal } from './components/GlobalActionModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { AlertCircle, X } from 'lucide-react';
+import { getInMemorySessionToken } from './lib/authSession';
 import { Toaster } from 'sonner';
 
-const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
-
-function QuotaBanner() {
-  const { quotaExceeded, lastError, resetError } = useAppStore();
-  
-  if (!quotaExceeded) return null;
-  
-  return (
-    <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] max-w-lg w-full px-4 animate-in slide-in-from-bottom-4">
-      <div className="bg-white p-5 rounded-2xl shadow-2xl flex gap-4 items-start border-2 border-red-100 ring-4 ring-red-50">
-        <div className="p-3 bg-red-50 rounded-xl">
-          <AlertCircle className="w-6 h-6 text-red-600" />
-        </div>
-        <div className="flex-1">
-          <p className="text-base font-bold text-slate-900 leading-none">Database Quota Exceeded</p>
-          <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-            The system has reached the daily limit for free database writes. Import, deletion, and settings updates are paused until reset (approx. midnight). 
-            <br/><span className="text-red-600 font-semibold mt-1 inline-block">App will remain in read-only mode.</span>
-          </p>
-        </div>
-        <button onClick={resetError} className="p-2 hover:bg-slate-100 rounded-xl transition-colors text-slate-400">
-          <X className="w-5 h-5" />
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function AppContent() {
-  const { quotaExceeded, user, setUser, setIsAdmin, isOtpVerified, setIsOtpVerified, isSuperAdmin, canAccessModule } = useAppStore();
-  const [loading, setLoading] = useState(true);
+  const { user, isSuperAdmin, canAccessModule } = useAppStore();
 
-  useEffect(() => {
-    const savedLocalUser = sessionStorage.getItem('local_session_user');
-    if (savedLocalUser) {
-      try {
-        const parsed = JSON.parse(savedLocalUser);
-        if (parsed && parsed.email) {
-          setUser(parsed);
-          setIsAdmin(
-            parsed?.role === 'Super Admin' ||
-            ADMIN_EMAILS.some(email => parsed.email?.toLowerCase() === email.toLowerCase())
-          );
-          if (sessionStorage.getItem('is_otp_verified') === 'true') {
-            setIsOtpVerified(true);
-          }
-          setLoading(false);
-        }
-      } catch {
-        // ignore invalid saved session
-      }
-    }
-
-    return onAuthStateChanged(auth, async (u) => {
-      const currentSaved = sessionStorage.getItem('local_session_user');
-      if (currentSaved) {
-        try {
-          const parsed = JSON.parse(currentSaved);
-          if (parsed && parsed.email) {
-            setUser(parsed);
-            setIsAdmin(
-              parsed?.role === 'Super Admin' ||
-              ADMIN_EMAILS.some(email => parsed.email?.toLowerCase() === email.toLowerCase())
-            );
-            setLoading(false);
-            return;
-          }
-        } catch {
-          sessionStorage.removeItem('local_session_user');
-        }
-      }
-
-      if (u) {
-        setUser(u);
-        const isAdminUser = ADMIN_EMAILS.some(email => u.email?.toLowerCase() === email.toLowerCase());
-        setIsAdmin(isAdminUser);
-        if (isAdminUser && sessionStorage.getItem('is_otp_verified') !== 'false') {
-          setIsOtpVerified(true);
-        }
-
-        const sessionKey = `admin_synced_${u.uid}`;
-        const alreadySynced = sessionStorage.getItem(sessionKey);
-
-        if (!quotaExceeded && isAdminUser && !alreadySynced) {
-          setTimeout(async () => {
-            try {
-              await fetch('/api/admin/create-user', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  uid: u.uid,
-                  email: u.email || 'admin@local',
-                  name: u.displayName || u.email || 'Admin',
-                  role: 'Super Admin'
-                })
-              });
-            } catch (e: any) {
-              console.warn("Admin role SQLite sync note:", e);
-            } finally {
-              sessionStorage.setItem(sessionKey, 'true');
-            }
-          }, 1000);
-        }
-      } else {
-        setUser(null);
-      }
-      setLoading(false);
-    });
-  }, [quotaExceeded, setUser, setIsAdmin, setIsOtpVerified]);
-
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center">
-        <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-      </div>
-    );
-  }
-
-  const isAuthenticated = Boolean(user && isOtpVerified);
+  const isAuthenticated = Boolean(user && getInMemorySessionToken());
   const guard = (moduleKey: Parameters<typeof canAccessModule>[0], element: React.ReactElement) =>
     canAccessModule(moduleKey) ? element : <Navigate to="/" replace />;
 
   return (
     <BrowserRouter>
       <Toaster position="top-right" richColors />
-      {isAuthenticated && <QuotaBanner />}
       {isAuthenticated && <GlobalActionModal />}
       <Routes>
         <Route path="/login" element={isAuthenticated ? <Navigate to="/" replace /> : <Login />} />
-        <Route path="/signup" element={isAuthenticated ? <Navigate to="/" replace /> : <SignUp />} />
+        <Route path="/signup" element={<Navigate to="/login" replace />} />
         {!isAuthenticated ? (
           <Route path="*" element={<Navigate to="/login" replace />} />
         ) : (
@@ -184,7 +64,7 @@ function AppContent() {
             <Route path="reports" element={guard('reports', <ErrorBoundary moduleName="Analytic Reports"><Reports /></ErrorBoundary>)} />
             <Route path="settings" element={guard('settings', <ErrorBoundary moduleName="Configuration"><SettingsPage /></ErrorBoundary>)} />
             {isSuperAdmin && <Route path="user-access" element={<ErrorBoundary moduleName="User & Role Config"><UserAccess /></ErrorBoundary>} />}
-            {isSuperAdmin && <Route path="admin" element={<ErrorBoundary moduleName="System Admin"><AdminDashboard /></ErrorBoundary>} />}
+            {isSuperAdmin && <Route path="admin" element={<Navigate to="/user-access" replace />} />}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         )}
@@ -202,4 +82,5 @@ export default function App() {
     </StoreProvider>
   );
 }
+
 

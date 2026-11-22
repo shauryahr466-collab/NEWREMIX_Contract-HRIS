@@ -12,6 +12,7 @@ import {
   X,
   RefreshCw,
   Lock,
+  KeyRound,
   Building2,
   Layers,
   UserCheck,
@@ -21,6 +22,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAppStore } from '../store';
+import { authFetch } from '../lib/authSession';
 import type { ModuleKey, SystemRole, SystemUser, UserPermissions } from '../types';
 import {
   ALL_MODULE_DEFINITIONS,
@@ -98,17 +100,21 @@ export function UserAccess() {
   );
   const [formNotes, setFormNotes] = useState('');
 
+  // Password change modal for signed-in Super Admin
+  const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
+  const [currentPasswordInput, setCurrentPasswordInput] = useState('');
+  const [newPasswordInput, setNewPasswordInput] = useState('');
+  const [confirmNewPasswordInput, setConfirmNewPasswordInput] = useState('');
+  const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
+
   const callerEmail = currentUserProfile?.email || authUser?.email || '';
 
   const loadData = async () => {
     setIsLoading(true);
     try {
-      const headers: Record<string, string> = {};
-      if (callerEmail) headers['x-hris-user-email'] = callerEmail;
-
       const [usersRes, scopeRes] = await Promise.all([
-        fetch('/api/admin/users', { headers }),
-        fetch('/api/admin/scope-options', { headers })
+        authFetch('/api/admin/users'),
+        authFetch('/api/admin/scope-options')
       ]);
 
       if (usersRes.ok) {
@@ -280,12 +286,10 @@ export function UserAccess() {
     try {
       const endpoint = editingUser ? `/api/admin/users/${encodeURIComponent(editingUser.id)}` : '/api/admin/create-user';
       const method = editingUser ? 'PUT' : 'POST';
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (callerEmail) headers['x-hris-user-email'] = callerEmail;
 
-      const res = await fetch(endpoint, {
+      const res = await authFetch(endpoint, {
         method,
-        headers,
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           username: formUsername.trim(),
           email: formEmail.trim().toLowerCase(),
@@ -326,12 +330,9 @@ export function UserAccess() {
   const handleToggleUserStatus = async (u: SystemUser) => {
     const nextStatus = u.status === 'Active' ? 'Suspended' : 'Active';
     try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (callerEmail) headers['x-hris-user-email'] = callerEmail;
-
-      const res = await fetch(`/api/admin/users/${encodeURIComponent(u.id)}`, {
+      const res = await authFetch(`/api/admin/users/${encodeURIComponent(u.id)}`, {
         method: 'PUT',
-        headers,
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...u, status: nextStatus })
       });
       const data = await res.json();
@@ -346,12 +347,8 @@ export function UserAccess() {
   const handleDeleteUser = async (u: SystemUser) => {
     if (!window.confirm(`Remove user "${u.username}" (${u.email})? They will no longer be able to log in.`)) return;
     try {
-      const headers: Record<string, string> = {};
-      if (callerEmail) headers['x-hris-user-email'] = callerEmail;
-
-      const res = await fetch(`/api/admin/users/${encodeURIComponent(u.id)}`, {
-        method: 'DELETE',
-        headers
+      const res = await authFetch(`/api/admin/users/${encodeURIComponent(u.id)}`, {
+        method: 'DELETE'
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to remove user');
@@ -359,6 +356,42 @@ export function UserAccess() {
       await loadData();
     } catch (err: any) {
       toast.error(err?.message || 'Delete failed');
+    }
+  };
+
+  const handleChangeMyPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPasswordInput.length < 6) {
+      toast.error('New password must be at least 6 characters.');
+      return;
+    }
+    if (newPasswordInput !== confirmNewPasswordInput) {
+      toast.error('New passwords do not match.');
+      return;
+    }
+    setIsUpdatingPassword(true);
+    try {
+      const res = await authFetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          currentPassword: currentPasswordInput,
+          newPassword: newPasswordInput
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || 'Failed to update password');
+      }
+      toast.success('Your password has been updated.');
+      setIsPasswordModalOpen(false);
+      setCurrentPasswordInput('');
+      setNewPasswordInput('');
+      setConfirmNewPasswordInput('');
+    } catch (err: any) {
+      toast.error(err?.message || 'Password update failed');
+    } finally {
+      setIsUpdatingPassword(false);
     }
   };
 
@@ -412,7 +445,20 @@ export function UserAccess() {
         description="Create and manage Super Admin, Department Head, Supervisor, Section Incharge, and Employee accounts with strict concern-only data access."
         icon={Shield}
         actions={
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setCurrentPasswordInput('');
+                setNewPasswordInput('');
+                setConfirmNewPasswordInput('');
+                setIsPasswordModalOpen(true);
+              }}
+            >
+              <KeyRound size={14} className="mr-1.5" />
+              Change My Password
+            </Button>
             <Button variant="outline" size="sm" onClick={loadData} disabled={isLoading}>
               <RefreshCw size={14} className={cn('mr-1.5', isLoading && 'animate-spin')} />
               Refresh
@@ -1003,6 +1049,82 @@ export function UserAccess() {
           </div>
         </div>
       )}
+
+      {/* Change Super Admin Password Modal */}
+      {isPasswordModalOpen && (
+        <div className="fixed inset-0 z-[130] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl max-w-md w-full overflow-hidden shadow-2xl">
+            <div className="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900 dark:text-white">Change My Password</h3>
+                <p className="text-xs text-slate-500 mt-0.5">{callerEmail}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsPasswordModalOpen(false)}
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleChangeMyPassword} className="p-6 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                  Current Password
+                </label>
+                <Input
+                  type="password"
+                  value={currentPasswordInput}
+                  onChange={e => setCurrentPasswordInput(e.target.value)}
+                  placeholder="Enter current password"
+                  autoComplete="current-password"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                  New Password (min 6 characters)
+                </label>
+                <Input
+                  type="password"
+                  value={newPasswordInput}
+                  onChange={e => setNewPasswordInput(e.target.value)}
+                  placeholder="Enter new password"
+                  autoComplete="new-password"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1.5">
+                  Confirm New Password
+                </label>
+                <Input
+                  type="password"
+                  value={confirmNewPasswordInput}
+                  onChange={e => setConfirmNewPasswordInput(e.target.value)}
+                  placeholder="Re-enter new password"
+                  autoComplete="new-password"
+                  required
+                />
+              </div>
+
+              <div className="pt-2 flex items-center justify-end gap-2">
+                <Button type="button" variant="outline" onClick={() => setIsPasswordModalOpen(false)}>
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={isUpdatingPassword}>
+                  {isUpdatingPassword && <Loader2 size={14} className="mr-1.5 animate-spin" />}
+                  Update Password
+                </Button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+

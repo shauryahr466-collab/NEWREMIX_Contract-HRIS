@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
-import { getSqliteDb, saveSqliteDb, getSqliteDbPath, getSanitizedRootFolder, withSqliteWriteLock } from './sqliteDb.js';
+import { getSqliteDb, saveSqliteDb, getSqliteDbPath, getSanitizedRootFolder, withSqliteWriteLock, withReadOnlySqliteSnapshot, recordSystemError } from './sqliteDb.js';
 import { fetchZkHardwareData, testZkHardwareConnection, ZkDeviceUser, ZkRawPunch } from './zkProtocol.js';
+import { validateIncomingPunchesAgainstDb } from './holidayValidationService.js';
+import { broadcastSseEvent } from './realtimeHub.js';
 
 export interface ZkPollingStatus {
   enabled: boolean;
@@ -14,20 +16,186 @@ export interface ZkPollingStatus {
   totalPollsRun: number;
   database: string;
   dbPath: string;
+  lastObservedPunchCount?: number;
+  lastObservedMaxPunchDatetime?: string | null;
+  lastObservedDbMtimeMs?: number;
 }
 
 export const zkPollingState: ZkPollingStatus = {
   enabled: true,
-  readOnlyMode: false,
-  intervalSeconds: 60,
-  intervalMinutes: 1,
+  readOnlyMode: process.env.ZK_ALLOW_DIRECT_WRITE !== 'true',
+  intervalSeconds: 900,
+  intervalMinutes: 15,
   isPollingNow: false,
   lastPollAt: null,
   lastPollResult: null,
   totalPollsRun: 0,
   database: 'SQLite',
-  dbPath: getSqliteDbPath()
+  dbPath: getSqliteDbPath(),
+  lastObservedPunchCount: undefined,
+  lastObservedMaxPunchDatetime: null,
+  lastObservedDbMtimeMs: 0
 };
+
+export function setZkCollectorMode(allowDirectWrite: boolean) {
+  zkPollingState.readOnlyMode = !allowDirectWrite;
+  return {
+    readOnlyMode: zkPollingState.readOnlyMode,
+    mode: zkPollingState.readOnlyMode ? 'READ_ONLY' : 'READ_WRITE'
+  };
+}
+
+export async function detectExternalPunchChangesReadOnly(): Promise<{
+  changed: boolean;
+  punchCount: number;
+  latestPunchDatetime: string | null;
+  delta: number;
+  dbMtimeMs: number;
+  dbSize: number;
+  readOnlyMode: boolean;
+}> {
+  const dbPath = getSqliteDbPath();
+  let dbMtimeMs = 0;
+  let dbSize = 0;
+  try {
+    if (fs.existsSync(dbPath)) {
+      const st = fs.statSync(dbPath);
+      dbMtimeMs = st.mtimeMs;
+      dbSize = st.size;
+    }
+  } catch (err) {
+    recordSystemError('zkPoller', err);
+  }
+
+  const snapshotResult = await withReadOnlySqliteSnapshot((db) => {
+    let punchCount = 0;
+    let latestPunchDatetime: string | null = null;
+    try {
+      const pRes = db.exec('SELECT COUNT(*), MAX(punch_datetime) FROM attendance_punches');
+      if (pRes.length > 0 && pRes[0].values.length > 0) {
+        punchCount = Number(pRes[0].values[0][0] || 0);
+        latestPunchDatetime = pRes[0].values[0][1] ? String(pRes[0].values[0][1]) : null;
+      }
+    } catch {}
+    return { punchCount, latestPunchDatetime };
+  });
+
+  const prevCount = zkPollingState.lastObservedPunchCount;
+  const prevMaxDt = zkPollingState.lastObservedMaxPunchDatetime;
+  const changed =
+    prevCount !== undefined &&
+    (snapshotResult.punchCount !== prevCount || snapshotResult.latestPunchDatetime !== prevMaxDt);
+
+  const delta = prevCount !== undefined ? snapshotResult.punchCount - prevCount : 0;
+
+  zkPollingState.lastObservedPunchCount = snapshotResult.punchCount;
+  zkPollingState.lastObservedMaxPunchDatetime = snapshotResult.latestPunchDatetime;
+  zkPollingState.lastObservedDbMtimeMs = dbMtimeMs;
+  zkPollingState.lastPollAt = new Date().toISOString();
+  zkPollingState.totalPollsRun += 1;
+  zkPollingState.lastPollResult = {
+    success: true,
+    readOnlyMode: zkPollingState.readOnlyMode,
+    polledAt: zkPollingState.lastPollAt,
+    punchCount: snapshotResult.punchCount,
+    latestPunchDatetime: snapshotResult.latestPunchDatetime,
+    changed,
+    delta
+  };
+
+  if (changed) {
+    broadcastSseEvent('PunchSnapshotUpdated', {
+      action: 'external_collector_update',
+      punchCount: snapshotResult.punchCount,
+      latestPunchDatetime: snapshotResult.latestPunchDatetime,
+      delta,
+      timestamp: zkPollingState.lastPollAt
+    });
+  }
+
+  return {
+    changed,
+    punchCount: snapshotResult.punchCount,
+    latestPunchDatetime: snapshotResult.latestPunchDatetime,
+    delta,
+    dbMtimeMs,
+    dbSize,
+    readOnlyMode: zkPollingState.readOnlyMode
+  };
+}
+
+function ensureZkSchedulerTable(db: any) {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS zk_scheduler_config (
+      id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      interval_minutes INTEGER NOT NULL DEFAULT 15,
+      updated_at TEXT
+    );
+  `);
+}
+
+export async function loadZkSchedulerConfigFromSqlite(): Promise<{ enabled: boolean; intervalMinutes: number; intervalSeconds: number }> {
+  const db = await getSqliteDb();
+  try {
+    ensureZkSchedulerTable(db);
+    const res = db.exec("SELECT enabled, interval_minutes FROM zk_scheduler_config WHERE id = 'default' LIMIT 1");
+    if (res.length > 0 && res[0].values.length > 0) {
+      const enabled = Number(res[0].values[0][0]) !== 0;
+      const rawMins = Number(res[0].values[0][1]);
+      const intervalMinutes = Number.isFinite(rawMins) && rawMins >= 1 && rawMins <= 1440 ? Math.round(rawMins) : 15;
+      zkPollingState.enabled = enabled;
+      zkPollingState.intervalMinutes = intervalMinutes;
+      zkPollingState.intervalSeconds = intervalMinutes * 60;
+      return { enabled, intervalMinutes, intervalSeconds: intervalMinutes * 60 };
+    }
+  } catch (e) {
+    console.warn('[ZKPoller] Scheduler config load note:', e);
+  }
+  zkPollingState.enabled = true;
+  zkPollingState.intervalMinutes = 15;
+  zkPollingState.intervalSeconds = 900;
+  return { enabled: true, intervalMinutes: 15, intervalSeconds: 900 };
+}
+
+export async function saveZkSchedulerConfigToSqlite(config: { enabled?: boolean; intervalMinutes?: number }): Promise<{ enabled: boolean; intervalMinutes: number; intervalSeconds: number }> {
+  return withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    ensureZkSchedulerTable(db);
+
+    const nextEnabled = typeof config.enabled === 'boolean' ? config.enabled : zkPollingState.enabled;
+    const rawMins = typeof config.intervalMinutes === 'number' && Number.isFinite(config.intervalMinutes)
+      ? Math.round(config.intervalMinutes)
+      : zkPollingState.intervalMinutes;
+    const nextIntervalMinutes = Math.max(1, Math.min(1440, rawMins || 15));
+    const now = new Date().toISOString();
+
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+    const stmt = db.prepare(`
+      INSERT INTO zk_scheduler_config (id, enabled, interval_minutes, updated_at)
+      VALUES ('default', ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        enabled=excluded.enabled,
+        interval_minutes=excluded.interval_minutes,
+        updated_at=excluded.updated_at
+    `);
+    stmt.run([nextEnabled ? 1 : 0, nextIntervalMinutes, now]);
+    stmt.free();
+    db.run('COMMIT');
+    saveSqliteDb();
+
+    zkPollingState.enabled = nextEnabled;
+    zkPollingState.intervalMinutes = nextIntervalMinutes;
+    zkPollingState.intervalSeconds = nextIntervalMinutes * 60;
+
+    return {
+      enabled: nextEnabled,
+      intervalMinutes: nextIntervalMinutes,
+      intervalSeconds: nextIntervalMinutes * 60
+    };
+  });
+}
 
 function normalizeEmpId(raw: string): string {
   const s = String(raw || '').trim();
@@ -452,6 +620,7 @@ function appendSyncLogToSqlite(db: any, logEntry: {
   durationMs: number;
   unmappedCount?: number;
   inactiveSkipped?: number;
+  holidayOverlapsSkipped?: number;
   mode?: string;
   message?: string;
 }) {
@@ -610,6 +779,7 @@ export interface IngestZkBatchParams {
   punches: ZkRawPunch[];
   users?: ZkDeviceUser[];
   durationMs?: number;
+  latencyMs?: number;
   mode?: string;
   status?: 'Success' | 'Failed';
   deviceStatus?: 'online' | 'offline';
@@ -627,6 +797,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
   unmappedCount: number;
   inactiveSkipped: number;
   beforeJoiningSkipped: number;
+  holidayOverlapsSkipped: number;
   mappingsAdded: number;
 }> {
   return withSqliteWriteLock(async () => {
@@ -660,7 +831,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
     } catch {}
 
     if (!resolvedDevId) {
-      resolvedDevId = 'dev_office_192_168_13_7';
+      resolvedDevId = 'dev_office_192_168_13_103';
     }
     resolvedDevName = resolvedDevName || 'ZKTeco Device';
 
@@ -672,6 +843,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
     let unmappedCount = 0;
     let inactiveSkipped = 0;
     let beforeJoiningSkipped = 0;
+    let holidayOverlapsSkipped = 0;
     let mappingsAdded = 0;
 
     // 1. Store any enrolled users pulled from hardware that match Active Employees
@@ -712,6 +884,8 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       INSERT OR IGNORE INTO zk_unmapped_punches (id, data, created_at)
       VALUES (?, ?, ?)
     `);
+
+    const candidatePunches: any[] = [];
 
     for (const raw of params.punches) {
       const rawUid = String(raw.deviceUserId || '').trim();
@@ -762,7 +936,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
         continue;
       }
 
-      const pObj = {
+      candidatePunches.push({
         id: pId,
         employeeId: empId,
         punchDatetime: dt,
@@ -775,10 +949,21 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
         transactionId: pId,
         location: resolvedDevIp ? `${resolvedDevName} (${resolvedDevIp})` : resolvedDevName,
         importFormat: 'standard'
-      };
+      });
+    }
 
-      punchStmt.run([pId, empId, dt, resolvedDevId, 'ZKTeco', JSON.stringify(pObj), now]);
-      ctx.existingPunchIds.add(pId);
+    // Cross-reference candidate biometric punches against Public Holiday Master DB to prevent holiday overlaps
+    const holidayChecked = validateIncomingPunchesAgainstDb(db, candidatePunches);
+    holidayOverlapsSkipped = holidayChecked.rejectedOverlaps.length;
+
+    for (const pObj of holidayChecked.acceptedPunches) {
+      const empTimeKey = `${pObj.employeeId}|${pObj.punchDatetime}`;
+      if (ctx.existingPunchIds.has(pObj.id) || ctx.existingPunchEmpTimes.has(empTimeKey)) {
+        duplicates++;
+        continue;
+      }
+      punchStmt.run([pObj.id, pObj.employeeId, pObj.punchDatetime, resolvedDevId, 'ZKTeco', JSON.stringify(pObj), now]);
+      ctx.existingPunchIds.add(pObj.id);
       ctx.existingPunchEmpTimes.add(empTimeKey);
       newRecords++;
     }
@@ -786,12 +971,22 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
     punchStmt.free();
     unmappedStmt.free();
 
+    const measuredLatency =
+      typeof params.latencyMs === 'number' && params.latencyMs >= 0
+        ? params.latencyMs
+        : typeof params.durationMs === 'number' && params.durationMs >= 0
+          ? params.durationMs
+          : undefined;
+
     const devOverrides = new Map<string, Partial<any>>();
     devOverrides.set(resolvedDevId, {
       status: params.deviceStatus || 'online',
       lastProtocolUsed: params.protocolUsed || params.mode || undefined,
       lastConnection: params.deviceStatus === 'offline' ? undefined : now,
       lastSync: params.status === 'Failed' ? undefined : now,
+      lastSuccessfulSync: params.status === 'Failed' ? undefined : now,
+      lastLatencyMs: measuredLatency,
+      lastProbeAt: now,
       lastError: params.errorMessage || '',
       ...(params.freeSizes ? {
         ...(params.freeSizes.userCount > 0 ? { deviceCapacityUsers: params.freeSizes.userCount } : {}),
@@ -815,12 +1010,23 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       durationMs: params.durationMs || 0,
       unmappedCount,
       inactiveSkipped,
+      holidayOverlapsSkipped,
       mode: params.mode || 'ZKT Sync',
-      message: params.errorMessage || `Processed ${params.punches.length} logs (${newRecords} new stored, ${duplicates} skipped)`
+      message: params.errorMessage || `Processed ${params.punches.length} logs (${newRecords} new stored, ${duplicates} skipped${holidayOverlapsSkipped > 0 ? `, ${holidayOverlapsSkipped} holiday overlaps prevented` : ''})`
     });
 
     db.run('COMMIT');
     saveSqliteDb();
+
+    if (newRecords > 0 || unmappedCount > 0 || mappingsAdded > 0) {
+      broadcastSseEvent('PunchSnapshotUpdated', {
+        action: 'manual_ingest',
+        deviceId: resolvedDevId,
+        deviceName: resolvedDevName,
+        newRecords,
+        timestamp: now
+      });
+    }
 
     return {
       success: params.status !== 'Failed',
@@ -832,6 +1038,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       unmappedCount,
       inactiveSkipped,
       beforeJoiningSkipped,
+      holidayOverlapsSkipped,
       mappingsAdded
     };
   });
@@ -1055,6 +1262,7 @@ export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'M
       users: hw.users,
       freeSizes: hw.freeSizes ? { userCount: hw.freeSizes.userCount, logCount: hw.freeSizes.logCount } : undefined,
       durationMs: Date.now() - startTime,
+      latencyMs: hw.latencyMs,
       mode: `${mode} (${hw.protocol})`,
       deviceStatus: 'online',
       status: 'Success'
@@ -1063,6 +1271,7 @@ export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'M
       ...res,
       reachable: true,
       protocol: hw.protocol,
+      latencyMs: hw.latencyMs,
       attempts: hw.attempts,
       message: `Polled ${targetDev.name} (${targetDev.ip}) via ${hw.protocol}: ${res.recordsRead} read, ${res.newRecords} new stored in SQLite, ${res.duplicates} duplicates skipped.`
     };
@@ -1074,6 +1283,7 @@ export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'M
     deviceIP: targetDev.ip,
     punches: [],
     durationMs: Date.now() - startTime,
+    latencyMs: hw.latencyMs,
     mode: `${mode} (Unreachable)`,
     deviceStatus: 'offline',
     status: 'Failed',
@@ -1084,6 +1294,7 @@ export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'M
     ...failRes,
     success: false,
     reachable: false,
+    latencyMs: hw.latencyMs,
     attempts: hw.attempts,
     error: hw.error || `Device ${targetDev.name} (${targetDev.ip}:${targetDev.port || 4370}) unreachable on current network`
   };
@@ -1121,6 +1332,10 @@ export async function testAndStoreZkDeviceConnection(params: {
         try { d = JSON.parse(String(r[1] || '{}')); } catch {}
         if ((params.deviceId && id === params.deviceId) || d.ip === params.ip) {
           d.status = res.reachable ? 'online' : 'offline';
+          d.lastProbeAt = now;
+          if (typeof res.latencyMs === 'number' && res.latencyMs >= 0) {
+            d.lastLatencyMs = res.latencyMs;
+          }
           if (res.reachable) {
             d.lastConnection = now;
             d.lastProtocolUsed = res.protocol;
@@ -1144,7 +1359,150 @@ export async function testAndStoreZkDeviceConnection(params: {
   return res;
 }
 
-export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mode?: string } = {}) {
+export async function probeAllZkDevicesHealth(timeoutMs = 1500) {
+  const startTime = Date.now();
+  const db = await getSqliteDb();
+  const devices: any[] = [];
+  try {
+    const devRes = db.exec('SELECT id, data FROM zk_devices');
+    if (devRes.length > 0) {
+      for (const r of devRes[0].values) {
+        try {
+          const d = JSON.parse(String(r[1] || '{}'));
+          devices.push({ ...d, id: String(r[0]) });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  const probeResults = await Promise.all(
+    devices.map(async (dev) => {
+      if (dev.enabled === false) {
+        return {
+          deviceId: dev.id,
+          skipped: true,
+          reachable: false,
+          latencyMs: dev.lastLatencyMs,
+          protocol: dev.lastProtocolUsed || dev.protocolMode || 'Disabled',
+          error: 'Device polling disabled'
+        };
+      }
+      const mode = dev.protocolMode || 'Auto';
+      const ip = String(dev.ip || '').trim();
+      if (ip === 'USB/File' || ip === 'Local Disk (E:)' || mode === 'USB-Disk') {
+        const t0 = Date.now();
+        const watchDir = getWatchFolderPath();
+        const exists = fs.existsSync(watchDir);
+        return {
+          deviceId: dev.id,
+          skipped: false,
+          reachable: exists,
+          latencyMs: Math.max(1, Date.now() - t0),
+          protocol: 'USB/WatchFolder',
+          error: exists ? '' : 'Watch folder unavailable'
+        };
+      }
+      if (ip === 'ADMS Push' || mode === 'ADMS') {
+        return {
+          deviceId: dev.id,
+          skipped: false,
+          reachable: true,
+          latencyMs: 1,
+          protocol: 'ADMS Push',
+          error: ''
+        };
+      }
+      const hw = await testZkHardwareConnection(
+        ip,
+        Number(dev.port) || 4370,
+        Number(dev.commKey) || 0,
+        timeoutMs,
+        mode
+      );
+      return {
+        deviceId: dev.id,
+        skipped: false,
+        reachable: hw.reachable,
+        latencyMs: hw.latencyMs,
+        protocol: hw.protocol,
+        serialNumber: hw.serialNumber,
+        freeSizes: hw.freeSizes,
+        error: hw.error || ''
+      };
+    })
+  );
+
+  const now = new Date().toISOString();
+  const resultMap = new Map(probeResults.map(r => [r.deviceId, r]));
+
+  await withSqliteWriteLock(async () => {
+    const writeDb = await getSqliteDb();
+    try { writeDb.run('ROLLBACK'); } catch {}
+    writeDb.run('BEGIN TRANSACTION');
+
+    const devRes = writeDb.exec('SELECT id, data FROM zk_devices');
+    if (devRes.length > 0) {
+      const upStmt = writeDb.prepare('UPDATE zk_devices SET data = ?, updated_at = ? WHERE id = ?');
+      for (const r of devRes[0].values) {
+        const id = String(r[0]);
+        let d: any = {};
+        try { d = JSON.parse(String(r[1] || '{}')); } catch {}
+        const p = resultMap.get(id);
+        if (p && !p.skipped) {
+          d.status = p.reachable ? 'online' : 'offline';
+          d.lastProbeAt = now;
+          if (typeof p.latencyMs === 'number' && p.latencyMs >= 0) {
+            d.lastLatencyMs = p.latencyMs;
+          }
+          if (p.reachable) {
+            d.lastConnection = now;
+            if (p.protocol && p.protocol !== 'NONE') {
+              d.lastProtocolUsed = p.protocol;
+            }
+          }
+          d.lastError = p.reachable ? '' : (p.error || 'Unreachable');
+          if ((p as any).serialNumber) d.serialNumber = (p as any).serialNumber;
+          if ((p as any).freeSizes) {
+            d.deviceCapacityUsers = (p as any).freeSizes.userCount;
+            d.deviceCapacityLogs = (p as any).freeSizes.logCount;
+          }
+          upStmt.run([JSON.stringify(d), now, id]);
+        }
+      }
+      upStmt.free();
+    }
+
+    writeDb.run('COMMIT');
+    saveSqliteDb();
+  });
+
+  const summary = await getZkPollingSummaryFromSqlite();
+  return {
+    success: true,
+    probedAt: now,
+    probeDurationMs: Date.now() - startTime,
+    results: probeResults,
+    summary
+  };
+}
+
+export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mode?: string; forceDirectPoll?: boolean } = {}) {
+  if (zkPollingState.readOnlyMode && !options.forceDirectPoll) {
+    const obs = await detectExternalPunchChangesReadOnly();
+    return {
+      success: true,
+      readOnlyMode: true,
+      skippedDirectWrite: true,
+      mode: options.mode || 'Read-Only External Collector Observation',
+      polledAt: zkPollingState.lastPollAt,
+      punchCount: obs.punchCount,
+      latestPunchDatetime: obs.latestPunchDatetime,
+      changed: obs.changed,
+      delta: obs.delta,
+      results: []
+    };
+  }
+
   if (zkPollingState.isPollingNow) {
     return {
       success: true,
@@ -1171,13 +1529,13 @@ export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mod
 
     const enabledDevices = devices.filter(d => d.enabled !== false);
     const nowMs = Date.now();
+    const globalScheduleMins = Math.max(1, Number(zkPollingState.intervalMinutes || 15));
     const targetDevices = options.dueOnly
       ? enabledDevices.filter(d => {
-          const mins = Number(d.autoSyncMinutes ?? 15);
-          if (mins <= 0) return false;
+          if (d.autoSyncMinutes === 0) return false;
           if (!d.lastSync) return true;
           const lastMs = Date.parse(String(d.lastSync));
-          return isNaN(lastMs) || nowMs - lastMs >= mins * 60 * 1000;
+          return isNaN(lastMs) || nowMs - lastMs >= globalScheduleMins * 60 * 1000;
         })
       : enabledDevices;
 
@@ -1251,15 +1609,18 @@ export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mod
 }
 
 export async function getZkPollingSummaryFromSqlite() {
-  const db = await getSqliteDb();
-  let deviceCount = 0;
-  let enabledDeviceCount = 0;
-  let onlineDeviceCount = 0;
-  let punchCount = 0;
-  let activeEmployeeCount = 0;
-  let mappedUserCount = 0;
-  let pendingUnmappedCount = 0;
-  let latestPunchDatetime: string | null = null;
+  return withReadOnlySqliteSnapshot((db) => {
+    let deviceCount = 0;
+    let enabledDeviceCount = 0;
+    let onlineDeviceCount = 0;
+    let punchCount = 0;
+    let activeEmployeeCount = 0;
+    let mappedUserCount = 0;
+    let pendingUnmappedCount = 0;
+    let latestPunchDatetime: string | null = null;
+    let lastSuccessfulSyncLog: any = null;
+    let latestSyncLog: any = null;
+    const latencySamples: number[] = [];
 
   try {
     const devRes = db.exec('SELECT data FROM zk_devices');
@@ -1270,6 +1631,9 @@ export async function getZkPollingSummaryFromSqlite() {
           const d = JSON.parse(String(r[0]));
           if (d.enabled !== false) enabledDeviceCount++;
           if (d.status === 'online') onlineDeviceCount++;
+          if (typeof d.lastLatencyMs === 'number' && d.lastLatencyMs >= 0) {
+            latencySamples.push(d.lastLatencyMs);
+          }
         } catch {}
       }
     }
@@ -1309,8 +1673,36 @@ export async function getZkPollingSummaryFromSqlite() {
     }
   } catch {}
 
+  try {
+    const logRes = db.exec('SELECT data FROM zk_sync_logs ORDER BY created_at DESC LIMIT 100');
+    if (logRes.length > 0) {
+      for (const r of logRes[0].values) {
+        try {
+          const log = JSON.parse(String(r[0]));
+          if (!latestSyncLog) latestSyncLog = log;
+          if (!lastSuccessfulSyncLog && log.status === 'Success') {
+            lastSuccessfulSyncLog = log;
+          }
+          if (latestSyncLog && lastSuccessfulSyncLog) break;
+        } catch {}
+      }
+    }
+  } catch {}
+
+  const averageLatencyMs = latencySamples.length > 0
+    ? Math.round(latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length)
+    : (typeof lastSuccessfulSyncLog?.durationMs === 'number' ? lastSuccessfulSyncLog.durationMs : null);
+
+  const lastReferenceMs = zkPollingState.lastPollAt
+    ? Date.parse(zkPollingState.lastPollAt)
+    : (latestSyncLog?.timestamp ? Date.parse(String(latestSyncLog.timestamp)) : NaN);
+  const nextPollAt = zkPollingState.enabled && !isNaN(lastReferenceMs)
+    ? new Date(lastReferenceMs + Math.max(1, zkPollingState.intervalMinutes) * 60 * 1000).toISOString()
+    : null;
+
   return {
     ...zkPollingState,
+    nextPollAt,
     dbPath: getSqliteDbPath(),
     watchFolderPath: getWatchFolderPath(),
     deviceCount,
@@ -1320,6 +1712,326 @@ export async function getZkPollingSummaryFromSqlite() {
     activeEmployeeCount,
     mappedUserCount,
     pendingUnmappedCount,
-    latestPunchDatetime
+    latestPunchDatetime,
+    lastSuccessfulSyncLog,
+    latestSyncLog,
+    averageLatencyMs
+  };
+  });
+}
+
+export const VERIFIED_ZK_FLEET = [
+  {
+    id: 'dev_main_192_168_117_200',
+    name: 'Time Office 2',
+    ip: '192.168.117.200',
+    port: 4370,
+    model: 'MB2000/ID',
+    serialNumber: 'BRC7233360063',
+    deviceNumber: 1,
+    commType: 'Ethernet',
+    enabled: true,
+    protocolMode: 'Auto',
+    commKey: 0,
+    deviceCapacityUsers: 369,
+    adminCount: 2,
+    fpCount: 697,
+    faceCount: 149,
+    palmCount: 0,
+    userFaceCount: 149,
+    passwordCount: 0,
+    opLogCount: 1,
+    deviceCapacityLogs: 50062,
+    autoSyncMinutes: 15
+  },
+  {
+    id: 'dev_factory_192_168_117_201',
+    name: 'Time Office 1',
+    ip: '192.168.117.201',
+    port: 4370,
+    model: 'MB2000/ID',
+    serialNumber: 'BRC7233360027',
+    deviceNumber: 1,
+    commType: 'Ethernet',
+    enabled: true,
+    protocolMode: 'Auto',
+    commKey: 0,
+    deviceCapacityUsers: 362,
+    adminCount: 3,
+    fpCount: 687,
+    faceCount: 209,
+    palmCount: 0,
+    userFaceCount: 209,
+    passwordCount: 0,
+    opLogCount: 2,
+    deviceCapacityLogs: 32876,
+    autoSyncMinutes: 15
+  },
+  {
+    id: 'dev_office_192_168_13_103',
+    name: 'ISTS Office',
+    ip: '192.168.13.103',
+    port: 4370,
+    model: 'MB2000',
+    serialNumber: 'MFP3241900135',
+    deviceNumber: 1,
+    commType: 'Ethernet',
+    enabled: true,
+    protocolMode: 'Auto',
+    commKey: 0,
+    deviceCapacityUsers: 103,
+    adminCount: 3,
+    fpCount: 204,
+    faceCount: 67,
+    palmCount: 0,
+    userFaceCount: 67,
+    passwordCount: 0,
+    opLogCount: 2,
+    deviceCapacityLogs: 67963,
+    autoSyncMinutes: 15
+  }
+] as const;
+
+export async function replaceWithVerifiedZkFleetInSqlite() {
+  return withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    const now = new Date().toISOString();
+
+    const existingMap = new Map<string, any>();
+    let removedCount = 0;
+
+    try {
+      const devRes = db.exec('SELECT id, data FROM zk_devices');
+      if (devRes.length > 0) {
+        for (const r of devRes[0].values) {
+          const id = String(r[0]);
+          let d: any = {};
+          try { d = JSON.parse(String(r[1] || '{}')); } catch {}
+          existingMap.set(id, d);
+        }
+      }
+    } catch {}
+
+    const verifiedIds = new Set<string>(VERIFIED_ZK_FLEET.map(v => v.id));
+
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+
+    // 1. Migrate legacy ID dev_office_192_168_13_7 -> dev_office_192_168_13_103 in punches & logs
+    try {
+      const pRes = db.exec("SELECT id, data FROM attendance_punches WHERE device_id = 'dev_office_192_168_13_7'");
+      if (pRes.length > 0) {
+        const upPunch = db.prepare("UPDATE attendance_punches SET device_id = ?, data = ? WHERE id = ?");
+        for (const r of pRes[0].values) {
+          const pId = String(r[0]);
+          let pObj: any = {};
+          try { pObj = JSON.parse(String(r[1] || '{}')); } catch {}
+          pObj.deviceId = 'dev_office_192_168_13_103';
+          pObj.deviceName = 'ISTS Office';
+          pObj.deviceIP = '192.168.13.103';
+          upPunch.run(['dev_office_192_168_13_103', JSON.stringify(pObj), pId]);
+        }
+        upPunch.free();
+      }
+    } catch {}
+
+    try {
+      const lRes = db.exec('SELECT id, data FROM zk_sync_logs');
+      if (lRes.length > 0) {
+        const upLog = db.prepare('UPDATE zk_sync_logs SET data = ? WHERE id = ?');
+        for (const r of lRes[0].values) {
+          const lId = String(r[0]);
+          let lObj: any = {};
+          try { lObj = JSON.parse(String(r[1] || '{}')); } catch {}
+          let dirty = false;
+          if (lObj.deviceId === 'dev_office_192_168_13_7') {
+            lObj.deviceId = 'dev_office_192_168_13_103';
+            lObj.deviceName = 'ISTS Office';
+            dirty = true;
+          } else if (lObj.deviceName === 'Office Device') {
+            lObj.deviceName = 'ISTS Office';
+            dirty = true;
+          } else if (lObj.deviceName === 'Main Device') {
+            lObj.deviceName = 'Time Office 2';
+            dirty = true;
+          } else if (lObj.deviceName === 'Factory Device') {
+            lObj.deviceName = 'Time Office 1';
+            dirty = true;
+          }
+          if (dirty) {
+            upLog.run([JSON.stringify(lObj), lId]);
+          }
+        }
+        upLog.free();
+      }
+    } catch {}
+
+    try {
+      const uRes = db.exec('SELECT id, data FROM zk_unmapped_punches');
+      if (uRes.length > 0) {
+        const upUnmapped = db.prepare('UPDATE zk_unmapped_punches SET data = ? WHERE id = ?');
+        for (const r of uRes[0].values) {
+          const uId = String(r[0]);
+          let uObj: any = {};
+          try { uObj = JSON.parse(String(r[1] || '{}')); } catch {}
+          if (uObj.deviceId === 'dev_office_192_168_13_7') {
+            uObj.deviceId = 'dev_office_192_168_13_103';
+            uObj.deviceName = 'ISTS Office';
+            uObj.deviceIP = '192.168.13.103';
+            upUnmapped.run([JSON.stringify(uObj), uId]);
+          }
+        }
+        upUnmapped.free();
+      }
+    } catch {}
+
+    // 2. Remove all previous / unverified device rows
+    const delStmt = db.prepare('DELETE FROM zk_devices WHERE id = ?');
+    for (const oldId of existingMap.keys()) {
+      if (!verifiedIds.has(oldId)) {
+        delStmt.run([oldId]);
+        removedCount++;
+      }
+    }
+    delStmt.free();
+
+    // 3. Upsert the 3 verified devices with exact hardware parameters
+    const upsertDev = db.prepare(`
+      INSERT INTO zk_devices (id, data, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        data=excluded.data,
+        updated_at=excluded.updated_at
+    `);
+
+    const legacyOffice = existingMap.get('dev_office_192_168_13_7');
+    for (const spec of VERIFIED_ZK_FLEET) {
+      const prev =
+        existingMap.get(spec.id) ||
+        (spec.id === 'dev_office_192_168_13_103' ? legacyOffice : undefined) ||
+        {};
+      const merged = {
+        status: prev.status || 'online',
+        lastConnection: prev.lastConnection || now,
+        lastSync: prev.lastSync || now,
+        lastSuccessfulSync: prev.lastSuccessfulSync,
+        lastLatencyMs: prev.lastLatencyMs,
+        lastProbeAt: prev.lastProbeAt,
+        lastProtocolUsed: prev.lastProtocolUsed || 'TCP-4370 (Ethernet)',
+        lastError: prev.lastError || '',
+        ...spec
+      };
+      upsertDev.run([spec.id, JSON.stringify(merged), now]);
+    }
+    upsertDev.free();
+
+    const stats = updateDeviceStatsFromSqlite(db);
+    db.run('COMMIT');
+    saveSqliteDb();
+
+    const outRes = db.exec('SELECT data FROM zk_devices');
+    const devices = outRes.length > 0
+      ? outRes[0].values.map((v: any[]) => {
+          try { return JSON.parse(String(v[0])); } catch { return null; }
+        }).filter(Boolean)
+      : [];
+
+    return {
+      success: true,
+      removedCount,
+      deviceCount: devices.length,
+      devices,
+      totalSystemLogs: stats.totalSystemLogs,
+      activeEmployees: stats.activeEmpCount,
+      database: 'SQLite',
+      dbPath: getSqliteDbPath()
+    };
+  });
+}
+
+export async function readStoredPunchesFromSqlite(options: { deviceId?: string; limit?: number } = {}) {
+  const db = await getSqliteDb();
+  const limit = Math.max(1, Math.min(1000, Number(options.limit) || 100));
+  const filterDevId = String(options.deviceId || '').trim();
+
+  let totalForQuery = 0;
+  let totalAll = 0;
+  const punches: any[] = [];
+
+  try {
+    const totRes = db.exec('SELECT COUNT(*) FROM attendance_punches');
+    if (totRes.length > 0 && totRes[0].values.length > 0) {
+      totalAll = Number(totRes[0].values[0][0] || 0);
+    }
+
+    if (filterDevId) {
+      const cStmt = db.prepare('SELECT COUNT(*) FROM attendance_punches WHERE device_id = ?');
+      cStmt.bind([filterDevId]);
+      if (cStmt.step()) {
+        totalForQuery = Number(cStmt.get()[0] || 0);
+      }
+      cStmt.free();
+
+      const qStmt = db.prepare(
+        'SELECT id, employee_id, punch_datetime, device_id, source, data, created_at FROM attendance_punches WHERE device_id = ? ORDER BY punch_datetime DESC LIMIT ?'
+      );
+      qStmt.bind([filterDevId, limit]);
+      while (qStmt.step()) {
+        const row = qStmt.get();
+        let parsed: any = {};
+        try { parsed = JSON.parse(String(row[5] || '{}')); } catch {}
+        punches.push({
+          ...parsed,
+          id: String(parsed.id || row[0] || ''),
+          employeeId: String(parsed.employeeId || row[1] || ''),
+          punchDatetime: String(parsed.punchDatetime || row[2] || ''),
+          deviceId: String(parsed.deviceId || row[3] || ''),
+          source: String(parsed.source || row[4] || 'ZKTeco')
+        });
+      }
+      qStmt.free();
+    } else {
+      totalForQuery = totalAll;
+      const qStmt = db.prepare(
+        'SELECT id, employee_id, punch_datetime, device_id, source, data, created_at FROM attendance_punches ORDER BY punch_datetime DESC LIMIT ?'
+      );
+      qStmt.bind([limit]);
+      while (qStmt.step()) {
+        const row = qStmt.get();
+        let parsed: any = {};
+        try { parsed = JSON.parse(String(row[5] || '{}')); } catch {}
+        punches.push({
+          ...parsed,
+          id: String(parsed.id || row[0] || ''),
+          employeeId: String(parsed.employeeId || row[1] || ''),
+          punchDatetime: String(parsed.punchDatetime || row[2] || ''),
+          deviceId: String(parsed.deviceId || row[3] || ''),
+          source: String(parsed.source || row[4] || 'ZKTeco')
+        });
+      }
+      qStmt.free();
+    }
+  } catch (e: any) {
+    return {
+      success: false,
+      error: e?.message || 'SQLite punch read failed',
+      database: 'SQLite',
+      dbPath: getSqliteDbPath(),
+      totalAll: 0,
+      totalMatched: 0,
+      punches: []
+    };
+  }
+
+  return {
+    success: true,
+    database: 'SQLite',
+    dbPath: getSqliteDbPath(),
+    deviceId: filterDevId || 'ALL',
+    totalAll,
+    totalMatched: totalForQuery,
+    returnedCount: punches.length,
+    latestPunchDatetime: punches[0]?.punchDatetime || null,
+    punches
   };
 }

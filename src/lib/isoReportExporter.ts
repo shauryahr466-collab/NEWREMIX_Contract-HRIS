@@ -155,42 +155,12 @@ export function formatIsoWeekCode(isoDate: string): string {
 export function formatTimeByStandard(
   val: string | null | undefined,
   standard: TimeStandardMode = 'iso',
-  includeSeconds = true
+  includeSeconds = false
 ): string {
   if (!val) return '-';
   const str = String(val).trim();
   if (!str || str === '--' || str === '--:--' || str === '-') return '-';
-
-  if (standard === 'legacy') {
-    if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(str)) {
-      const [hRaw, mRaw] = str.split(':').map(Number);
-      const ampm = hRaw >= 12 ? 'PM' : 'AM';
-      const h12 = hRaw % 12 || 12;
-      return `${h12}:${String(mRaw).padStart(2, '0')} ${ampm}`;
-    }
-    return formatAMPM(str);
-  }
-
-  // ISO 8601 24-hour clock
-  if (/^\d{1,2}:\d{2}:\d{2}$/.test(str)) {
-    const [h, m, s] = str.split(':');
-    return includeSeconds ? `${h.padStart(2, '0')}:${m}:${s}` : `${h.padStart(2, '0')}:${m}`;
-  }
-  if (/^\d{1,2}:\d{2}$/.test(str)) {
-    const [h, m] = str.split(':');
-    return includeSeconds ? `${h.padStart(2, '0')}:${m}:00` : `${h.padStart(2, '0')}:${m}`;
-  }
-
-  const wall = toDeviceWallClockIso(str);
-  const m = wall.match(/(?:T|\s|^)(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-  if (m) {
-    const hh = m[1].padStart(2, '0');
-    const mm = m[2];
-    const ss = (m[3] || '00').padStart(2, '0');
-    return includeSeconds ? `${hh}:${mm}:${ss}` : `${hh}:${mm}`;
-  }
-
-  return str;
+  return formatAMPM(str);
 }
 
 export function formatIsoHoursHHMM(decimalHours: number): string {

@@ -29,8 +29,7 @@ export const ALL_MODULE_DEFINITIONS: Array<{
   { key: 'import', label: 'Punch Import', path: '/import', category: 'Administration' },
   { key: 'auditLogs', label: 'System Audit Log', path: '/audit-logs', category: 'Administration' },
   { key: 'settings', label: 'Configuration', path: '/settings', category: 'Administration' },
-  { key: 'userAccess', label: 'User & Role Config', path: '/user-access', category: 'Administration' },
-  { key: 'admin', label: 'System Admin', path: '/admin', category: 'Administration' }
+  { key: 'userAccess', label: 'User & Role Config', path: '/user-access', category: 'Administration' }
 ];
 
 export const PATH_TO_MODULE_KEY: Record<string, ModuleKey> = ALL_MODULE_DEFINITIONS.reduce((acc, m) => {

@@ -1,0 +1,14 @@
+# Company Intranet Caddy Reverse Proxy Configuration
+# Optimized for LAN hosting (e.g. http://10.12.10.54:844) -> Node.js server on port 3000
+# Recommended: Run `npm run build && npm start` (production bundle) for fastest LAN loads.
+
+:844 {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:3000 {
+		flush_interval -1
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+}

@@ -582,7 +582,7 @@ export function Reports() {
           'Name': r.name,
           'Department': r.department,
           'Section': r.section,
-          'ISO Week': r.isoWeek,
+          'BS Date': r.bsDate,
           'Date': r.formattedDate,
           'Time Sequence': r.timeString
         }))
@@ -1134,7 +1134,7 @@ export function Reports() {
                         <th className="py-2.5 px-3">Employee Name</th>
                         <th className="py-2.5 px-3">Department</th>
                         <th className="py-2.5 px-3">Section</th>
-                        <th className="py-2.5 px-3">ISO Week</th>
+                        <th className="py-2.5 px-3">BS Date</th>
                         <th className="py-2.5 px-3">Date</th>
                         <th className="py-2.5 px-3 text-right">Punches</th>
                         <th className="py-2.5 px-3">Punch Time Sequence</th>
@@ -1147,7 +1147,7 @@ export function Reports() {
                           <td className="py-2 px-3 font-medium text-slate-800 dark:text-slate-200">{r.name}</td>
                           <td className="py-2 px-3 text-slate-500">{r.department}</td>
                           <td className="py-2 px-3 text-slate-500">{r.section}</td>
-                          <td className="py-2 px-3 font-mono tabular-nums text-slate-400">{r.isoWeek}</td>
+                          <td className="py-2 px-3 font-mono tabular-nums text-slate-600 dark:text-slate-300">{r.bsDate}</td>
                           <td className="py-2 px-3 font-mono tabular-nums text-slate-700 dark:text-slate-300">{r.formattedDate}</td>
                           <td className="py-2 px-3 font-mono tabular-nums text-right">{r.punchCount}</td>
                           <td className="py-2 px-3 font-mono text-[11px] text-indigo-700 dark:text-indigo-400">{r.timeString}</td>

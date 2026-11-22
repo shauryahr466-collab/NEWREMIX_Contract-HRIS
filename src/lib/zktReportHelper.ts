@@ -1,9 +1,8 @@
 import { format, parseISO } from 'date-fns';
 import type { RawPunch, Employee, ProcessedAttendance } from '../types';
+import { getNepaliDate } from '../utils/dateHelper';
 import { formatAMPM, normalizeEmployeeId, toDeviceWallClockIso } from './utils';
 import {
-  formatIsoWeekCode,
-  formatTimeByStandard,
   type IsoDocumentMeta,
   type TimeStandardMode
 } from './isoReportExporter';
@@ -17,10 +16,10 @@ export interface ZkBioDataRow {
   department: string;
   section: string;
   dateStr: string;      // ISO 8601 YYYY-MM-DD
-  isoWeek: string;      // ISO 8601 YYYY-Www
+  bsDate: string;       // B.S. YYYY-MM-DD
   formattedDate: string; // ISO YYYY-MM-DD or legacy M/d/yyyy
   punchCount: number;
-  timeString: string;    // Sorted HH:mm:ss or AM/PM comma-separated
+  timeString: string;    // Sorted h:mm AM/PM comma-separated
 }
 
 export function generateZkBioDataRows(
@@ -47,7 +46,7 @@ export function generateZkBioDataRows(
     department: string;
     section: string;
     dateStr: string;
-    isoWeek: string;
+    bsDate: string;
     formattedDate: string;
     rawWallTimes: string[];
   }>();
@@ -89,7 +88,7 @@ export function generateZkBioDataRows(
           department: emp?.department || 'General',
           section: emp?.section || '-',
           dateStr,
-          isoWeek: formatIsoWeekCode(dateStr),
+          bsDate: getNepaliDate(dateStr),
           formattedDate: formatDateVal(dateStr),
           rawWallTimes: []
         };
@@ -125,7 +124,7 @@ export function generateZkBioDataRows(
           department: emp?.department || d.department || 'General',
           section: emp?.section || '-',
           dateStr,
-          isoWeek: formatIsoWeekCode(dateStr),
+          bsDate: getNepaliDate(dateStr),
           formattedDate: formatDateVal(dateStr),
           rawWallTimes: []
         };
@@ -145,18 +144,14 @@ export function generateZkBioDataRows(
 
   let rows: ZkBioDataRow[] = Array.from(groupMap.values()).map(g => {
     const sortedTimes = [...g.rawWallTimes].sort();
-    const formattedTimes = sortedTimes.map(t =>
-      timeStandard === 'iso'
-        ? formatTimeByStandard(t, 'iso', true)
-        : formatAMPM(t)
-    );
+    const formattedTimes = sortedTimes.map(t => formatAMPM(t));
     return {
       employeeNo: g.employeeNo,
       name: g.name,
       department: g.department,
       section: g.section,
       dateStr: g.dateStr,
-      isoWeek: g.isoWeek,
+      bsDate: g.bsDate,
       formattedDate: g.formattedDate,
       punchCount: sortedTimes.length,
       timeString: formattedTimes.join(', ')
@@ -229,7 +224,7 @@ export function exportZkBioDataExcel(
     'Name': r.name,
     'Department': r.department,
     'Section': r.section,
-    'ISO Week': r.isoWeek,
+    'BS Date': r.bsDate,
     'Date': r.formattedDate,
     'Punch Count': r.punchCount,
     'Time Sequence': r.timeString
@@ -241,7 +236,7 @@ export function exportZkBioDataExcel(
     { wch: 28 },
     { wch: 20 },
     { wch: 18 },
-    { wch: 11 },
+    { wch: 14 },
     { wch: 14 },
     { wch: 12 },
     { wch: 70 }
@@ -260,7 +255,7 @@ export function exportZkBioDataCSV(rows: ZkBioDataRow[], companyName: string = '
     'Name': r.name,
     'Department': r.department,
     'Section': r.section,
-    'ISO Week': r.isoWeek,
+    'BS Date': r.bsDate,
     'Date': r.formattedDate,
     'Punch Count': r.punchCount,
     'Time Sequence': r.timeString
@@ -328,13 +323,13 @@ export function exportZkBioDataPDF(
     doc.text(`Generated On: ${format(new Date(), 'yyyy-MM-dd HH:mm:ss')} | Total Records: ${rows.length}`, pageWidth / 2, 17, { align: 'center' });
   }
 
-  const head = [['Emp No.', 'Name', 'Department', 'Section', 'ISO Week', 'Date', 'Count', 'Time Sequence']];
+  const head = [['Emp No.', 'Name', 'Department', 'Section', 'BS Date', 'Date', 'Count', 'Time Sequence']];
   const body = rows.map(r => [
     r.employeeNo,
     r.name,
     r.department,
     r.section,
-    r.isoWeek,
+    r.bsDate,
     r.formattedDate,
     String(r.punchCount),
     r.timeString

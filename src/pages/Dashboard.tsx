@@ -15,6 +15,7 @@ import {
 import { motion } from 'motion/react';
 import { Link, useNavigate } from 'react-router-dom';
 import { DepartmentInsights } from '../components/DepartmentInsights';
+import { BiometricHealth } from '../components/BiometricHealth';
 import { PageHeader, Card, KPICard, Button, Badge } from '../components/ui';
 
 export function Dashboard() {
@@ -295,6 +296,8 @@ export function Dashboard() {
               </div>
             </Card>
           </div>
+
+          <BiometricHealth />
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <Card title="System Activity" actions={<Link to="/audit-logs"><Button variant="ghost" size="sm">View All</Button></Link>}>

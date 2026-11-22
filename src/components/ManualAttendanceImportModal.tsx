@@ -10,6 +10,7 @@ import { Employee } from '../types';
 import { normalizeEmployeeId } from '../lib/utils';
 import { useActionStatus } from '../context/ActionStatusContext';
 import { useAppStore } from '../store';
+import { buildHolidayMasterMap, validateForceAttendanceAgainstHolidays, validatePunchesAgainstHolidays } from '../lib/holidayValidation';
 
 export interface ManualAttendanceImportModalProps {
   isOpen: boolean;
@@ -32,7 +33,7 @@ interface ParsedAttendanceRow {
 }
 
 export function ManualAttendanceImportModal({ isOpen, onClose }: ManualAttendanceImportModalProps) {
-  const { employees, addForceAttendance, setPunches, recalculate } = useAppStore();
+  const { employees, settings, punches, shiftAssignments, addForceAttendance, setPunches, recalculate } = useAppStore();
   const { executeWithStatus } = useActionStatus();
   
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -185,6 +186,9 @@ export function ManualAttendanceImportModal({ isOpen, onClose }: ManualAttendanc
           const outTime = normalizeTimeStr(row['Out Time (HH:mm)'] ?? row['Out Time'] ?? row['OUT'] ?? row['Time Out'] ?? '');
           const remarks = String(row['Remarks'] ?? 'Manual Attendance Import').trim();
 
+          const holidayMap = buildHolidayMasterMap([], settings.holidays || []);
+          const matchedHoliday = holidayMap.get(dateStr);
+
           let validationStatus: 'VALID' | 'WARNING' | 'ERROR' = 'VALID';
           let validationMessage = 'Ready for import';
 
@@ -194,6 +198,26 @@ export function ManualAttendanceImportModal({ isOpen, onClose }: ManualAttendanc
           } else if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
             validationStatus = 'ERROR';
             validationMessage = `Invalid date "${rawDate}"`;
+          } else if (matchedHoliday) {
+            const holCheck = validateForceAttendanceAgainstHolidays({
+              record: {
+                employeeId: matchedEmp.id,
+                date: dateStr,
+                status: rawStatus || 'Present',
+                inTime,
+                outTime,
+              },
+              holidays: settings.holidays || [],
+              existingPunches: punches,
+              policy: settings.holidayPunchPolicy || 'prevent_overlaps',
+            });
+            if (!holCheck.allowed) {
+              validationStatus = 'ERROR';
+              validationMessage = holCheck.warning || `Blocked overlap on Public Holiday "${matchedHoliday.name}"`;
+            } else {
+              validationStatus = rawStatus.toLowerCase() === 'public holiday' ? 'VALID' : 'WARNING';
+              validationMessage = `Public Holiday (${matchedHoliday.name}) — validated non-overlapping`;
+            }
           } else if (rawStatus.toLowerCase() === 'present' && !inTime && !outTime) {
             validationStatus = 'WARNING';
             validationMessage = 'Present status without IN/OUT times. Will default to 09:00 - 18:00';
@@ -334,9 +358,26 @@ export function ManualAttendanceImportModal({ isOpen, onClose }: ManualAttendanc
           }
         }
 
+        let validatedSessionPunches = sessionPunchesToApply;
+        let blockedHolidayPunches = 0;
         if (sessionPunchesToApply.length > 0) {
-          updateProgress({ percent: 80, message: `Saving ${sessionPunchesToApply.length} punches to SQLite...` });
-          await setPunches(sessionPunchesToApply);
+          const holValidation = validatePunchesAgainstHolidays({
+            incomingPunches: sessionPunchesToApply,
+            existingPunches: punches,
+            holidays: settings.holidays || [],
+            employees,
+            shifts: settings.shifts,
+            shiftAssignments,
+            mergeMinutes: settings.duplicateMergeTime ?? 5,
+            policy: settings.holidayPunchPolicy || 'prevent_overlaps',
+          });
+          validatedSessionPunches = holValidation.acceptedPunches as typeof sessionPunchesToApply;
+          blockedHolidayPunches = holValidation.rejectedOverlaps.length;
+        }
+
+        if (validatedSessionPunches.length > 0) {
+          updateProgress({ percent: 80, message: `Saving ${validatedSessionPunches.length} validated punches to SQLite...` });
+          await setPunches(validatedSessionPunches);
         }
 
         updateProgress({ percent: 90, message: 'Triggering attendance recalculation...' });
@@ -352,7 +393,8 @@ export function ManualAttendanceImportModal({ isOpen, onClose }: ManualAttendanc
           dbPath: 'E:\\SHRM_HRIS\\Database.db',
           breakdown: {
             'Imported Entries': `${eligibleToImport.length} staff attendance records`,
-            'Punches Stored in SQLite': `${sessionPunchesToApply.length} entries`,
+            'Punches Stored in SQLite': `${validatedSessionPunches.length} entries`,
+            ...(blockedHolidayPunches > 0 ? { 'Holiday Overlaps Prevented': `${blockedHolidayPunches} duplicate/blocked punches` } : {}),
             'Linked Modules': 'Attendance, Monthly Muster, Overtime Audit, and Payroll'
           }
         };

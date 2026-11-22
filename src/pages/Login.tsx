@@ -1,472 +1,388 @@
-import React, { useState } from 'react';
-import { Shield, CheckCircle2, Mail, Lock, Key, Loader2, Info, Eye, EyeOff } from 'lucide-react';
-import { signInWithGoogle as googleSignInFn, emailSignIn, resetPassword } from '../lib/firebase';
-import { motion, AnimatePresence } from 'motion/react';
+import React, { useEffect, useState } from 'react';
+import { Shield, CheckCircle2, Mail, Lock, Loader2, Eye, EyeOff, KeyRound, AlertCircle } from 'lucide-react';
 import { toast } from 'sonner';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store';
+import { setInMemorySession } from '../lib/authSession';
 import { Button, Input } from '../components/ui';
 
-type LoginStep = 'credentials' | 'otp';
-
-const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
+type BootstrapStatus = {
+  setupRequired: boolean;
+  envOverrideActive: boolean;
+  hasOwnerPassword: boolean;
+  ownerHint?: string;
+};
 
 export function Login() {
-  const { setIsOtpVerified, setUser, setIsAdmin, setCurrentUserProfile, refreshCurrentUserProfile } = useAppStore();
-  const [step, setStep] = useState<LoginStep>('credentials');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [showPassword, setShowPassword] = useState(false);
-  const [otp, setOtp] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
+  const { setIsOtpVerified, setUser, setIsAdmin, setCurrentUserProfile } = useAppStore();
   const navigate = useNavigate();
 
-  const isUserAdmin = (emailAddress: string) => {
-    return ADMIN_EMAILS.some(adminEmail => emailAddress.toLowerCase() === adminEmail.toLowerCase());
-  };
+  const [mode, setMode] = useState<'login' | 'setup'>('login');
+  const [bootstrapStatus, setBootstrapStatus] = useState<BootstrapStatus | null>(null);
 
-  const handleInstantBypass = async (targetEmail = email || 'hr.sandiprajak466@gmail.com') => {
-    const cleanInput = String(targetEmail || 'hr.sandiprajak466@gmail.com').trim().toLowerCase();
-    const activeEmail = cleanInput.includes('@') ? cleanInput : 'hr.sandiprajak466@gmail.com';
-    const mockUser = {
-      uid: 'local_admin_' + Date.now(),
-      email: activeEmail,
-      displayName: activeEmail.split('@')[0] || 'Admin User',
-      role: isUserAdmin(activeEmail) ? 'Super Admin' : undefined
+  const [identifier, setIdentifier] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    fetch('/api/auth/bootstrap-status')
+      .then(res => (res.ok ? res.json() : null))
+      .then((data: BootstrapStatus | null) => {
+        if (!mounted || !data) return;
+        setBootstrapStatus(data);
+        if (data.setupRequired) {
+          setMode('setup');
+        }
+      })
+      .catch(() => {
+        // Ignore transient status fetch issues; user can still attempt login
+      });
+    return () => {
+      mounted = false;
     };
-    sessionStorage.setItem('local_session_user', JSON.stringify(mockUser));
-    sessionStorage.setItem('is_otp_verified', 'true');
-    setUser(mockUser);
-    setIsAdmin(isUserAdmin(activeEmail));
+  }, []);
+
+  const completeSignIn = (userPayload: any, sessionToken: string) => {
+    setInMemorySession(sessionToken, userPayload);
+    const sessionUser = {
+      uid: userPayload.id,
+      email: userPayload.email,
+      displayName: userPayload.username,
+      role: userPayload.role
+    };
+    setCurrentUserProfile(userPayload);
+    setIsAdmin(userPayload.role === 'Super Admin');
     setIsOtpVerified(true);
-    await refreshCurrentUserProfile(activeEmail).catch(() => {});
-    toast.success('Signed in successfully (Local Access)');
+    setUser(sessionUser);
+    toast.success(`Signed in as ${userPayload.username} (${userPayload.role})`);
     navigate('/', { replace: true });
   };
 
-  const handleForgotPassword = async () => {
-    const target = email.trim();
-    if (!target) {
-      toast.info('Enter your Work Email or Login ID above, then click Forgot?.');
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMsg(null);
+    const cleanId = identifier.trim();
+    if (!cleanId || !password) {
+      setErrorMsg('Enter your provisioned Work Email / Login ID and Password.');
       return;
     }
-    if (!target.includes('@')) {
-      toast.info('Local user passwords can be reset by your Super Admin in User & Role Config.');
-      return;
-    }
+
+    setIsLoading(true);
     try {
-      await resetPassword(target);
-      toast.success(`Password reset link sent to ${target}`);
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: cleanId, password })
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data?.success && data?.user && data?.sessionToken) {
+        completeSignIn(data.user, data.sessionToken);
+        return;
+      }
+
+      if (data?.setupRequired) {
+        setBootstrapStatus(prev => ({
+          setupRequired: true,
+          envOverrideActive: Boolean(prev?.envOverrideActive),
+          hasOwnerPassword: false,
+          ownerHint: prev?.ownerHint
+        }));
+        setMode('setup');
+        setConfirmPassword('');
+      }
+
+      const message = data?.error || 'Access Denied: Invalid credentials or unauthorized account.';
+      setErrorMsg(message);
+      toast.error(message);
     } catch {
-      toast.info('For local SQLite accounts, ask your Super Admin to reset your password in User & Role Config.');
-    }
-  };
-
-  const handleGoogleLogin = async () => {
-    setIsLoading(true);
-    setUnauthorizedDomain(null);
-    try {
-      const result = await googleSignInFn();
-      if (result) {
-        sessionStorage.removeItem('local_session_user');
-        setUser(result.user);
-        if (isUserAdmin(result.user.email || '')) {
-          sessionStorage.setItem('is_otp_verified', 'true');
-          setIsAdmin(true);
-          setIsOtpVerified(true);
-          await refreshCurrentUserProfile(result.user.email || '').catch(() => {});
-          toast.success('Admin access granted');
-          navigate('/', { replace: true });
-          return;
-        }
-        await sendOtp(result.user.email!);
-      }
-    } catch (error: any) {
-      console.error("Login failed:", error);
-      if (error.code === 'auth/unauthorized-domain' || String(error?.message).includes('unauthorized-domain')) {
-        const domain = window.location.hostname;
-        setUnauthorizedDomain(domain);
-        toast.error(`Domain '${domain}' is not authorized in Firebase Console. You can use Instant Access below.`, {
-          duration: 8000
-        });
-      } else if (error.code === 'auth/network-request-failed') {
-        toast.error('Network error. Check connection and Firebase authorization.', {
-          duration: 5000,
-        });
-      } else {
-        toast.error(error.message || "Google Sign-In failed");
-      }
+      const message = 'Unable to reach authentication service. Verify server connectivity.';
+      setErrorMsg(message);
+      toast.error(message);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleCredentialsLogin = async (e: React.FormEvent) => {
+  const handleOwnerSetupSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanIdentifier = email.trim();
-    if (!cleanIdentifier || !password) {
-      toast.error('Please enter your Work Email / Login ID and Password.');
+    setErrorMsg(null);
+    const cleanEmail = identifier.trim().toLowerCase();
+    if (!cleanEmail) {
+      setErrorMsg('Enter the company owner email address.');
+      return;
+    }
+    if (password.length < 6) {
+      setErrorMsg('Owner password must be at least 6 characters long.');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setErrorMsg('Passwords do not match.');
       return;
     }
 
     setIsLoading(true);
-    setUnauthorizedDomain(null);
     try {
-      // 1. Check Super-Admin-provisioned local SQLite RBAC user accounts first
-      const localRes = await fetch('/api/auth/local-login', {
+      const res = await fetch('/api/auth/setup-admin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleanIdentifier, password })
+        body: JSON.stringify({ email: cleanEmail, password })
       });
-      const localData = await localRes.json().catch(() => ({}));
+      const data = await res.json().catch(() => ({}));
 
-      if (localRes.ok && localData?.success && localData?.user) {
-        const u = localData.user;
-        const sessionUser = {
-          uid: u.id,
-          email: u.email,
-          displayName: u.username,
-          role: u.role
-        };
-        sessionStorage.setItem('local_session_user', JSON.stringify(sessionUser));
-        sessionStorage.setItem('is_otp_verified', 'true');
-        setUser(sessionUser);
-        setCurrentUserProfile(u);
-        setIsAdmin(u.role === 'Super Admin');
-        setIsOtpVerified(true);
-        toast.success(`Signed in as ${u.username} (${u.role})`);
-        navigate('/', { replace: true });
+      if (res.ok && data?.success && data?.user && data?.sessionToken) {
+        toast.success('Owner password configured and locked.');
+        completeSignIn(data.user, data.sessionToken);
         return;
       }
 
-      if (localRes.status === 403 || (localRes.status === 401 && !localData?.noLocalPassword)) {
-        toast.error(localData?.error || 'Invalid credentials or suspended account');
-        return;
-      }
-
-      if (!cleanIdentifier.includes('@')) {
-        toast.error(localData?.error || 'User ID not found in local user directory.');
-        return;
-      }
-
-      // 2. Fallback to Firebase Auth for cloud-registered email accounts
-      const signedInUser = await emailSignIn(cleanIdentifier, password);
-      if (signedInUser) {
-        sessionStorage.removeItem('local_session_user');
-        setUser(signedInUser);
-      }
-      if (isUserAdmin(cleanIdentifier)) {
-        sessionStorage.setItem('is_otp_verified', 'true');
-        setIsAdmin(true);
-        setIsOtpVerified(true);
-        await refreshCurrentUserProfile(cleanIdentifier).catch(() => {});
-        toast.success('Admin access granted');
-        navigate('/', { replace: true });
-        return;
-      }
-      await sendOtp(cleanIdentifier);
-    } catch (error: any) {
-      console.error("Login failed:", error);
-      if (error.code === 'auth/unauthorized-domain' || String(error?.message).includes('unauthorized-domain')) {
-        const domain = window.location.hostname;
-        setUnauthorizedDomain(domain);
-        if (isUserAdmin(cleanIdentifier)) {
-          toast.info(`Authorized domain notice for ${domain}. Logging in with Local Admin Access...`);
-          await handleInstantBypass(cleanIdentifier);
-          return;
-        }
-        toast.error(`Domain '${domain}' is not authorized in Firebase Auth. Use your local user credentials or contact Super Admin.`);
-      } else if (error.code === 'auth/operation-not-allowed') {
-        toast.error('Email login not enabled in Firebase.');
-      } else {
-        toast.error(error.message || "Invalid credentials");
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const sendOtp = async (targetEmail: string) => {
-    try {
-      const response = await fetch('/api/auth/send-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: targetEmail }),
-      });
-      const data = await response.json();
-      if (response.ok) {
-        setEmail(targetEmail);
-        setStep('otp');
-        toast.success('Verification code sent');
-        if (data.debugOtp) {
-          console.log(`[DEBUG] OTP: ${data.debugOtp}`);
-          toast.info(`Debug OTP (Console): ${data.debugOtp}`);
-        }
-      } else {
-        throw new Error(data.error);
-      }
-    } catch (error: any) {
-      toast.error(error.message || 'Failed to send OTP');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleVerifyOtp = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsLoading(true);
-    try {
-      const response = await fetch('/api/auth/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, code: otp }),
-      });
-      if (response.ok) {
-        sessionStorage.setItem('is_otp_verified', 'true');
-        setIsOtpVerified(true);
-        await refreshCurrentUserProfile(email).catch(() => {});
-        toast.success('Access granted');
-        navigate('/', { replace: true });
-      } else {
-        const data = await response.json();
-        throw new Error(data.error);
-      }
-    } catch (error: any) {
-      toast.error(error.message || 'Invalid code');
+      const message = data?.error || 'Owner setup failed.';
+      setErrorMsg(message);
+      toast.error(message);
+    } catch {
+      const message = 'Unable to reach server during owner setup.';
+      setErrorMsg(message);
+      toast.error(message);
     } finally {
       setIsLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col items-center justify-center p-6">
-      <div className="max-w-4xl w-full grid grid-cols-1 md:grid-cols-2 bg-white dark:bg-slate-900 rounded-2xl shadow-2xl overflow-hidden border border-slate-100 dark:border-slate-800">
-        
-        {/* Left Side: Professional Branding */}
-        <div className="hidden md:flex flex-col justify-between p-12 bg-primary text-white relative overflow-hidden">
-          <div className="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
-            <div className="absolute top-[-20%] left-[-20%] w-[80%] h-[80%] bg-white rounded-full blur-[100px]" />
-          </div>
-          
-          <div className="relative z-10 space-y-8">
-            <div className="flex items-center gap-2">
-              <Shield size={24} className="text-white" />
-              <span className="text-lg font-bold tracking-tight uppercase">Workforce One</span>
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-4 sm:p-6">
+      <div className="max-w-4xl w-full grid grid-cols-1 md:grid-cols-2 bg-white dark:bg-slate-900 rounded-2xl shadow-xl overflow-hidden border border-slate-200 dark:border-slate-800">
+        {/* Left Side: Enterprise Branding */}
+        <div className="hidden md:flex flex-col justify-between p-10 lg:p-12 bg-slate-900 text-white border-r border-slate-800">
+          <div className="space-y-8">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-lg bg-primary flex items-center justify-center">
+                <Shield size={18} className="text-white" />
+              </div>
+              <div>
+                <span className="text-sm font-bold tracking-tight uppercase block">Contractor HRIS</span>
+                <span className="text-[11px] text-slate-400">Company Network Portal</span>
+              </div>
             </div>
-            
-            <div className="space-y-4">
-              <h2 className="text-3xl font-bold leading-tight tracking-tight">
-                Enterprise Workforce <br /> Management.
-              </h2>
-              <p className="text-primary-foreground/80 text-base leading-relaxed">
-                Streamline operations with precision attendance tracking and automated workforce insights.
+
+            <div className="space-y-3">
+              <h1 className="text-2xl lg:text-3xl font-bold leading-tight tracking-tight text-white">
+                Enterprise Workforce &amp; Biometric Attendance
+              </h1>
+              <p className="text-slate-300 text-sm leading-relaxed">
+                Authorized company access only. Attendance logs, ZKTeco hardware sync, overtime approvals, and payroll run directly on your local server.
               </p>
             </div>
 
-            <div className="space-y-4 pt-4">
+            <div className="space-y-3 pt-2">
               {[
-                "Real-time attendance processing",
-                "Automated overtime validation",
-                "Shift management & visualization",
-                "Advanced audit trails"
+                'Role-scoped department & section visibility',
+                'Automated ZKTeco biometric punch sync',
+                'Public holiday validation & ISO reporting',
+                'Signed company network sessions'
               ].map((feature, i) => (
-                <div key={i} className="flex items-center gap-3 text-sm font-medium">
-                  <CheckCircle2 size={16} className="text-primary-foreground/60" />
-                  {feature}
+                <div key={i} className="flex items-center gap-2.5 text-sm text-slate-200">
+                  <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+                  <span>{feature}</span>
                 </div>
               ))}
             </div>
           </div>
 
-          <div className="relative z-10 pt-8 border-t border-white/10 flex items-center justify-between">
-             <div className="flex -space-x-2">
-               {[1,2,3,4].map(i => (
-                 <div key={i} className="w-8 h-8 rounded-full border-2 border-primary bg-slate-200 overflow-hidden">
-                   <img src={`https://api.dicebear.com/7.x/avataaars/svg?seed=user${i}`} alt="user" />
-                 </div>
-               ))}
-             </div>
-             <p className="text-[10px] font-bold uppercase tracking-widest text-primary-foreground/60">Trusted Infrastructure</p>
+          <div className="pt-6 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
+            <span>Provisioned Accounts Only</span>
+            <span>SQLite Local Core</span>
           </div>
         </div>
 
-        {/* Right Side: Auth Forms */}
-        <div className="p-8 md:p-12 flex flex-col justify-center bg-white dark:bg-slate-900">
-          <AnimatePresence mode="wait">
-            {step === 'credentials' ? (
-              <motion.div 
-                key="credentials"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="max-w-sm mx-auto w-full space-y-8"
-              >
-                <div className="space-y-2">
-                  <h3 className="text-2xl font-bold text-slate-900 dark:text-white">Sign In</h3>
-                  <p className="text-slate-500 dark:text-slate-400 text-sm font-medium">Access your enterprise portal</p>
+        {/* Right Side: Sign In or First-Time Owner Setup */}
+        <div className="p-8 md:p-10 lg:p-12 flex flex-col justify-center bg-white dark:bg-slate-900">
+          <div className="max-w-sm mx-auto w-full space-y-6">
+            <div className="space-y-1.5">
+              <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
+                {mode === 'setup' ? 'First-Time Owner Setup' : 'Sign In'}
+              </h2>
+              <p className="text-slate-500 dark:text-slate-400 text-sm">
+                {mode === 'setup'
+                  ? 'Set the permanent Super Admin password to lock system access.'
+                  : 'Enter your provisioned Work Email or Login ID and Password.'}
+              </p>
+            </div>
+
+            {bootstrapStatus?.setupRequired && (
+              <div className="p-3 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-800 rounded-lg text-xs text-indigo-900 dark:text-indigo-200 flex items-start gap-2">
+                <KeyRound size={15} className="shrink-0 mt-0.5 text-indigo-600 dark:text-indigo-400" />
+                <div>
+                  <span className="font-semibold block">Owner Password Not Set Yet</span>
+                  <span className="text-indigo-700 dark:text-indigo-300">
+                    Claim owner access once ({bootstrapStatus.ownerHint || 'owner account'}). Setup locks automatically once saved.
+                  </span>
                 </div>
+              </div>
+            )}
 
-                <form onSubmit={handleCredentialsLogin} className="space-y-5">
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Work Email or Login ID</label>
-                    <div className="relative">
-                      <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                      <Input 
-                        type="text"
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        className="pl-10 h-11"
-                        placeholder="email@company.com or login ID"
-                        required
-                      />
-                    </div>
-                  </div>
+            {errorMsg && (
+              <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg text-xs text-rose-800 dark:text-rose-200 flex items-start gap-2">
+                <AlertCircle size={15} className="shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
 
-                  <div className="space-y-2">
-                    <div className="flex justify-between items-center px-1">
-                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Password</label>
-                      <button type="button" onClick={handleForgotPassword} className="text-[10px] font-bold text-primary hover:underline uppercase">Forgot?</button>
-                    </div>
-                    <div className="relative">
-                      <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
-                      <Input 
-                        type={showPassword ? 'text' : 'password'}
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        className="pl-10 pr-10 h-11"
-                        placeholder="••••••••"
-                        required
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowPassword(prev => !prev)}
-                        aria-label={showPassword ? 'Hide password' : 'Show password'}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
-                      >
-                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
-
-                  <Button 
-                    type="submit"
-                    disabled={isLoading}
-                    className="w-full h-11 text-sm font-bold shadow-lg shadow-primary/10"
-                  >
-                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Continue'}
-                  </Button>
-                </form>
-
-                <div className="relative flex items-center py-2">
-                  <div className="flex-grow border-t border-slate-100 dark:border-slate-800"></div>
-                  <span className="flex-shrink mx-4 text-[10px] font-bold text-slate-300 dark:text-slate-600 uppercase tracking-widest">Enterprise Access</span>
-                  <div className="flex-grow border-t border-slate-100 dark:border-slate-800"></div>
-                </div>
-
-                <Button 
-                  variant="outline"
-                  onClick={handleGoogleLogin}
-                  disabled={isLoading}
-                  className="w-full h-11 gap-3 dark:bg-slate-800/50"
-                >
-                  <img src="https://www.google.com/favicon.ico" className="w-4 h-4" alt="Google" />
-                  Continue with Google
-                </Button>
-
-                <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-2">
-                  <Button
-                    type="button"
-                    onClick={() => handleInstantBypass(email || 'hr.sandiprajak466@gmail.com')}
-                    className="w-full h-10 text-xs font-bold bg-slate-900 hover:bg-slate-800 text-white dark:bg-slate-800 dark:hover:bg-slate-700"
-                  >
-                    <Shield size={14} className="mr-2 text-indigo-400" />
-                    Instant Admin Access
-                  </Button>
-                </div>
-
-                {unauthorizedDomain && (
-                  <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-xl text-xs space-y-2">
-                    <p className="font-bold text-amber-800 dark:text-amber-300 flex items-center gap-1.5">
-                      <Info size={14} /> Firebase Authorized Domain Notice
-                    </p>
-                    <p className="text-amber-700 dark:text-amber-400 leading-relaxed text-[11px]">
-                      The domain <code className="font-mono bg-amber-100 dark:bg-amber-900/60 px-1 py-0.5 rounded text-slate-900 dark:text-amber-100">{unauthorizedDomain}</code> needs to be added in <strong>Firebase Console &gt; Authentication &gt; Settings &gt; Authorized domains</strong> for full OAuth popups.
-                    </p>
-                  </div>
-                )}
-
-                <div className="text-center pt-2">
-                  <p className="text-xs font-medium text-slate-500">
-                    No account? <Link to="/signup" className="text-primary font-bold hover:underline">Register your organization</Link>
-                  </p>
-                </div>
-              </motion.div>
-            ) : (
-              <motion.div 
-                key="otp"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="max-w-sm mx-auto w-full space-y-8"
-              >
-                <div className="space-y-4 text-center">
-                  <div className="w-12 h-12 bg-primary/5 rounded-xl flex items-center justify-center mx-auto">
-                    <Key className="w-6 h-6 text-primary" />
-                  </div>
-                  <div className="space-y-2">
-                    <h3 className="text-2xl font-bold text-slate-900 dark:text-white">Verify Account</h3>
-                    <p className="text-slate-500 text-sm font-medium">Enter the security code sent to <br /><span className="text-slate-900 dark:text-white font-bold">{email}</span></p>
-                  </div>
-                </div>
-
-                <form onSubmit={handleVerifyOtp} className="space-y-6">
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest text-center block mb-4">6-Digit Verification Code</label>
-                    <input 
-                      type="text"
-                      maxLength={6}
-                      value={otp}
-                      onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
-                      className="w-full px-4 py-4 bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 rounded-xl text-2xl font-bold text-center tracking-[0.4em] focus:ring-2 focus:ring-primary outline-none transition-all dark:text-white"
-                      placeholder="000000"
+            {mode === 'setup' ? (
+              <form onSubmit={handleOwnerSetupSubmit} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+                    Owner Email
+                  </label>
+                  <div className="relative">
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <Input
+                      type="email"
+                      value={identifier}
+                      onChange={e => setIdentifier(e.target.value)}
+                      className="pl-10 h-10"
+                      placeholder="owner@company.com"
+                      autoComplete="username"
                       required
                     />
                   </div>
+                </div>
 
-                  <Button 
-                    type="submit"
-                    disabled={isLoading || otp.length !== 6}
-                    className="w-full h-11 text-sm font-bold"
-                  >
-                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Verify Access'}
-                  </Button>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+                    Create Owner Password
+                  </label>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <Input
+                      type={showPassword ? 'text' : 'password'}
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
+                      className="pl-10 pr-10 h-10"
+                      placeholder="Minimum 6 characters"
+                      autoComplete="new-password"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(prev => !prev)}
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
 
-                  <Button 
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+                    Confirm Password
+                  </label>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <Input
+                      type={showPassword ? 'text' : 'password'}
+                      value={confirmPassword}
+                      onChange={e => setConfirmPassword(e.target.value)}
+                      className="pl-10 h-10"
+                      placeholder="Re-enter password"
+                      autoComplete="new-password"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <Button type="submit" disabled={isLoading} className="w-full h-10 text-sm font-semibold">
+                  {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Save Owner Password & Enter'}
+                </Button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode('login');
+                    setErrorMsg(null);
+                  }}
+                  className="w-full text-xs font-medium text-slate-500 hover:text-slate-900 dark:hover:text-white transition-colors py-1"
+                >
+                  Already configured? Return to Sign In
+                </button>
+              </form>
+            ) : (
+              <form onSubmit={handleLoginSubmit} className="space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+                    Work Email or Login ID
+                  </label>
+                  <div className="relative">
+                    <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <Input
+                      type="text"
+                      value={identifier}
+                      onChange={e => setIdentifier(e.target.value)}
+                      className="pl-10 h-10"
+                      placeholder="email@company.com or user ID"
+                      autoComplete="username"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-slate-700 dark:text-slate-300 block">
+                    Password
+                  </label>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <Input
+                      type={showPassword ? 'text' : 'password'}
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
+                      className="pl-10 pr-10 h-10"
+                      placeholder="Enter password"
+                      autoComplete="current-password"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(prev => !prev)}
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <Button type="submit" disabled={isLoading} className="w-full h-10 text-sm font-semibold">
+                  {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Sign In'}
+                </Button>
+
+                {bootstrapStatus?.setupRequired && (
+                  <button
                     type="button"
-                    variant="ghost"
-                    onClick={() => setStep('credentials')}
-                    className="w-full text-xs font-bold text-slate-400"
+                    onClick={() => {
+                      setMode('setup');
+                      setErrorMsg(null);
+                    }}
+                    className="w-full text-xs font-medium text-primary hover:underline py-1"
                   >
-                    Return to login
-                  </Button>
-                </form>
-              </motion.div>
+                    First-time owner setup required? Set password now
+                  </button>
+                )}
+              </form>
             )}
-          </AnimatePresence>
 
-          <div className="pt-8 mt-12 border-t border-slate-100 dark:border-slate-800">
-            <div className="flex flex-col items-center gap-3 text-center">
-              <div className="flex items-center gap-1.5">
-                <Shield size={10} className="text-primary" />
-                <span className="text-[9px] font-bold text-slate-400 uppercase tracking-[0.2em]">Restricted Access Area</span>
-              </div>
-              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-100 dark:border-slate-800 w-full">
-                <p className="text-[9px] font-bold text-slate-400 uppercase tracking-wider mb-1 text-center">Authorized Administrators</p>
-                <p className="text-[9px] text-primary font-bold break-all">
-                  {ADMIN_EMAILS.join(' • ')}
-                </p>
-              </div>
+            <div className="pt-5 border-t border-slate-200 dark:border-slate-800 text-center space-y-1">
+              <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex items-center justify-center gap-1.5">
+                <Shield size={12} className="text-slate-400" />
+                Restricted Company Portal
+              </p>
+              <p className="text-[11px] text-slate-400 dark:text-slate-500">
+                Access is restricted to provisioned accounts. Unlisted users are denied. Contact your System Administrator for credentials.
+              </p>
             </div>
           </div>
         </div>
@@ -474,4 +390,5 @@ export function Login() {
     </div>
   );
 }
+
 

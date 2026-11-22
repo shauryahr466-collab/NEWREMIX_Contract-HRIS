@@ -2,11 +2,10 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
-import net from 'net';
+import zlib from 'zlib';
 import dotenv from 'dotenv';
-import nodemailer from 'nodemailer';
 import { localRouter } from './src/server/localApi.js';
-import { getSqliteDb, saveSqliteDb, getSqliteDbPath, withSqliteWriteLock } from './src/server/sqliteDb.js';
+import { getSqliteDb, getSqliteDbPath } from './src/server/sqliteDb.js';
 import {
   zkPollingState,
   getZkPollingSummaryFromSqlite,
@@ -15,180 +14,248 @@ import {
   ingestZkPunchesToSqlite,
   reconcileSystemDataInSqlite,
   testAndStoreZkDeviceConnection,
+  probeAllZkDevicesHealth,
+  replaceWithVerifiedZkFleetInSqlite,
+  readStoredPunchesFromSqlite,
   parseAdmsAttlogText,
   normalizeZkDateTime,
   recordAdmsDeviceHeartbeat,
-  scanWatchFolderAndIngestToSqlite
+  scanWatchFolderAndIngestToSqlite,
+  loadZkSchedulerConfigFromSqlite,
+  saveZkSchedulerConfigToSqlite,
+  detectExternalPunchChangesReadOnly,
+  setZkCollectorMode
 } from './src/server/zkPoller.js';
+import { registerSseClient, broadcastSseEvent } from './src/server/realtimeHub.js';
 import { discoverZkDevicesOnSubnet } from './src/server/zkProtocol.js';
 import {
   authenticateLocalUser,
+  claimOwnerAdminPassword,
   createOrUpdateSystemUser,
   deleteSystemUser,
+  getOwnerBootstrapStatus,
   getSystemScopeOptions,
   isBootstrapSuperAdminEmail,
   listSystemUsers,
-  resolveSessionProfile
+  resolveSessionProfile,
+  updateUserPassword
 } from './src/server/userAccess.js';
+import {
+  extractBearerToken,
+  signSessionToken,
+  verifySessionToken
+} from './src/server/authSession.js';
+import {
+  generateSqliteHolidayValidationReport,
+  reconcileHolidaysAndPreventOverlapsInSqlite,
+  syncHolidaysMasterTableWithLock,
+  validateIncomingPunchesAgainstDb,
+} from './src/server/holidayValidationService.js';
 
 dotenv.config();
 
-const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
-
-// In-memory store for OTPs (in production, use Redis or a database)
-const otpStore = new Map<string, { code: string; expires: number }>();
-
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
+
+  // Respect Caddy / reverse proxy headers (X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host)
+  app.set('trust proxy', true);
+  app.disable('x-powered-by');
+
+  // Lightweight gzip compression for JSON & text payloads over LAN / Caddy
+  app.use((req, res, next) => {
+    const acceptEncoding = String(req.headers['accept-encoding'] || '');
+    if (!acceptEncoding.includes('gzip')) {
+      return next();
+    }
+    const origJson = res.json.bind(res);
+    res.json = (body: any) => {
+      try {
+        const jsonStr = JSON.stringify(body);
+        if (jsonStr.length < 1024) {
+          return origJson(body);
+        }
+        const gz = zlib.gzipSync(Buffer.from(jsonStr, 'utf8'));
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Vary', 'Accept-Encoding');
+        return res.send(gz);
+      } catch {
+        return origJson(body);
+      }
+    };
+    next();
+  });
 
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-  // Health Check Endpoint
-  app.get('/api/health', (req, res) => {
+  // Health Check Endpoint (Used by Caddy active health checks)
+  app.get('/api/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.status(200).json({ status: 'ok', database: 'SQLite', dbPath: getSqliteDbPath() });
   });
 
-  // Mount Local SQLite & Disk Storage API Router
-  app.use('/api/local', localRouter);
-  app.use('/api/payroll', localRouter);
-
-  // OTP Endpoints
-  app.post('/api/auth/send-otp', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email is required' });
-
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = Date.now() + 10 * 60 * 1000; // 10 minutes
-    otpStore.set(email, { code, expires });
-
-    console.log(`[AUTH] OTP for ${email}: ${code}`);
-
-    const smtpHost = process.env.SMTP_HOST;
-    const smtpPort = parseInt(process.env.SMTP_PORT || '587');
-    const smtpUser = process.env.SMTP_USER;
-    const smtpPass = process.env.SMTP_PASS;
-
-    if (smtpHost && smtpUser && smtpPass && smtpPass !== 'your-app-password') {
-      try {
-        const transporter = nodemailer.createTransport({
-          host: smtpHost,
-          port: smtpPort,
-          secure: smtpPort === 465,
-          auth: { user: smtpUser, pass: smtpPass },
-        });
-
-        await transporter.sendMail({
-          from: `"Attendance Pro" <${process.env.SMTP_FROM || smtpUser}>`,
-          to: email,
-          subject: 'Your Verification Code',
-          text: `Your verification code is: ${code}. It will expire in 10 minutes.`,
-          html: `<div style="font-family: sans-serif; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
-            <h2 style="color: #4f46e5;">Attendance Pro Verification</h2>
-            <p>Your 2-step verification code is:</p>
-            <div style="font-size: 32px; font-weight: bold; letter-spacing: 5px; color: #1e293b; padding: 10px 0;">${code}</div>
-            <p style="color: #64748b; font-size: 12px;">This code will expire in 10 minutes.</p>
-          </div>`,
-        });
-
-        return res.json({ message: 'OTP sent to email' });
-      } catch (error) {
-        console.error('Failed to send email:', error);
-      }
-    }
-
-    res.json({
-      message: 'OTP generated (Check console in dev mode)',
-      debugOtp: process.env.NODE_ENV !== 'production' ? code : undefined
-    });
-  });
-
-  app.post('/api/auth/verify-otp', (req, res) => {
-    const { email, code } = req.body;
-    const record = otpStore.get(email);
-
-    if (!record) {
-      return res.status(400).json({ error: 'No OTP found for this email' });
-    }
-
-    if (Date.now() > record.expires) {
-      otpStore.delete(email);
-      return res.status(400).json({ error: 'OTP has expired' });
-    }
-
-    if (record.code !== code) {
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
-
-    otpStore.delete(email);
-    res.json({ success: true });
-  });
-
-  // Local SQLite User Login & Session Profile Resolution
-  app.post('/api/auth/local-login', async (req, res) => {
+  // =========================================================================
+  // Strict Provisioned-Only Authentication & Session Middleware
+  // =========================================================================
+  app.get('/api/auth/bootstrap-status', async (_req, res) => {
     try {
-      const { email, username, password } = req.body || {};
-      const identifier = String(email || username || '').trim();
-      const result = await authenticateLocalUser(identifier, String(password || ''));
+      const status = await getOwnerBootstrapStatus();
+      return res.json(status);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message || 'Failed to read setup status' });
+    }
+  });
+
+  app.post('/api/auth/setup-admin', async (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      const result = await claimOwnerAdminPassword(String(email || ''), String(password || ''));
+      if ('error' in result) {
+        return res.status(result.statusCode).json({ success: false, error: result.error });
+      }
+      const sessionToken = signSessionToken(result.user);
+      return res.json({ success: true, user: result.user, sessionToken });
+    } catch (e: any) {
+      if (e?.message === 'ALREADY_CLAIMED') {
+        return res.status(403).json({ success: false, error: 'Owner password is already configured.' });
+      }
+      return res.status(500).json({ success: false, error: e.message || 'Owner setup failed' });
+    }
+  });
+
+  app.post(['/api/auth/login', '/api/auth/local-login'], async (req, res) => {
+    try {
+      const { email, username, identifier, password } = req.body || {};
+      const loginId = String(identifier || email || username || '').trim();
+      const result = await authenticateLocalUser(loginId, String(password || ''));
       if ('error' in result) {
         return res.status(result.statusCode).json({
           success: false,
           error: result.error,
-          noLocalPassword: Boolean(result.noLocalPassword)
+          setupRequired: Boolean(result.setupRequired)
         });
       }
-      return res.json({ success: true, user: result.user });
+      const sessionToken = signSessionToken(result.user);
+      return res.json({ success: true, user: result.user, sessionToken });
     } catch (e: any) {
       return res.status(500).json({ success: false, error: e.message || 'Authentication failed' });
     }
   });
 
-  app.get('/api/auth/session-profile', async (req, res) => {
+  app.post('/api/auth/logout', (_req, res) => {
+    return res.json({ success: true });
+  });
+
+  // Shared token verification helper
+  const authenticateRequest = async (req: express.Request) => {
+    const token = extractBearerToken(req.headers.authorization);
+    if (!token) return null;
+    const payload = verifySessionToken(token);
+    if (!payload) return null;
+
+    const liveProfile = await resolveSessionProfile(payload.email);
+    if (!liveProfile || liveProfile.status === 'Suspended') {
+      return null;
+    }
+    return liveProfile;
+  };
+
+  const requireAuth: express.RequestHandler = async (req, res, next) => {
     try {
-      const email = String(req.query.email || req.headers['x-hris-user-email'] || '').trim();
-      if (!email) return res.json({ user: null });
-      const profile = await resolveSessionProfile(email);
-      return res.json({ user: profile });
+      const profile = await authenticateRequest(req);
+      if (!profile) {
+        return res.status(401).json({ success: false, error: 'Authentication required. Please sign in.' });
+      }
+      (req as any).authUser = profile;
+      (req as any).callerEmail = profile.email;
+      return next();
+    } catch {
+      return res.status(401).json({ success: false, error: 'Invalid or expired session.' });
+    }
+  };
+
+  const requireSuperAdmin: express.RequestHandler = async (req, res, next) => {
+    try {
+      const profile = await authenticateRequest(req);
+      if (!profile) {
+        return res.status(401).json({ success: false, error: 'Authentication required. Please sign in.' });
+      }
+      const isSuper =
+        profile.status === 'Active' &&
+        (profile.role === 'Super Admin' || isBootstrapSuperAdminEmail(profile.email));
+      if (!isSuper) {
+        return res.status(403).json({
+          success: false,
+          error: 'Only Super Admin can perform administrative or user management actions.'
+        });
+      }
+      (req as any).authUser = profile;
+      (req as any).callerEmail = profile.email;
+      return next();
+    } catch {
+      return res.status(401).json({ success: false, error: 'Invalid or expired session.' });
+    }
+  };
+
+  app.get('/api/auth/me', requireAuth, async (req, res) => {
+    return res.json({ authenticated: true, user: (req as any).authUser });
+  });
+
+  app.get('/api/auth/session-profile', requireAuth, async (req, res) => {
+    return res.json({ user: (req as any).authUser });
+  });
+
+  app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+    try {
+      const authUser = (req as any).authUser;
+      const { currentPassword, newPassword } = req.body || {};
+      const result = await updateUserPassword(
+        authUser.email,
+        String(currentPassword || ''),
+        String(newPassword || '')
+      );
+      if ('error' in result) {
+        return res.status(result.statusCode).json({ success: false, error: result.error });
+      }
+      return res.json({ success: true, message: 'Password updated successfully.' });
     } catch (e: any) {
-      return res.status(500).json({ error: e.message || 'Failed to resolve profile' });
+      return res.status(500).json({ success: false, error: e.message || 'Password update failed' });
     }
   });
 
-  // Super Admin Guard Middleware (SQLite RBAC + JWT Email Compatible)
-  const verifySuperAdmin = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.split('Bearer ')[1];
-    let callerEmail = String(req.headers['x-hris-user-email'] || '').trim();
-
-    if (token && token !== 'undefined' && token !== 'null') {
-      try {
-        const parts = token.split('.');
-        if (parts.length === 3) {
-          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-          if (payload.email) callerEmail = String(payload.email).trim();
-        }
-      } catch {}
-    }
-
-    if (callerEmail) {
-      if (isBootstrapSuperAdminEmail(callerEmail) || ADMIN_EMAILS.some(e => e.toLowerCase() === callerEmail.toLowerCase())) {
-        (req as any).callerEmail = callerEmail;
-        return next();
+  // Authenticated Real-Time SSE Broadcast Endpoint (supports Header or ?token= for EventSource)
+  app.get('/api/events', async (req, res) => {
+    try {
+      const headerToken = extractBearerToken(req.headers.authorization);
+      const queryToken = typeof req.query.token === 'string' ? req.query.token.trim() : '';
+      const token = headerToken || queryToken;
+      if (!token) {
+        return res.status(401).json({ success: false, error: 'Authentication required for live updates.' });
       }
-      const profile = await resolveSessionProfile(callerEmail);
-      if (profile && profile.role === 'Super Admin' && profile.status === 'Active') {
-        (req as any).callerEmail = callerEmail;
-        return next();
+      const payload = verifySessionToken(token);
+      if (!payload) {
+        return res.status(401).json({ success: false, error: 'Invalid or expired session.' });
       }
-      return res.status(403).json({ error: 'Only Super Admin can create or modify system users and roles.' });
+      const liveProfile = await resolveSessionProfile(payload.email);
+      if (!liveProfile || liveProfile.status === 'Suspended') {
+        return res.status(401).json({ success: false, error: 'Session is suspended or unauthorized.' });
+      }
+      registerSseClient(liveProfile, res, req.ip || '');
+    } catch {
+      if (!res.headersSent) {
+        return res.status(401).json({ success: false, error: 'SSE authentication failed.' });
+      }
     }
+  });
 
-    return next();
-  };
+  // Mount Protected Local SQLite & Disk Storage API Router
+  app.use('/api/local', requireAuth, localRouter);
+  app.use('/api/payroll', requireAuth, localRouter);
 
-  // User Access & Role Management Routes (Backed 100% by SQLite)
-  app.get('/api/admin/scope-options', verifySuperAdmin, async (_req, res) => {
+  // User Access & Role Management Routes (Strictly Super Admin Only)
+  app.get('/api/admin/scope-options', requireSuperAdmin, async (_req, res) => {
     try {
       const options = await getSystemScopeOptions();
       return res.json(options);
@@ -197,10 +264,10 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/create-user', verifySuperAdmin, async (req, res) => {
+  app.post('/api/admin/create-user', requireSuperAdmin, async (req, res) => {
     try {
       const body = req.body || {};
-      const result = await createOrUpdateSystemUser({
+      const createdRes = await createOrUpdateSystemUser({
         id: body.id,
         username: body.username || body.displayName || '',
         email: body.email || '',
@@ -212,18 +279,25 @@ async function startServer() {
         linkedEmployeeId: body.linkedEmployeeId,
         permissions: body.permissions,
         notes: body.notes,
-        createdBy: (req as any).callerEmail || body.createdBy || 'Super Admin'
+        createdBy: (req as any).callerEmail || 'Super Admin'
       });
-      return res.json({ success: true, uid: result.user.id, user: result.user, created: result.created });
+      broadcastSseEvent('UserPermissionsUpdated', {
+        email: createdRes.user.email,
+        userId: createdRes.user.id,
+        role: createdRes.user.role,
+        status: createdRes.user.status,
+        updatedBy: (req as any).callerEmail || 'Super Admin'
+      });
+      return res.json({ success: true, uid: createdRes.user.id, user: createdRes.user, created: createdRes.created });
     } catch (error: any) {
       return res.status(400).json({ error: error.message || 'Failed to create user' });
     }
   });
 
-  app.put('/api/admin/users/:id', verifySuperAdmin, async (req, res) => {
+  app.put('/api/admin/users/:id', requireSuperAdmin, async (req, res) => {
     try {
       const body = req.body || {};
-      const result = await createOrUpdateSystemUser(
+      const updatedRes = await createOrUpdateSystemUser(
         {
           id: req.params.id,
           username: body.username || body.displayName || '',
@@ -236,26 +310,38 @@ async function startServer() {
           linkedEmployeeId: body.linkedEmployeeId,
           permissions: body.permissions,
           notes: body.notes,
-          createdBy: (req as any).callerEmail || body.createdBy || 'Super Admin'
+          createdBy: (req as any).callerEmail || 'Super Admin'
         },
         req.params.id
       );
-      return res.json({ success: true, user: result.user });
+      broadcastSseEvent('UserPermissionsUpdated', {
+        email: updatedRes.user.email,
+        userId: updatedRes.user.id,
+        role: updatedRes.user.role,
+        status: updatedRes.user.status,
+        updatedBy: (req as any).callerEmail || 'Super Admin'
+      });
+      return res.json({ success: true, user: updatedRes.user });
     } catch (error: any) {
       return res.status(400).json({ error: error.message || 'Failed to update user' });
     }
   });
 
-  app.delete('/api/admin/users/:id', verifySuperAdmin, async (req, res) => {
+  app.delete('/api/admin/users/:id', requireSuperAdmin, async (req, res) => {
     try {
       await deleteSystemUser(req.params.id, (req as any).callerEmail);
+      broadcastSseEvent('UserPermissionsUpdated', {
+        userId: req.params.id,
+        deleted: true,
+        updatedBy: (req as any).callerEmail || 'Super Admin'
+      });
       return res.json({ success: true });
     } catch (error: any) {
       return res.status(400).json({ error: error.message || 'Failed to delete user' });
     }
   });
 
-  app.get('/api/admin/users', verifySuperAdmin, async (_req, res) => {
+  app.get('/api/admin/users', requireSuperAdmin, async (_req, res) => {
     try {
       const users = await listSystemUsers();
       return res.json(users);
@@ -267,42 +353,92 @@ async function startServer() {
   // =========================================================================
   // ZKTeco System-Aligned Polling Engine & SQLite Storage Endpoints
   // =========================================================================
-  app.get('/api/zk/auto-poll/status', async (req, res) => {
+  const hasDeviceOrImportAccess = (user: any): boolean => {
+    if (!user || user.status === 'Suspended') return false;
+    if (user.role === 'Super Admin' || isBootstrapSuperAdminEmail(user.email)) return true;
+    return Boolean(user.permissions?.modules?.devices || user.permissions?.modules?.import);
+  };
+
+  const requireDeviceAccess: express.RequestHandler = (req, res, next) => {
+    const authUser = (req as any).authUser;
+    if (!hasDeviceOrImportAccess(authUser)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied. Biometric device operations require Device Setup or Import permission.'
+      });
+    }
+    return next();
+  };
+
+  app.get('/api/zk/auto-poll/status', requireAuth, async (req, res) => {
     try {
       const summary = await getZkPollingSummaryFromSqlite();
-      res.json(summary);
+      const authUser = (req as any).authUser;
+      const isSuper = authUser?.role === 'Super Admin' || isBootstrapSuperAdminEmail(authUser?.email);
+      if (!isSuper) {
+        const { dbPath: _dbp, watchFolderPath: _wfp, ...safeSummary } = summary as any;
+        return res.json({ ...safeSummary, dbPath: 'Database.db (Protected)' });
+      }
+      return res.json(summary);
     } catch (e: any) {
-      res.status(500).json({ error: e.message || 'Failed to load ZKT polling status' });
+      return res.status(500).json({ error: e.message || 'Failed to load ZKT polling status' });
     }
   });
 
-  app.post('/api/zk/auto-poll/toggle', async (req, res) => {
+  app.post('/api/zk/mode', requireSuperAdmin, async (req, res) => {
+    try {
+      const allowDirectWrite = Boolean(req.body?.allowDirectWrite);
+      const modeRes = setZkCollectorMode(allowDirectWrite);
+      const summary = await getZkPollingSummaryFromSqlite();
+      broadcastSseEvent('PunchSnapshotUpdated', {
+        action: 'collector_mode_changed',
+        readOnlyMode: modeRes.readOnlyMode,
+        punchMode: modeRes.mode,
+        timestamp: new Date().toISOString()
+      });
+      return res.json({ success: true, ...modeRes, summary });
+    } catch (e: any) {
+      return res.status(500).json({ success: false, error: e.message || 'Failed to switch ZKT collector mode' });
+    }
+  });
+
+  app.post('/api/zk/auto-poll/toggle', requireAuth, requireDeviceAccess, async (req, res) => {
     try {
       const { enabled, intervalMinutes, intervalSeconds } = req.body || {};
-      if (typeof enabled === 'boolean') {
-        zkPollingState.enabled = enabled;
+      let nextMinutes = zkPollingState.intervalMinutes;
+      if (typeof intervalMinutes === 'number' && Number.isFinite(intervalMinutes) && intervalMinutes >= 1) {
+        nextMinutes = Math.max(1, Math.min(1440, Math.round(intervalMinutes)));
+      } else if (typeof intervalSeconds === 'number' && Number.isFinite(intervalSeconds) && intervalSeconds >= 60) {
+        nextMinutes = Math.max(1, Math.min(1440, Math.round(intervalSeconds / 60)));
       }
-      if (typeof intervalMinutes === 'number' && intervalMinutes > 0) {
-        zkPollingState.intervalMinutes = intervalMinutes;
-        zkPollingState.intervalSeconds = intervalMinutes * 60;
-      }
-      if (typeof intervalSeconds === 'number' && intervalSeconds >= 15) {
-        zkPollingState.intervalSeconds = intervalSeconds;
-        zkPollingState.intervalMinutes = Math.max(1, Math.round(intervalSeconds / 60));
-      }
+
+      await saveZkSchedulerConfigToSqlite({
+        enabled: typeof enabled === 'boolean' ? enabled : zkPollingState.enabled,
+        intervalMinutes: nextMinutes
+      });
+
       const summary = await getZkPollingSummaryFromSqlite();
       res.json({ success: true, ...summary });
     } catch (e: any) {
-      res.status(500).json({ error: e.message || 'Failed to toggle ZKT polling' });
+      res.status(500).json({ error: e.message || 'Failed to update ZKT auto-fetch schedule' });
     }
   });
 
-  app.post(['/api/zk/auto-poll/run-now', '/api/zk/fetch-all'], async (req, res) => {
+  app.post(['/api/zk/auto-poll/run-now', '/api/zk/fetch-all'], requireAuth, requireDeviceAccess, async (req, res) => {
     try {
+      const forceDirectPoll = Boolean(req.body?.forceDirectPoll);
       const pollRes = await pollAllZkDevicesToSqlite({
         dueOnly: false,
+        forceDirectPoll,
         mode: req.body?.mode || 'Manual Batch Poll'
       });
+      if ('readOnlyMode' in pollRes && pollRes.readOnlyMode && pollRes.skippedDirectWrite) {
+        return res.json({
+          ...pollRes,
+          database: 'SQLite',
+          message: `Read-Only Collector Mode active: scanned SQLite snapshot (${pollRes.punchCount} total punches${pollRes.changed ? `, ${pollRes.delta} new detected` : ', up to date'}). External biometric collector owns raw punch writes.`
+        });
+      }
       res.json({
         ...pollRes,
         database: 'SQLite',
@@ -316,13 +452,26 @@ async function startServer() {
     }
   });
 
-  app.post('/api/zk/fetch-device', async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+  app.post('/api/zk/fetch-device', requireAuth, requireDeviceAccess, async (req, res) => {
     try {
-      const { deviceId, ip, mode } = req.body || {};
+      const { deviceId, ip, mode, forceDirectPoll } = req.body || {};
       const target = String(deviceId || ip || '').trim();
       if (!target) {
         return res.status(400).json({ success: false, error: 'deviceId or ip is required' });
+      }
+      if (zkPollingState.readOnlyMode && !forceDirectPoll) {
+        const obs = await detectExternalPunchChangesReadOnly();
+        return res.json({
+          success: true,
+          readOnlyMode: true,
+          skippedDirectWrite: true,
+          deviceId: target,
+          recordsRead: 0,
+          newRecords: obs.delta,
+          duplicates: 0,
+          punchCount: obs.punchCount,
+          message: `Read-Only Collector Mode active: observed ${obs.punchCount} SQLite punches without overwriting raw punch tables.`
+        });
       }
       const result = await pollSingleZkDeviceToSqlite(target, mode || 'Single Device Sync');
       return res.json({
@@ -335,7 +484,78 @@ async function startServer() {
     }
   });
 
-  app.post('/api/zk/reconcile-system', async (req, res) => {
+  // Direct LAN Link for fetching punches or observing SQLite punches
+  app.get('/api/zk/fetch-punch', requireAuth, requireDeviceAccess, async (req, res) => {
+    try {
+      const target = String(req.query.deviceId || req.query.ip || '').trim();
+      const mode = String(req.query.mode || 'Direct Fetch Punch Link').trim();
+      const forceDirectPoll = String(req.query.forceDirectPoll || '') === 'true';
+      if (zkPollingState.readOnlyMode && !forceDirectPoll) {
+        const obs = await detectExternalPunchChangesReadOnly();
+        const stored = await readStoredPunchesFromSqlite({ deviceId: target || undefined, limit: 25 });
+        return res.json({
+          success: true,
+          readOnlyMode: true,
+          skippedDirectWrite: true,
+          database: 'SQLite',
+          storedInSqlite: target ? stored.totalMatched : stored.totalAll,
+          latestStoredPunches: stored.punches,
+          ...obs
+        });
+      }
+      if (target) {
+        const result = await pollSingleZkDeviceToSqlite(target, mode);
+        const stored = await readStoredPunchesFromSqlite({ deviceId: result.deviceId || target, limit: 25 });
+        return res.json({
+          ...result,
+          database: 'SQLite',
+          dbPath: getSqliteDbPath(),
+          storedInSqlite: stored.totalMatched,
+          latestStoredPunches: stored.punches
+        });
+      }
+      const pollRes = await pollAllZkDevicesToSqlite({ dueOnly: false, forceDirectPoll, mode });
+      const stored = await readStoredPunchesFromSqlite({ limit: 25 });
+      return res.json({
+        ...pollRes,
+        database: 'SQLite',
+        dbPath: getSqliteDbPath(),
+        storedInSqlite: stored.totalAll,
+        latestStoredPunches: stored.punches
+      });
+    } catch (e: any) {
+      return res.status(500).json({ success: false, error: e.message || 'Fetch punch failed' });
+    }
+  });
+
+  // Direct LAN Link for reading stored punches directly from SQLite (authenticated + role-scoped)
+  app.get('/api/zk/read-sqlite', requireAuth, async (req, res) => {
+    try {
+      const deviceId = req.query.deviceId ? String(req.query.deviceId).trim() : undefined;
+      const limit = req.query.limit ? Number(req.query.limit) : 100;
+      const data = await readStoredPunchesFromSqlite({ deviceId, limit });
+      const authUser = (req as any).authUser;
+      const isSuper = authUser?.role === 'Super Admin' || isBootstrapSuperAdminEmail(authUser?.email);
+      if (!isSuper) {
+        const { dbPath: _dbp, ...safeData } = data as any;
+        return res.json(safeData);
+      }
+      return res.json(data);
+    } catch (e: any) {
+      return res.status(500).json({ success: false, error: e.message || 'SQLite read failed' });
+    }
+  });
+
+  app.post('/api/zk/devices/replace-fleet', requireSuperAdmin, async (_req, res) => {
+    try {
+      const result = await replaceWithVerifiedZkFleetInSqlite();
+      return res.json(result);
+    } catch (e: any) {
+      return res.status(500).json({ success: false, error: e.message || 'Fleet replacement failed' });
+    }
+  });
+
+  app.post('/api/zk/reconcile-system', requireAuth, async (_req, res) => {
     try {
       const recon = await reconcileSystemDataInSqlite();
       res.json({
@@ -349,10 +569,7 @@ async function startServer() {
     }
   });
 
-  // =========================================================================
-  // ZKTeco Hardware Connectivity Test & Multi-Protocol Discovery
-  // =========================================================================
-  app.post('/api/zk/agent/test-connection', async (req, res) => {
+  app.post('/api/zk/agent/test-connection', requireAuth, async (req, res) => {
     const { deviceId, ip, port, commKey, model, protocolMode } = req.body || {};
     try {
       const now = new Date().toISOString();
@@ -396,7 +613,17 @@ async function startServer() {
     }
   });
 
-  app.post('/api/zk/discover', async (req, res) => {
+  app.post('/api/zk/health/probe', requireAuth, async (req, res) => {
+    try {
+      const timeoutMs = Number(req.body?.timeoutMs) || 1500;
+      const probe = await probeAllZkDevicesHealth(timeoutMs);
+      res.json(probe);
+    } catch (error: any) {
+      res.status(500).json({ success: false, error: error.message || 'Biometric health probe failed' });
+    }
+  });
+
+  app.post('/api/zk/discover', requireAuth, async (req, res) => {
     try {
       const { subnetPrefix, startHost, endHost, port } = req.body || {};
       const prefix = String(subnetPrefix || '192.168.1').trim();
@@ -420,7 +647,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/zk/watch-folder/scan', async (req, res) => {
+  app.post('/api/zk/watch-folder/scan', requireAuth, requireDeviceAccess, async (req, res) => {
     try {
       const result = await scanWatchFolderAndIngestToSqlite(req.body?.deviceId);
       return res.json({
@@ -434,7 +661,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/zk/upload-raw', async (req, res) => {
+  app.post('/api/zk/upload-raw', requireAuth, requireDeviceAccess, async (req, res) => {
     const startTime = Date.now();
     try {
       const { rawText, deviceId, deviceName, deviceIP, mode } = req.body || {};
@@ -520,17 +747,22 @@ async function startServer() {
     res.send('OK');
   });
 
-  app.options(['/api/zk/agent/sync', '/api/zk/fetch-device', '/api/zk/fetch-all'], (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.sendStatus(200);
-  });
-
   app.post('/api/zk/agent/sync', async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
     const startTime = Date.now();
     try {
+      const authProfile = await authenticateRequest(req);
+      const collectorKey = String(process.env.ZK_COLLECTOR_KEY || '').trim();
+      const headerKey = String(req.headers['x-collector-key'] || '').trim();
+      const remoteIp = String(req.ip || '').replace(/^::ffff:/, '');
+      const isLoopback = remoteIp === '127.0.0.1' || remoteIp === '::1';
+
+      if (authProfile) {
+        if (!hasDeviceOrImportAccess(authProfile)) {
+          return res.status(403).json({ success: false, error: 'Device/Import permission required.' });
+        }
+      } else if (!(collectorKey && headerKey && headerKey === collectorKey) && !isLoopback) {
+        return res.status(401).json({ success: false, error: 'Authentication or valid collector credentials required.' });
+      }
       const { deviceId, deviceName, deviceIP, serialNumber, punches, users, mode } = req.body || {};
       const rawList = Array.isArray(punches) ? punches : [];
       const cleanedPunches = rawList
@@ -571,28 +803,111 @@ async function startServer() {
     }
   });
 
-  // Background Scheduled ZKT Polling Loop (Checks device autoSyncMinutes & reconciles SQLite)
+  // Background ZKT Loop: Read-Only External Collector Observer by default (zero raw punch writes)
   setInterval(async () => {
-    if (!zkPollingState.enabled) return;
     try {
-      await pollAllZkDevicesToSqlite({ dueOnly: true, mode: 'Scheduled Auto-Poll' });
+      if (zkPollingState.readOnlyMode) {
+        if (!zkPollingState.enabled) return;
+        await detectExternalPunchChangesReadOnly();
+      } else {
+        if (!zkPollingState.enabled) return;
+        await pollAllZkDevicesToSqlite({ dueOnly: true, mode: 'Scheduled Auto-Poll' });
+      }
     } catch {
-      // silent catch so background loop never crashes server
+      // silent catch
     }
-  }, 30 * 1000);
+  }, 15 * 1000);
 
-  // Initial system-data reconciliation once server starts
-  setTimeout(() => {
-    reconcileSystemDataInSqlite().catch((e) => console.warn('[ZKPoller] Initial reconciliation note:', e));
+  // =========================================================================
+  // Public Holiday Master Validation & Punch Overlap Prevention Service
+  // =========================================================================
+  app.get('/api/validation/holidays/report', requireAuth, async (_req, res) => {
+    try {
+      const report = await generateSqliteHolidayValidationReport();
+      return res.json(report);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message || 'Failed to generate holiday validation report' });
+    }
+  });
+
+  app.post('/api/validation/holidays/check-punches', requireAuth, async (req, res) => {
+    try {
+      const incoming = Array.isArray(req.body?.punches) ? req.body.punches : [];
+      const policy = req.body?.policy;
+      const db = await getSqliteDb();
+      const validation = validateIncomingPunchesAgainstDb(db, incoming, { policy });
+      return res.json({
+        success: true,
+        checkedCount: incoming.length,
+        acceptedCount: validation.acceptedPunches.length,
+        rejectedCount: validation.rejectedOverlaps.length,
+        holidayMatchedCount: validation.holidayMatchedCount,
+        acceptedPunches: validation.acceptedPunches,
+        rejectedOverlaps: validation.rejectedOverlaps,
+        conflicts: validation.conflicts,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message || 'Failed to check punches against holidays' });
+    }
+  });
+
+  app.post('/api/validation/holidays/reconcile', requireAuth, async (req, res) => {
+    try {
+      const result = await reconcileHolidaysAndPreventOverlapsInSqlite({
+        removeConflictingForceAttendance: req.body?.removeConflictingForceAttendance !== false,
+        reconcileByUser: String((req as any).callerEmail || req.body?.user || 'System Admin'),
+      });
+      return res.json(result);
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message || 'Failed to reconcile holiday overlaps' });
+    }
+  });
+
+  // Initial system-data & holiday master synchronization once server starts
+  setTimeout(async () => {
+    await loadZkSchedulerConfigFromSqlite().catch((e) => console.warn('[ZKPoller] Scheduler load note:', e));
+    try {
+      const db = await getSqliteDb();
+      const devCheck = db.exec('SELECT id, data FROM zk_devices');
+      let needsFleetSync = devCheck.length === 0 || devCheck[0].values.length === 0;
+      if (!needsFleetSync) {
+        for (const r of devCheck[0].values) {
+          const id = String(r[0] || '');
+          const dataStr = String(r[1] || '');
+          if (
+            id === 'dev_office_192_168_13_7' ||
+            dataStr.includes('"deviceCapacityLogs":50049') ||
+            dataStr.includes('"deviceCapacityLogs":32870') ||
+            dataStr.includes('"deviceCapacityLogs":67961')
+          ) {
+            needsFleetSync = true;
+            break;
+          }
+        }
+      }
+      if (needsFleetSync) {
+        await replaceWithVerifiedZkFleetInSqlite();
+      }
+    } catch (e) {
+      console.warn('[ZKPoller] Initial fleet sync note:', e);
+    }
+    if (!zkPollingState.readOnlyMode) {
+      syncHolidaysMasterTableWithLock().catch((e) => console.warn('[HolidayService] Initial sync note:', e));
+      reconcileSystemDataInSqlite().catch((e) => console.warn('[ZKPoller] Initial reconciliation note:', e));
+    } else {
+      detectExternalPunchChangesReadOnly().catch((e) => console.warn('[ZKPoller] Initial read-only snapshot note:', e));
+    }
   }, 1500);
 
-  // Vite middleware for development vs static build serving
+  // Vite middleware for development vs static build serving (optimized for Caddy reverse proxy)
   const distPath = path.join(process.cwd(), 'dist');
   const isProduction = process.env.NODE_ENV === 'production' || (!process.env.VITE_DEV && fs.existsSync(path.join(distPath, 'index.html')) && fs.existsSync(path.join(distPath, 'server.cjs')));
 
   if (isProduction) {
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.use('/assets', express.static(path.join(distPath, 'assets'), { maxAge: '7d', immutable: true }));
+    app.use(express.static(distPath, { maxAge: '1h' }));
+    app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {

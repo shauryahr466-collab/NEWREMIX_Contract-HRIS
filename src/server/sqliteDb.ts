@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import initSqlJs, { Database } from 'sql.js';
 
@@ -11,6 +12,55 @@ let roDbInstance: Database | null = null;
 let roDbPath: string | null = null;
 let roDbMtimeMs = 0;
 let roDbSize = 0;
+
+export interface SystemErrorEntry {
+  id: string;
+  timestamp: string;
+  source: string;
+  message: string;
+}
+
+const recentSystemErrors: SystemErrorEntry[] = [];
+const MAX_SYSTEM_ERRORS = 50;
+
+export const sqliteHealthMeta: {
+  lastVerifiedAt: string | null;
+  lastIntegrityStatus: 'ok' | 'error' | 'unknown';
+  lastIntegrityError: string | null;
+  lastBackupPath: string | null;
+  lastBackupVerifiedAt: string | null;
+  lastBackupStatus: 'VERIFIED' | 'FAILED' | 'NONE';
+  lastBackupError: string | null;
+} = {
+  lastVerifiedAt: null,
+  lastIntegrityStatus: 'unknown',
+  lastIntegrityError: null,
+  lastBackupPath: null,
+  lastBackupVerifiedAt: null,
+  lastBackupStatus: 'NONE',
+  lastBackupError: null
+};
+
+export function recordSystemError(source: string, message: unknown) {
+  const cleanMsg = String(message instanceof Error ? message.message : message || 'Unknown error').slice(0, 400);
+  recentSystemErrors.unshift({
+    id: `err_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: new Date().toISOString(),
+    source,
+    message: cleanMsg
+  });
+  if (recentSystemErrors.length > MAX_SYSTEM_ERRORS) {
+    recentSystemErrors.length = MAX_SYSTEM_ERRORS;
+  }
+}
+
+export function getRecentSystemErrors(limit = 15): SystemErrorEntry[] {
+  return recentSystemErrors.slice(0, Math.max(1, limit));
+}
+
+export function getSqliteHealthMeta() {
+  return { ...sqliteHealthMeta };
+}
 
 // Ensure root folder works across operating systems safely
 export function getSanitizedRootFolder(): string {
@@ -27,7 +77,7 @@ export function getSanitizedRootFolder(): string {
   if (!fs.existsSync(fallback)) {
     try {
       fs.mkdirSync(fallback, { recursive: true });
-    } catch (e) {
+    } catch {
       // ignore
     }
   }
@@ -76,6 +126,10 @@ export function initLocalDirectories() {
 
 export async function getSqliteDb(): Promise<Database> {
   const dbPath = getSqliteDbPath();
+  const requireExistingDb =
+    ((process.platform === 'win32' && Boolean(process.env.LOCAL_DB_PATH)) ||
+      process.env.REQUIRE_EXISTING_DB === 'true') &&
+    process.env.ALLOW_INIT_NEW_DB !== 'true';
 
   if (dbInstance && activeDbPath === dbPath) {
     try {
@@ -85,14 +139,28 @@ export async function getSqliteDb(): Promise<Database> {
         if (stats.size > 0 && (stats.mtimeMs !== activeDbMtimeMs || stats.size !== activeDbSize)) {
           diskChanged = true;
         }
+      } else if (requireExistingDb) {
+        const msg = `PRODUCTION_DB_MISSING: Configured SQLite database missing at ${dbPath}`;
+        sqliteHealthMeta.lastIntegrityStatus = 'error';
+        sqliteHealthMeta.lastIntegrityError = msg;
+        recordSystemError('sqliteDb', msg);
+        throw new Error(msg);
       }
       if (!diskChanged) {
-        dbInstance.exec('PRAGMA quick_check;');
-        return dbInstance;
+        const chk = dbInstance.exec('PRAGMA quick_check;');
+        if (chk.length > 0 && chk[0].values?.[0]?.[0] === 'ok') {
+          sqliteHealthMeta.lastVerifiedAt = new Date().toISOString();
+          sqliteHealthMeta.lastIntegrityStatus = 'ok';
+          sqliteHealthMeta.lastIntegrityError = null;
+          return dbInstance;
+        }
       }
       try { dbInstance.close(); } catch {}
       dbInstance = null;
-    } catch {
+    } catch (err: any) {
+      if (err?.message?.startsWith('PRODUCTION_DB_MISSING')) {
+        throw err;
+      }
       dbInstance = null;
     }
   }
@@ -101,13 +169,21 @@ export async function getSqliteDb(): Promise<Database> {
   const SQL = await initSqlJs();
   activeDbPath = dbPath;
 
+  const dbExists = fs.existsSync(dbPath);
+  if (requireExistingDb && !dbExists) {
+    const msg = `PRODUCTION_DB_MISSING: Refusing to create a blank database because required SQLite file is missing at ${dbPath}. Restore from Backups or set ALLOW_INIT_NEW_DB=true for initial setup.`;
+    sqliteHealthMeta.lastIntegrityStatus = 'error';
+    sqliteHealthMeta.lastIntegrityError = msg;
+    recordSystemError('sqliteDb', msg);
+    throw new Error(msg);
+  }
+
   const dbDir = path.dirname(dbPath);
   if (!fs.existsSync(dbDir)) {
     fs.mkdirSync(dbDir, { recursive: true });
   }
 
   let fileBuffer: Buffer | null = null;
-  const dbExists = fs.existsSync(dbPath);
   let loadedStats: fs.Stats | null = null;
 
   if (dbExists) {
@@ -117,7 +193,8 @@ export async function getSqliteDb(): Promise<Database> {
         fileBuffer = fs.readFileSync(dbPath);
         loadedStats = stats;
       }
-    } catch (e) {
+    } catch (e: any) {
+      recordSystemError('sqliteDb', `Failed to read database at ${dbPath}: ${e?.message || e}`);
       console.warn(`[SQLite] Failed to read existing database at ${dbPath}:`, e);
     }
   }
@@ -127,34 +204,37 @@ export async function getSqliteDb(): Promise<Database> {
   if (fileBuffer && fileBuffer.length > 0) {
     try {
       const candidate = new SQL.Database(fileBuffer);
-      // Quick health check on the loaded database instance
       const check = candidate.exec('PRAGMA quick_check;');
       if (check && check.length > 0 && check[0].values?.[0]?.[0] === 'ok') {
         dbInstance = candidate;
         loadedSuccessfully = true;
         activeDbMtimeMs = loadedStats?.mtimeMs || 0;
         activeDbSize = loadedStats?.size || fileBuffer.length;
+        sqliteHealthMeta.lastVerifiedAt = new Date().toISOString();
+        sqliteHealthMeta.lastIntegrityStatus = 'ok';
+        sqliteHealthMeta.lastIntegrityError = null;
         console.log(`[SQLite] Loaded healthy database from: ${dbPath}`);
       } else {
         throw new Error('Database quick_check failed');
       }
 
-      // Automatic Safety Backup after successful load verification
+      // Automatic verified startup safety backup
       try {
-        const backupDir = path.join(getSanitizedRootFolder(), 'Backups');
-        if (!fs.existsSync(backupDir)) {
-          fs.mkdirSync(backupDir, { recursive: true });
-        }
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const backupPath = path.join(backupDir, `Database_backup_${timestamp}.db`);
-        fs.copyFileSync(dbPath, backupPath);
-      } catch (bErr) {
-        console.warn('[SQLite] Automatic safety backup notice:', bErr);
+        const backupPath = _createDatabaseBackupUnlocked('startup');
+        sqliteHealthMeta.lastBackupPath = backupPath;
+        sqliteHealthMeta.lastBackupVerifiedAt = new Date().toISOString();
+        sqliteHealthMeta.lastBackupStatus = 'VERIFIED';
+        sqliteHealthMeta.lastBackupError = null;
+      } catch (bErr: any) {
+        sqliteHealthMeta.lastBackupStatus = 'FAILED';
+        sqliteHealthMeta.lastBackupError = bErr?.message || String(bErr);
+        recordSystemError('backup', `Automatic startup backup notice: ${sqliteHealthMeta.lastBackupError}`);
       }
     } catch (e: any) {
+      recordSystemError('sqliteDb', `Database integrity recovery triggered: ${e?.message || e}`);
       console.warn(`[SQLite] Database file at ${dbPath} needed recovery (${e?.message || e}), searching backups...`);
 
-      // Try restoring from recent backup if available
+      // Try restoring from recent verified backup if available
       try {
         const backupDir = path.join(getSanitizedRootFolder(), 'Backups');
         if (fs.existsSync(backupDir)) {
@@ -172,6 +252,9 @@ export async function getSqliteDb(): Promise<Database> {
                 if (bCheck && bCheck.length > 0 && bCheck[0].values?.[0]?.[0] === 'ok') {
                   dbInstance = bCand;
                   loadedSuccessfully = true;
+                  sqliteHealthMeta.lastVerifiedAt = new Date().toISOString();
+                  sqliteHealthMeta.lastIntegrityStatus = 'ok';
+                  sqliteHealthMeta.lastIntegrityError = null;
                   console.log(`[SQLite] Restored healthy database from backup: ${bFile}`);
                   break;
                 }
@@ -181,14 +264,24 @@ export async function getSqliteDb(): Promise<Database> {
             }
           }
         }
-      } catch (bRestErr) {
-        console.warn('[SQLite] Backup restore check notice:', bRestErr);
+      } catch (bRestErr: any) {
+        recordSystemError('sqliteDb', `Backup recovery check failed: ${bRestErr?.message || bRestErr}`);
       }
     }
   }
 
   if (!loadedSuccessfully || !dbInstance) {
+    if (requireExistingDb && dbExists) {
+      const msg = `PRODUCTION_DB_CORRUPT: Existing production database at ${dbPath} failed integrity check and no verified backup could be restored. Halting to prevent overwriting production records.`;
+      sqliteHealthMeta.lastIntegrityStatus = 'error';
+      sqliteHealthMeta.lastIntegrityError = msg;
+      recordSystemError('sqliteDb', msg);
+      throw new Error(msg);
+    }
     dbInstance = new SQL.Database();
+    sqliteHealthMeta.lastVerifiedAt = new Date().toISOString();
+    sqliteHealthMeta.lastIntegrityStatus = 'ok';
+    sqliteHealthMeta.lastIntegrityError = null;
     console.log(`[SQLite] Initialized clean SQLite database instance.`);
   }
 
@@ -410,6 +503,13 @@ export async function getSqliteDb(): Promise<Database> {
     CREATE TABLE IF NOT EXISTS zk_devices (
       id TEXT PRIMARY KEY,
       data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS zk_scheduler_config (
+      id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      interval_minutes INTEGER NOT NULL DEFAULT 15,
       updated_at TEXT
     );
 
@@ -657,36 +757,279 @@ export async function resetSqliteDb(): Promise<Database> {
   return await getSqliteDb();
 }
 
-export function createDatabaseBackup(label?: string): string {
+const SQLITE_MAGIC_HEADER = 'SQLite format 3\0';
+
+function assertValidSqliteBuffer(buf: Buffer, contextLabel: string) {
+  if (!buf || buf.length < 100) {
+    throw new Error(`${contextLabel}: file is empty or too small (${buf ? buf.length : 0} bytes)`);
+  }
+  const header = buf.subarray(0, 16).toString('utf8');
+  if (header !== SQLITE_MAGIC_HEADER) {
+    throw new Error(`${contextLabel}: invalid SQLite magic header`);
+  }
+}
+
+export function _createDatabaseBackupUnlocked(label?: string): string {
   const dbPath = activeDbPath || getSqliteDbPath();
   const backupDir = path.join(getSanitizedRootFolder(), 'Backups');
   if (!fs.existsSync(backupDir)) {
     fs.mkdirSync(backupDir, { recursive: true });
   }
 
-  // Flush current database to disk first
-  saveSqliteDb();
-
   const pad = (n: number) => n.toString().padStart(2, '0');
   const d = new Date();
-  const dateStr = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const dateStr = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}_${String(d.getMilliseconds()).padStart(3, '0')}`;
   const suffix = label ? `_${label.replace(/[^a-zA-Z0-9_-]/g, '_')}` : '';
   const backupFileName = `Database_backup_${dateStr}${suffix}.db`;
   const backupPath = path.join(backupDir, backupFileName);
+  const tmpPath = `${backupPath}.tmp.${Date.now()}`;
 
+  let diskIsNewer = false;
   if (fs.existsSync(dbPath)) {
-    fs.copyFileSync(dbPath, backupPath);
-    console.log(`[SQLite Backup] Created backup at: ${backupPath}`);
+    try {
+      const st = fs.statSync(dbPath);
+      if (st.size > 0 && activeDbMtimeMs > 0 && st.mtimeMs > activeDbMtimeMs + 5) {
+        diskIsNewer = true;
+      }
+    } catch {}
   }
+
+  if (diskIsNewer || !dbInstance) {
+    if (!fs.existsSync(dbPath)) {
+      throw new Error(`Cannot create backup: database file not found at ${dbPath}`);
+    }
+    fs.copyFileSync(dbPath, tmpPath);
+  } else {
+    const data = dbInstance.export();
+    fs.writeFileSync(tmpPath, Buffer.from(data));
+  }
+
+  const buf = fs.readFileSync(tmpPath);
+  assertValidSqliteBuffer(buf, 'Backup creation');
+  fs.renameSync(tmpPath, backupPath);
+
+  sqliteHealthMeta.lastBackupPath = backupPath;
+  console.log(`[SQLite Backup] Created backup at: ${backupPath} (${buf.length} bytes)`);
   return backupPath;
+}
+
+export function createDatabaseBackup(label?: string): string {
+  // Flush current database to disk safely if no external collector overwrite occurred
+  saveSqliteDb();
+  return _createDatabaseBackupUnlocked(label);
+}
+
+export async function verifyBackupFile(fileNameOrPath: string): Promise<{
+  valid: boolean;
+  fileName: string;
+  filePath: string;
+  sizeBytes: number;
+  quickCheck: string;
+  employeesCount: number;
+  punchesCount: number;
+  payrollRunsCount: number;
+  error?: string;
+}> {
+  const backupDir = path.resolve(getSanitizedRootFolder(), 'Backups');
+  const safeName = path.basename(String(fileNameOrPath || '').trim());
+  if (!safeName || !safeName.endsWith('.db')) {
+    throw new Error('Invalid backup filename');
+  }
+  const resolved = path.resolve(backupDir, safeName);
+  if (!resolved.startsWith(backupDir + path.sep)) {
+    throw new Error('Access denied: backup path outside Backups directory');
+  }
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Backup file not found: ${safeName}`);
+  }
+
+  const stats = fs.statSync(resolved);
+  const buf = fs.readFileSync(resolved);
+  let testDb: Database | null = null;
+  try {
+    assertValidSqliteBuffer(buf, `Backup verify (${safeName})`);
+    const SQL = await initSqlJs();
+    testDb = new SQL.Database(buf);
+    const chk = testDb.exec('PRAGMA quick_check;');
+    const quickCheck = String(chk?.[0]?.values?.[0]?.[0] || 'unknown');
+    if (quickCheck !== 'ok') {
+      throw new Error(`PRAGMA quick_check returned: ${quickCheck}`);
+    }
+
+    const safeCount = (tableName: string): number => {
+      try {
+        const res = testDb!.exec(`SELECT COUNT(*) FROM ${tableName}`);
+        return Number(res?.[0]?.values?.[0]?.[0] || 0);
+      } catch {
+        return 0;
+      }
+    };
+
+    return {
+      valid: true,
+      fileName: safeName,
+      filePath: resolved,
+      sizeBytes: stats.size,
+      quickCheck,
+      employeesCount: safeCount('employees'),
+      punchesCount: safeCount('attendance_punches'),
+      payrollRunsCount: safeCount('payroll_runs')
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      fileName: safeName,
+      filePath: resolved,
+      sizeBytes: stats.size,
+      quickCheck: 'failed',
+      employeesCount: 0,
+      punchesCount: 0,
+      payrollRunsCount: 0,
+      error: err?.message || 'Backup verification failed'
+    };
+  } finally {
+    if (testDb) {
+      try { testDb.close(); } catch {}
+    }
+  }
+}
+
+export async function createVerifiedDatabaseBackup(label?: string): Promise<{
+  backupPath: string;
+  fileName: string;
+  sizeBytes: number;
+  quickCheck: string;
+  employeesCount: number;
+  punchesCount: number;
+  payrollRunsCount: number;
+  verified: boolean;
+}> {
+  return withSqliteWriteLock(async () => {
+    await getSqliteDb();
+    const backupPath = _createDatabaseBackupUnlocked(label);
+    const fileName = path.basename(backupPath);
+    const verification = await verifyBackupFile(fileName);
+    if (!verification.valid) {
+      sqliteHealthMeta.lastBackupStatus = 'FAILED';
+      sqliteHealthMeta.lastBackupError = verification.error || 'Backup verification failed';
+      recordSystemError('backup', sqliteHealthMeta.lastBackupError);
+      try { fs.unlinkSync(backupPath); } catch {}
+      throw new Error(`Verified backup failed: ${sqliteHealthMeta.lastBackupError}`);
+    }
+
+    sqliteHealthMeta.lastBackupPath = backupPath;
+    sqliteHealthMeta.lastBackupVerifiedAt = new Date().toISOString();
+    sqliteHealthMeta.lastBackupStatus = 'VERIFIED';
+    sqliteHealthMeta.lastBackupError = null;
+
+    return {
+      backupPath,
+      fileName,
+      sizeBytes: verification.sizeBytes,
+      quickCheck: verification.quickCheck,
+      employeesCount: verification.employeesCount,
+      punchesCount: verification.punchesCount,
+      payrollRunsCount: verification.payrollRunsCount,
+      verified: true
+    };
+  });
+}
+
+export async function testRestoreBackupCopy(fileName: string): Promise<{
+  success: boolean;
+  fileName: string;
+  quickCheck: string;
+  employeesCount: number;
+  punchesCount: number;
+  payrollRunsCount: number;
+  sizeBytes: number;
+  error?: string;
+}> {
+  const backupDir = path.resolve(getSanitizedRootFolder(), 'Backups');
+  const safeName = path.basename(String(fileName || '').trim());
+  if (!safeName || !safeName.endsWith('.db')) {
+    throw new Error('Invalid backup filename');
+  }
+  const sourcePath = path.resolve(backupDir, safeName);
+  if (!sourcePath.startsWith(backupDir + path.sep)) {
+    throw new Error('Access denied: backup path outside Backups directory');
+  }
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`Backup file not found: ${safeName}`);
+  }
+
+  const tempCopyPath = path.join(os.tmpdir(), `shrm_restore_test_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.db`);
+  let tempDb: Database | null = null;
+  try {
+    fs.copyFileSync(sourcePath, tempCopyPath);
+    const stats = fs.statSync(tempCopyPath);
+    const buf = fs.readFileSync(tempCopyPath);
+    assertValidSqliteBuffer(buf, `Test restore (${safeName})`);
+    const SQL = await initSqlJs();
+    tempDb = new SQL.Database(buf);
+    const chk = tempDb.exec('PRAGMA quick_check;');
+    const quickCheck = String(chk?.[0]?.values?.[0]?.[0] || 'unknown');
+    if (quickCheck !== 'ok') {
+      throw new Error(`Restore integrity check failed: ${quickCheck}`);
+    }
+    const safeCount = (t: string): number => {
+      try {
+        const res = tempDb!.exec(`SELECT COUNT(*) FROM ${t}`);
+        return Number(res?.[0]?.values?.[0]?.[0] || 0);
+      } catch {
+        return 0;
+      }
+    };
+    return {
+      success: true,
+      fileName: safeName,
+      quickCheck,
+      employeesCount: safeCount('employees'),
+      punchesCount: safeCount('attendance_punches'),
+      payrollRunsCount: safeCount('payroll_runs'),
+      sizeBytes: stats.size
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      fileName: safeName,
+      quickCheck: 'failed',
+      employeesCount: 0,
+      punchesCount: 0,
+      payrollRunsCount: 0,
+      sizeBytes: 0,
+      error: err?.message || 'Test restore failed'
+    };
+  } finally {
+    if (tempDb) {
+      try { tempDb.close(); } catch {}
+    }
+    try {
+      if (fs.existsSync(tempCopyPath)) fs.unlinkSync(tempCopyPath);
+    } catch {}
+  }
 }
 
 export function saveSqliteDb() {
   if (!dbInstance) return;
   try {
+    const targetPath = activeDbPath || getSqliteDbPath();
+
+    // Guard against overwriting an external collector's newer write on disk with stale in-memory sql.js bytes
+    if (activeDbMtimeMs > 0 && fs.existsSync(targetPath)) {
+      try {
+        const currentStats = fs.statSync(targetPath);
+        if (currentStats.size > 0 && currentStats.mtimeMs > activeDbMtimeMs + 5) {
+          const msg = `Aborted stale SQLite flush: external disk modification detected at ${targetPath}`;
+          console.warn(`[SQLite Guard] ${msg}`);
+          recordSystemError('sqliteDb', msg);
+          return;
+        }
+      } catch {}
+    }
+
     const data = dbInstance.export();
     const buffer = Buffer.from(data);
-    const targetPath = activeDbPath || getSqliteDbPath();
 
     const dir = path.dirname(targetPath);
     if (!fs.existsSync(dir)) {
@@ -702,7 +1045,8 @@ export function saveSqliteDb() {
       activeDbMtimeMs = savedStats.mtimeMs;
       activeDbSize = savedStats.size;
     } catch {}
-  } catch (err) {
+  } catch (err: any) {
+    recordSystemError('sqliteDb', `Notice during SQLite disk sync: ${err?.message || err}`);
     console.warn('[SQLite] Notice during SQLite disk sync:', err);
   }
 }

@@ -22,5 +22,12 @@
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
-  }
+  },
+  "exclude": [
+    "verify_hris_e2e.ts",
+    "app/applet/verify_hris_e2e.ts",
+    "node_modules",
+    "*.cjs",
+    "*.mjs"
+  ]
 }

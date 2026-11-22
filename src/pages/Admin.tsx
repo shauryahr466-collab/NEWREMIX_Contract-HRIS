@@ -1,25 +1,28 @@
 import React, { useMemo, useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store';
-import { Shield, Users, Fingerprint, Clock, AlertCircle, Database, Server, UserPlus, Mail, Lock, User, Key, Loader2, RefreshCw, Info } from 'lucide-react';
+import { Shield, Users, Fingerprint, Clock, AlertCircle, Database, Server, UserPlus, Lock, Loader2, RefreshCw, Info, UserCog } from 'lucide-react';
 import { format } from 'date-fns';
 import { toast } from 'sonner';
 import { auth } from '../lib/firebase';
 import { PageHeader, Card, KPICard, Button, Input, Badge } from '../components/ui';
+import { formatUserScopeSummary } from '../lib/accessControl';
 import { cn } from '../lib/utils';
 
 export function AdminDashboard() {
+  const navigate = useNavigate();
   const { employees, punches, settings, shiftAssignments, assignmentLogs } = useAppStore();
   const [adminUsers, setAdminUsers] = useState<any[]>([]);
   const [isFetchingUsers, setIsFetchingUsers] = useState(false);
   const [isCreatingUser, setIsCreatingUser] = useState(false);
-  const [newUser, setNewUser] = useState({ email: '', password: '', displayName: '', role: 'Editor' });
+  const [newUser, setNewUser] = useState({ email: '', password: '', displayName: '', role: 'Department Head' });
 
   const fetchUsers = async () => {
     setIsFetchingUsers(true);
     try {
       const token = await auth.currentUser?.getIdToken();
       const response = await fetch('/api/admin/users', {
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: token ? { 'Authorization': `Bearer ${token}` } : {}
       });
       if (response.ok) {
         const data = await response.json();
@@ -51,7 +54,7 @@ export function AdminDashboard() {
       });
       if (response.ok) {
         toast.success('User created successfully');
-        setNewUser({ email: '', password: '', displayName: '', role: 'Editor' });
+        setNewUser({ email: '', password: '', displayName: '', role: 'Department Head' });
         fetchUsers();
       } else {
         const data = await response.json();
@@ -135,18 +138,26 @@ export function AdminDashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-6">
           <Card className="p-0 overflow-hidden">
-            <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+            <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
                 <Users size={16} className="text-slate-400" />
-                <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest">User Management</h3>
+                <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest">User & Role Directory</h3>
               </div>
-              <Button variant="ghost" size="sm" onClick={fetchUsers} disabled={isFetchingUsers}>
-                <RefreshCw size={14} className={isFetchingUsers ? "animate-spin" : ""} />
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => navigate('/user-access')} className="text-xs">
+                  <UserCog size={14} className="mr-1.5" />
+                  Configure Role Scopes & Permissions
+                </Button>
+                <Button variant="ghost" size="sm" onClick={fetchUsers} disabled={isFetchingUsers}>
+                  <RefreshCw size={14} className={isFetchingUsers ? "animate-spin" : ""} />
+                </Button>
+              </div>
             </div>
 
             <div className="p-6 bg-slate-50/50 dark:bg-slate-900/50 border-b border-slate-100 dark:border-slate-800">
-              <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">Add Authorized User</h4>
+              <div className="flex items-center justify-between mb-4">
+                <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Quick User Provision (Use User & Role Config for Department/Section Scope)</h4>
+              </div>
               <form onSubmit={handleCreateUser} className="grid grid-cols-1 md:grid-cols-4 gap-3">
                 <Input 
                   value={newUser.displayName}
@@ -174,8 +185,11 @@ export function AdminDashboard() {
                     onChange={(e) => setNewUser({...newUser, role: e.target.value})}
                     className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-800 rounded-lg px-3 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all"
                   >
-                    <option value="Editor">Editor</option>
-                    <option value="Admin">Admin</option>
+                    <option value="Department Head">Department Head</option>
+                    <option value="Supervisor">Supervisor</option>
+                    <option value="Section Incharge">Section Incharge</option>
+                    <option value="Employee">Employee</option>
+                    <option value="Super Admin">Super Admin</option>
                   </select>
                   <Button type="submit" disabled={isCreatingUser} className="shrink-0">
                     {isCreatingUser ? <Loader2 size={16} className="animate-spin" /> : <UserPlus size={16} />}
@@ -189,7 +203,7 @@ export function AdminDashboard() {
                 <thead>
                   <tr className="bg-slate-50/50 dark:bg-slate-900/50 border-b border-slate-100 dark:border-slate-800">
                     <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">User</th>
-                    <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Email</th>
+                    <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Concern Scope</th>
                     <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-center">Role</th>
                     <th className="px-6 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest text-right">Created</th>
                   </tr>
@@ -210,17 +224,24 @@ export function AdminDashboard() {
                             <div className="w-8 h-8 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 group-hover:bg-primary group-hover:text-white rounded-lg flex items-center justify-center font-bold text-[10px] transition-all">
                               {user.username?.[0] || 'U'}
                             </div>
-                            <span className="text-xs font-bold text-slate-900 dark:text-white">{user.username}</span>
+                            <div>
+                              <span className="text-xs font-bold text-slate-900 dark:text-white block">{user.username}</span>
+                              <span className="text-[11px] text-slate-500">{user.email}</span>
+                            </div>
                           </div>
                         </td>
-                        <td className="px-6 py-4 text-xs text-slate-500">{user.email}</td>
+                        <td className="px-6 py-4 text-xs text-slate-500 max-w-xs truncate">{formatUserScopeSummary(user)}</td>
                         <td className="px-6 py-4 text-center">
-                          <Badge variant={user.role === 'Admin' ? 'info' : 'success'} className="text-[9px] uppercase">
+                          <Badge variant={user.role === 'Super Admin' ? 'info' : 'success'} className="text-[9px] uppercase">
                             {user.role}
                           </Badge>
                         </td>
-                        <td className="px-6 py-4 text-right text-[10px] font-medium text-slate-400">
-                          {user.createdAt ? format(new Date(user.createdAt._seconds * 1000), 'MMM dd, yyyy') : 'N/A'}
+                        <td className="px-6 py-4 text-right text-[10px] font-medium text-slate-400 tabular-nums">
+                          {typeof user.createdAt === 'string'
+                            ? format(new Date(user.createdAt), 'MMM dd, yyyy')
+                            : user.createdAt?._seconds
+                              ? format(new Date(user.createdAt._seconds * 1000), 'MMM dd, yyyy')
+                              : 'N/A'}
                         </td>
                       </tr>
                     ))

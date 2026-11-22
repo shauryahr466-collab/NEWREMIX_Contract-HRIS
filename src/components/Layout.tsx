@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Outlet, NavLink, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, Cpu, TrendingUp } from 'lucide-react';
+import { LayoutDashboard, Users, FileUp, Fingerprint, FileText, Settings, LogOut, Shield, ShieldAlert, Clock, CalendarRange, UserCheck, ChevronLeft, ChevronRight, Search, Bell, User as UserIcon, Menu, Moon, Sun, RefreshCw, Cpu, TrendingUp, UserCog, Eye } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { NepaliRupeeIcon } from './ui';
 import { useAppStore } from '../store';
@@ -11,6 +11,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { EmployeeDrawer } from './EmployeeDrawer';
 import { LocalModeIndicator } from './LocalModeIndicator';
+import { formatUserScopeSummary } from '../lib/accessControl';
+import type { ModuleKey } from '../types';
 
 const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
 
@@ -38,18 +40,23 @@ export function Layout() {
     openEmployeeProfile, closeEmployeeProfile, 
     theme, setTheme, globalSearchTerm, setGlobalSearchTerm, 
     recalculate, isInitializing, quotaExceeded, resetError,
-    setIsOtpVerified, user, setUser
+    setIsOtpVerified, user, setUser,
+    isSuperAdmin, effectiveUserProfile, previewUserProfile, setPreviewUserProfile,
+    setCurrentUserProfile, canAccessModule
   } = useAppStore();
   const location = useLocation();
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isMobileOpen, setIsMobileOpen] = useState(false);
   
-  const currentUserEmail = user?.email || auth.currentUser?.email || '';
-  const isAdmin = ADMIN_EMAILS.some(email => currentUserEmail.toLowerCase() === email.toLowerCase());
+  const currentUserEmail = effectiveUserProfile?.email || user?.email || auth.currentUser?.email || '';
+  const isAdmin = isSuperAdmin || ADMIN_EMAILS.some(email => currentUserEmail.toLowerCase() === email.toLowerCase());
 
   const handleSignOut = () => {
     setIsOtpVerified(false);
+    setPreviewUserProfile(null);
+    setCurrentUserProfile(null);
     sessionStorage.removeItem('local_session_user');
+    sessionStorage.removeItem('local_user_profile');
     sessionStorage.removeItem('is_otp_verified');
     setUser(null);
     signOut(auth).catch(() => {});
@@ -57,27 +64,27 @@ export function Layout() {
 
   const selectedEmployee = employees.find(e => e.id === selectedEmployeeId) || null;
 
-  const navItems = [
-    { to: '/', icon: LayoutDashboard, label: 'Enterprise Dashboard' },
-    { to: '/employees', icon: Users, label: 'Employee Directory' },
-    { to: '/movement-attrition', icon: UserCheck, label: 'Movement & Attrition' },
-    { to: '/salary-analysis', icon: TrendingUp, label: 'SALARY ANALYSIS' },
-    { to: '/devices', icon: Cpu, label: 'Device Setup' },
-    { to: '/import', icon: FileUp, label: 'Punch Import' },
-    { to: '/attendance', icon: Fingerprint, label: 'Attendance logs' },
-    { to: '/auditor', icon: ShieldAlert, label: 'Attendance Auditor' },
-    { to: '/audit-logs', icon: Shield, label: 'System Audit Log' },
-    { to: '/overtime', icon: Clock, label: 'OT Audit Log' },
-    { to: '/sbl', icon: CalendarRange, label: 'SBL Management' },
-    { to: '/force-attendance', icon: UserCheck, label: 'Manual Corrections' },
-    { to: '/payroll', icon: NepaliRupeeIcon, label: 'Payroll & Disburse' },
-    { to: '/reports', icon: FileText, label: 'Analytic Reports' },
-    { to: '/settings', icon: Settings, label: 'Configuration' },
+  const allNavItems: Array<{ to: string; icon: any; label: string; moduleKey: ModuleKey }> = [
+    { to: '/', icon: LayoutDashboard, label: 'Enterprise Dashboard', moduleKey: 'dashboard' },
+    { to: '/employees', icon: Users, label: 'Employee Directory', moduleKey: 'employees' },
+    { to: '/movement-attrition', icon: UserCheck, label: 'Movement & Attrition', moduleKey: 'movementAttrition' },
+    { to: '/salary-analysis', icon: TrendingUp, label: 'Salary Analysis', moduleKey: 'salaryAnalysis' },
+    { to: '/devices', icon: Cpu, label: 'Device Setup', moduleKey: 'devices' },
+    { to: '/import', icon: FileUp, label: 'Punch Import', moduleKey: 'import' },
+    { to: '/attendance', icon: Fingerprint, label: 'Attendance Logs', moduleKey: 'attendance' },
+    { to: '/auditor', icon: ShieldAlert, label: 'Attendance Auditor', moduleKey: 'auditor' },
+    { to: '/audit-logs', icon: Shield, label: 'System Audit Log', moduleKey: 'auditLogs' },
+    { to: '/overtime', icon: Clock, label: 'OT Audit Log', moduleKey: 'overtime' },
+    { to: '/sbl', icon: CalendarRange, label: 'SBL Management', moduleKey: 'sbl' },
+    { to: '/force-attendance', icon: UserCheck, label: 'Manual Corrections', moduleKey: 'forceAttendance' },
+    { to: '/payroll', icon: NepaliRupeeIcon, label: 'Payroll & Disburse', moduleKey: 'payroll' },
+    { to: '/reports', icon: FileText, label: 'Analytic Reports', moduleKey: 'reports' },
+    { to: '/settings', icon: Settings, label: 'Configuration', moduleKey: 'settings' },
+    { to: '/user-access', icon: UserCog, label: 'User & Role Config', moduleKey: 'userAccess' },
+    { to: '/admin', icon: Shield, label: 'System Admin', moduleKey: 'admin' },
   ];
 
-  if (isAdmin) {
-    navItems.push({ to: '/admin', icon: Shield, label: 'System Admin' });
-  }
+  const navItems = allNavItems.filter(item => canAccessModule(item.moduleKey));
 
   const currentNavItem = navItems.find(item => item.to === location.pathname);
 
@@ -167,15 +174,15 @@ export function Layout() {
           )}>
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 shrink-0 rounded bg-slate-700 flex items-center justify-center font-semibold text-slate-300 text-xs">
-                {auth.currentUser?.displayName?.charAt(0) || auth.currentUser?.email?.charAt(0) || 'U'}
+                {(effectiveUserProfile?.username || auth.currentUser?.displayName || auth.currentUser?.email || 'U').charAt(0).toUpperCase()}
               </div>
               {!isCollapsed && (
                 <div className="flex-1 min-w-0">
                   <p className="text-[12px] font-semibold text-white truncate">
-                    {auth.currentUser?.displayName || auth.currentUser?.email?.split('@')[0]}
+                    {effectiveUserProfile?.username || auth.currentUser?.displayName || auth.currentUser?.email?.split('@')[0]}
                   </p>
-                  <p className="text-[10px] text-slate-500 truncate mt-0.5">
-                    {isAdmin ? 'Administrator' : 'Staff Member'}
+                  <p className="text-[10px] text-slate-400 truncate mt-0.5" title={formatUserScopeSummary(effectiveUserProfile)}>
+                    {effectiveUserProfile?.role || (isAdmin ? 'Super Admin' : 'Staff Member')}
                   </p>
                 </div>
               )}
@@ -195,6 +202,26 @@ export function Layout() {
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-full overflow-hidden relative">
+        {previewUserProfile && (
+          <div className="bg-amber-600 text-white px-6 py-2 flex items-center justify-between gap-4 text-xs shrink-0">
+            <div className="flex items-center gap-2 min-w-0">
+              <Eye size={14} className="shrink-0" />
+              <span className="font-semibold truncate">
+                Role Scope Preview: {previewUserProfile.username} · {previewUserProfile.role} · {formatUserScopeSummary(previewUserProfile)}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setPreviewUserProfile(null);
+                toast.success('Returned to Super Admin full access');
+              }}
+              className="px-3 py-1 rounded bg-white text-amber-900 font-semibold hover:bg-amber-50 transition-colors whitespace-nowrap shrink-0"
+            >
+              Exit Preview to Super Admin
+            </button>
+          </div>
+        )}
         {/* Top Header */}
         <header className="min-h-16 h-auto py-2 glass-header flex items-center justify-between px-6 shrink-0 gap-4 flex-wrap">
           <div className="flex items-center gap-4">
@@ -209,11 +236,19 @@ export function Layout() {
               <NavLink to="/" className="hover:text-primary transition-colors">Home</NavLink>
               <ChevronRight size={12} className="text-slate-300" />
               <span className="font-medium text-slate-900 dark:text-white">{currentNavItem?.label || 'App'}</span>
+              {effectiveUserProfile && effectiveUserProfile.role !== 'Super Admin' && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-slate-500 dark:text-slate-400 truncate max-w-xs" title={formatUserScopeSummary(effectiveUserProfile)}>
+                    {formatUserScopeSummary(effectiveUserProfile)}
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
           <div className="flex items-center gap-4 flex-wrap justify-end">
-            <LocalModeIndicator />
+            {isAdmin && <LocalModeIndicator />}
             <div className="relative hidden md:block">
               <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input 
@@ -263,15 +298,18 @@ export function Layout() {
               </HeaderButton>
               <HeaderButton title="Notifications">
                 <Bell size={16} />
-                <span className="absolute top-2 right-2 w-1.5 h-1.5 bg-danger rounded-full"></span>
               </HeaderButton>
               
               <div className="h-6 w-[1px] bg-slate-200 dark:bg-slate-700 mx-2"></div>
               
               <div className="flex items-center gap-3 pl-1">
                 <div className="text-right hidden sm:block">
-                  <p className="text-[12px] font-semibold text-slate-900 dark:text-white leading-none">System Active</p>
-                  <p className="text-[10px] text-slate-500 mt-1">HRIS v2.4</p>
+                  <p className="text-[12px] font-semibold text-slate-900 dark:text-white leading-none">
+                    {effectiveUserProfile?.username || 'System Active'}
+                  </p>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    {effectiveUserProfile?.role || 'HRIS'}
+                  </p>
                 </div>
                 <div className="w-8 h-8 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 flex items-center justify-center border border-slate-200 dark:border-slate-700">
                   <UserIcon size={16} />

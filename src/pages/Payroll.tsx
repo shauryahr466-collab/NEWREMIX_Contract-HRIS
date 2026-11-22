@@ -39,8 +39,10 @@ export function Payroll() {
     addEmployee,
     deleteEmployeesBatch,
     settings,
-    setSettings
+    setSettings,
+    effectiveUserProfile
   } = useAppStore();
+  const canApprovePayroll = !effectiveUserProfile || effectiveUserProfile.role === 'Super Admin' || Boolean(effectiveUserProfile.permissions?.canApprovePayroll);
 
   const { executeWithStatus, showSuccess, showError } = useActionStatus();
 
@@ -676,6 +678,10 @@ export function Payroll() {
 
   // Handle Approve Run
   const handleApprove = async (runId: string) => {
+    if (!canApprovePayroll) {
+      toast.error('Your configured role does not have permission to approve payroll runs.');
+      return;
+    }
     const run = payrollRuns.find(r => r.id === runId);
     if (!run) return;
 
@@ -1096,6 +1102,10 @@ export function Payroll() {
                           </span>
                         </>
                       )}
+                      <span>•</span>
+                      <span className="font-semibold px-2 py-0.5 rounded text-[10px] bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200/60 dark:border-indigo-800/60">
+                        OT Basis: {settings.payrollConfig?.overtimeCalculationBasis === 'gross' ? 'Gross Salary' : 'Basic Salary'} ({settings.payrollConfig?.overtimeMultiplier || 1.5}x)
+                      </span>
                     </p>
                   </div>
 

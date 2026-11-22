@@ -8,11 +8,12 @@ import {
 } from '../../utils/nepaliCalendar';
 import { 
   Search, Download, Printer, Filter, Users, Calendar, 
-  CheckCircle2, XCircle, Clock, Award, ChevronLeft, ChevronRight, FileSpreadsheet, FileText 
+  CheckCircle2, XCircle, Clock, Award, ChevronLeft, ChevronRight, FileSpreadsheet, FileText, Upload 
 } from 'lucide-react';
 import { Card, Button, Input } from '../ui';
 import { MultiSelect } from '../MultiSelect';
 import { MusterCellModal } from './MusterCellModal';
+import { ManualAttendanceImportModal } from '../ManualAttendanceImportModal';
 import { Employee, ProcessedAttendance, ShiftMaster, RawPunch } from '../../types';
 import { formatDuration, cn, formatAMPM, toDeviceWallClockIso } from '../../lib/utils';
 import { parseISO, format } from 'date-fns';
@@ -45,6 +46,7 @@ export function MonthlyMuster() {
   const [searchTerm, setSearchTerm] = useState('');
   const [deptFilter, setDeptFilter] = useState<string[]>(['All']);
   const [sectionFilter, setSectionFilter] = useState<string[]>(['All']);
+  const [isManualImportOpen, setIsManualImportOpen] = useState(false);
 
   // Cell Detail Modal State
   const [cellModal, setCellModal] = useState<{
@@ -430,6 +432,9 @@ export function MonthlyMuster() {
 
           {/* Action Export Buttons */}
           <div className="flex items-center gap-2 self-end lg:self-auto">
+            <Button size="sm" onClick={() => setIsManualImportOpen(true)} className="h-9 bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs">
+              <Upload size={14} /> Import Attendance
+            </Button>
             <Button variant="outline" size="sm" onClick={handleExportExcel} className="h-9">
               <FileSpreadsheet size={14} className="text-emerald-600" /> Export Excel
             </Button>
@@ -713,6 +718,11 @@ export function MonthlyMuster() {
         rawPunches={cellModal.rawPunches}
       />
 
+      {/* Manual Attendance Import Modal */}
+      <ManualAttendanceImportModal 
+        isOpen={isManualImportOpen}
+        onClose={() => setIsManualImportOpen(false)}
+      />
     </div>
   );
 }

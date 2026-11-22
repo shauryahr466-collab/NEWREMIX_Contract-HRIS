@@ -17,6 +17,8 @@ interface OTAuditLogProps {
   attendanceData: ProcessedAttendance[];
   shifts: ShiftMaster[];
   punches?: RawPunch[];
+  otBasis?: 'basic' | 'gross';
+  otMultiplier?: number;
   onEdit: (record: OvertimeRecord) => void;
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
@@ -35,6 +37,8 @@ export const OTAuditLog: React.FC<OTAuditLogProps> = ({
   attendanceData, 
   shifts,
   punches = [],
+  otBasis = 'basic',
+  otMultiplier = 1.5,
   onEdit,
   onApprove,
   onReject,
@@ -489,6 +493,12 @@ export const OTAuditLog: React.FC<OTAuditLogProps> = ({
               <th className="px-3 py-3.5 whitespace-nowrap">Bio OT</th>
               <th className="px-3 py-3.5 whitespace-nowrap">Sup. OT</th>
               <th className="px-3 py-3.5 whitespace-nowrap text-indigo-600 dark:text-indigo-400">Final OT</th>
+              <th className="px-3 py-3.5 whitespace-nowrap text-indigo-700 dark:text-indigo-300">
+                <div className="flex flex-col">
+                  <span>OT Rate & Pay</span>
+                  <span className="text-[9px] font-normal text-slate-400 lowercase">{otBasis === 'gross' ? 'Gross' : 'Basic'} Salary Basis</span>
+                </div>
+              </th>
               <th className="px-3 py-3.5 whitespace-nowrap text-emerald-600 dark:text-emerald-400">HR Saving</th>
               <th className="px-3 py-3.5 whitespace-nowrap">Audit Status</th>
               <th className="px-3 py-3.5 whitespace-nowrap">OT Status</th>
@@ -498,7 +508,7 @@ export const OTAuditLog: React.FC<OTAuditLogProps> = ({
           <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
             {currentRecords.length === 0 ? (
               <tr>
-                <td colSpan={12} className="px-4 py-12 text-center text-slate-400 dark:text-slate-500">
+                <td colSpan={13} className="px-4 py-12 text-center text-slate-400 dark:text-slate-500">
                   <div className="flex flex-col items-center justify-center gap-2">
                     <Layers className="w-8 h-8 opacity-40" />
                     <p className="text-sm font-semibold">No overtime audit records found matching criteria</p>
@@ -511,6 +521,17 @@ export const OTAuditLog: React.FC<OTAuditLogProps> = ({
                 const isSelected = selectedIds.includes(record.id);
                 const isExpanded = expandedRecordId === record.id;
                 const hasSaving = audit.hrSaving > 0;
+
+                const recBasis = record.otBasis || otBasis || 'basic';
+                const monthlyBasic = Number(audit.emp?.basicSalary || 0);
+                const monthlyAllowances = Number(audit.emp?.allowances || ((Number(audit.emp?.dearnessAllowance || 0)) + (Number(audit.emp?.otherAllowance || 0))) || 0);
+                const monthlyGross = Number(audit.emp?.grossSalary && audit.emp.grossSalary >= monthlyBasic ? audit.emp.grossSalary : (monthlyBasic + monthlyAllowances));
+                const salaryBase = recBasis === 'gross' ? monthlyGross : monthlyBasic;
+                const dutyHrs = Number(audit.standardDutyHours || 8) || 8;
+                const divisor = 26 * dutyHrs;
+                const mult = otMultiplier || 1.5;
+                const calculatedHourlyRate = record.otRate || (salaryBase > 0 && divisor > 0 ? Number(((salaryBase / divisor) * mult).toFixed(2)) : 0);
+                const calculatedOtPay = record.otAmount !== undefined ? record.otAmount : Math.round(Number(audit.finalOt || 0) * calculatedHourlyRate);
 
                 return (
                   <React.Fragment key={record.id}>
@@ -616,6 +637,18 @@ export const OTAuditLog: React.FC<OTAuditLogProps> = ({
                         <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/60 px-2 py-0.5 rounded-md border border-indigo-100 dark:border-indigo-900/40">
                           {audit.finalOt}h
                         </span>
+                      </td>
+
+                      {/* Calculated OT Pay & Basis */}
+                      <td className="px-3 py-3 whitespace-nowrap">
+                        <div className="flex flex-col">
+                          <span className="text-xs font-black text-indigo-600 dark:text-indigo-400">
+                            Rs. {calculatedOtPay.toLocaleString()}
+                          </span>
+                          <span className="text-[9px] font-semibold text-slate-500 dark:text-slate-400">
+                            {recBasis === 'gross' ? 'Gross' : 'Basic'} @ Rs.{calculatedHourlyRate}/h ({mult}x)
+                          </span>
+                        </div>
                       </td>
 
                       {/* HR Saving */}

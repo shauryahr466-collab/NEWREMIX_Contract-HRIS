@@ -12,7 +12,7 @@ type LoginStep = 'credentials' | 'otp';
 const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
 
 export function Login() {
-  const { setIsOtpVerified, setUser, setIsAdmin } = useAppStore();
+  const { setIsOtpVerified, setUser, setIsAdmin, setCurrentUserProfile } = useAppStore();
   const [step, setStep] = useState<LoginStep>('credentials');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -78,6 +78,38 @@ export function Login() {
     setIsLoading(true);
     setUnauthorizedDomain(null);
     try {
+      // 1. Check Super-Admin-provisioned local SQLite RBAC user accounts first
+      const localRes = await fetch('/api/auth/local-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email.trim(), password })
+      });
+      const localData = await localRes.json().catch(() => ({}));
+
+      if (localRes.ok && localData?.success && localData?.user) {
+        const u = localData.user;
+        const sessionUser = {
+          uid: u.id,
+          email: u.email,
+          displayName: u.username,
+          role: u.role
+        };
+        sessionStorage.setItem('local_session_user', JSON.stringify(sessionUser));
+        setUser(sessionUser);
+        setCurrentUserProfile(u);
+        setIsAdmin(u.role === 'Super Admin');
+        setIsOtpVerified(true);
+        toast.success(`Signed in as ${u.username} (${u.role})`);
+        navigate('/');
+        return;
+      }
+
+      if (localRes.status === 401 || localRes.status === 403) {
+        toast.error(localData?.error || 'Invalid credentials or suspended account');
+        return;
+      }
+
+      // 2. Fallback to Firebase Auth for cloud-registered accounts
       await emailSignIn(email, password);
       if (isUserAdmin(email)) {
         setIsOtpVerified(true);
@@ -222,15 +254,15 @@ export function Login() {
 
                 <form onSubmit={handleCredentialsLogin} className="space-y-5">
                   <div className="space-y-2">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Work Email</label>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Work Email or Login ID</label>
                     <div className="relative">
                       <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                       <Input 
-                        type="email"
+                        type="text"
                         value={email}
                         onChange={(e) => setEmail(e.target.value)}
                         className="pl-10 h-11"
-                        placeholder="john.doe@company.com"
+                        placeholder="email@company.com or login ID"
                         required
                       />
                     </div>

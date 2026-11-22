@@ -4,6 +4,13 @@ import initSqlJs, { Database } from 'sql.js';
 
 let dbInstance: Database | null = null;
 let activeDbPath: string | null = null;
+let activeDbMtimeMs = 0;
+let activeDbSize = 0;
+
+let roDbInstance: Database | null = null;
+let roDbPath: string | null = null;
+let roDbMtimeMs = 0;
+let roDbSize = 0;
 
 // Ensure root folder works across operating systems safely
 export function getSanitizedRootFolder(): string {
@@ -68,10 +75,23 @@ export function initLocalDirectories() {
 }
 
 export async function getSqliteDb(): Promise<Database> {
-  if (dbInstance) {
+  const dbPath = getSqliteDbPath();
+
+  if (dbInstance && activeDbPath === dbPath) {
     try {
-      dbInstance.exec('PRAGMA quick_check;');
-      return dbInstance;
+      let diskChanged = false;
+      if (fs.existsSync(dbPath)) {
+        const stats = fs.statSync(dbPath);
+        if (stats.size > 0 && (stats.mtimeMs !== activeDbMtimeMs || stats.size !== activeDbSize)) {
+          diskChanged = true;
+        }
+      }
+      if (!diskChanged) {
+        dbInstance.exec('PRAGMA quick_check;');
+        return dbInstance;
+      }
+      try { dbInstance.close(); } catch {}
+      dbInstance = null;
     } catch {
       dbInstance = null;
     }
@@ -79,7 +99,6 @@ export async function getSqliteDb(): Promise<Database> {
 
   initLocalDirectories();
   const SQL = await initSqlJs();
-  const dbPath = getSqliteDbPath();
   activeDbPath = dbPath;
 
   const dbDir = path.dirname(dbPath);
@@ -89,12 +108,14 @@ export async function getSqliteDb(): Promise<Database> {
 
   let fileBuffer: Buffer | null = null;
   const dbExists = fs.existsSync(dbPath);
+  let loadedStats: fs.Stats | null = null;
 
   if (dbExists) {
     try {
       const stats = fs.statSync(dbPath);
       if (stats.size > 0) {
         fileBuffer = fs.readFileSync(dbPath);
+        loadedStats = stats;
       }
     } catch (e) {
       console.warn(`[SQLite] Failed to read existing database at ${dbPath}:`, e);
@@ -111,6 +132,8 @@ export async function getSqliteDb(): Promise<Database> {
       if (check && check.length > 0 && check[0].values?.[0]?.[0] === 'ok') {
         dbInstance = candidate;
         loadedSuccessfully = true;
+        activeDbMtimeMs = loadedStats?.mtimeMs || 0;
+        activeDbSize = loadedStats?.size || fileBuffer.length;
         console.log(`[SQLite] Loaded healthy database from: ${dbPath}`);
       } else {
         throw new Error('Database quick_check failed');
@@ -565,8 +588,58 @@ export async function getSqliteDb(): Promise<Database> {
     console.warn('[SQLite] Notice during employee joining_date auto-normalization:', migErr);
   }
 
-  saveSqliteDb();
+  if (!dbExists || !loadedSuccessfully) {
+    saveSqliteDb();
+  }
   return dbInstance;
+}
+
+/**
+ * 100% Read-Only SQLite Snapshot Reader.
+ * Reads directly from physical Database.db on disk whenever file mtime/size changes
+ * and NEVER exports, saves, or mutates Database.db.
+ */
+export async function withReadOnlySqliteSnapshot<T>(operation: (db: Database) => T): Promise<T> {
+  const dbPath = getSqliteDbPath();
+
+  if (!fs.existsSync(dbPath)) {
+    // Fallback to initialized schema view if DB file has not been created yet, without forcing disk writes if avoidable
+    const db = await getSqliteDb();
+    return operation(db);
+  }
+
+  try {
+    const stats = fs.statSync(dbPath);
+    if (stats.size > 0) {
+      const needsReload =
+        !roDbInstance ||
+        roDbPath !== dbPath ||
+        roDbMtimeMs !== stats.mtimeMs ||
+        roDbSize !== stats.size;
+
+      if (needsReload) {
+        const SQL = await initSqlJs();
+        const fileBuffer = fs.readFileSync(dbPath);
+        const candidate = new SQL.Database(fileBuffer);
+        if (roDbInstance) {
+          try { roDbInstance.close(); } catch {}
+        }
+        roDbInstance = candidate;
+        roDbPath = dbPath;
+        roDbMtimeMs = stats.mtimeMs;
+        roDbSize = stats.size;
+      }
+
+      if (roDbInstance) {
+        return operation(roDbInstance);
+      }
+    }
+  } catch (err) {
+    console.warn('[SQLite Read-Only Snapshot] Falling back cleanly:', err);
+  }
+
+  const db = await getSqliteDb();
+  return operation(db);
 }
 
 export async function resetSqliteDb(): Promise<Database> {
@@ -623,6 +696,12 @@ export function saveSqliteDb() {
     const tmpPath = `${targetPath}.tmp.${Date.now()}`;
     fs.writeFileSync(tmpPath, buffer);
     fs.renameSync(tmpPath, targetPath);
+
+    try {
+      const savedStats = fs.statSync(targetPath);
+      activeDbMtimeMs = savedStats.mtimeMs;
+      activeDbSize = savedStats.size;
+    } catch {}
   } catch (err) {
     console.warn('[SQLite] Notice during SQLite disk sync:', err);
   }

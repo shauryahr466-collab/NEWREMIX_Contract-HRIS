@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import initSqlJs from 'sql.js';
-import { getSqliteDb, saveSqliteDb, getSanitizedRootFolder, setRootFolder, getSqliteDbPath, createDatabaseBackup, withSqliteWriteLock } from './sqliteDb.js';
+import { getSqliteDb, saveSqliteDb, getSanitizedRootFolder, setRootFolder, getSqliteDbPath, createDatabaseBackup, withSqliteWriteLock, withReadOnlySqliteSnapshot } from './sqliteDb.js';
 
 export const localRouter = express.Router();
 
@@ -45,32 +45,37 @@ function sanitizeFileName(fileName: string): string {
   return fileName.replace(/[^a-zA-Z0-9_.-]/g, '_');
 }
 
-// 1. Status & Health
+// 1. Status & Health (100% Read-Only Snapshot)
 localRouter.get('/status', async (req, res) => {
   try {
-    const db = await getSqliteDb();
     const root = getSanitizedRootFolder();
 
-    let empCount = 0;
-    let punchCount = 0;
-    let docCount = 0;
+    const { empCount, punchCount, docCount } = await withReadOnlySqliteSnapshot((db) => {
+      let eCount = 0;
+      let pCount = 0;
+      let dCount = 0;
 
-    try {
-      const empRes = db.exec('SELECT COUNT(*) as cnt FROM employees');
-      if (empRes.length > 0 && empRes[0].values.length > 0) {
-        empCount = Number(empRes[0].values[0][0]);
-      }
-      const punchRes = db.exec('SELECT COUNT(*) as cnt FROM attendance_punches');
-      if (punchRes.length > 0 && punchRes[0].values.length > 0) {
-        punchCount = Number(punchRes[0].values[0][0]);
-      }
-      const docRes = db.exec('SELECT COUNT(*) as cnt FROM documents');
-      if (docRes.length > 0 && docRes[0].values.length > 0) {
-        docCount = Number(docRes[0].values[0][0]);
-      }
-    } catch (e) {
-      console.warn('[Status] Query count note:', e);
-    }
+      try {
+        const empRes = db.exec('SELECT COUNT(*) as cnt FROM employees');
+        if (empRes.length > 0 && empRes[0].values.length > 0) {
+          eCount = Number(empRes[0].values[0][0]);
+        }
+      } catch {}
+      try {
+        const punchRes = db.exec('SELECT COUNT(*) as cnt FROM attendance_punches');
+        if (punchRes.length > 0 && punchRes[0].values.length > 0) {
+          pCount = Number(punchRes[0].values[0][0]);
+        }
+      } catch {}
+      try {
+        const docRes = db.exec('SELECT COUNT(*) as cnt FROM documents');
+        if (docRes.length > 0 && docRes[0].values.length > 0) {
+          dCount = Number(docRes[0].values[0][0]);
+        }
+      } catch {}
+
+      return { empCount: eCount, punchCount: pCount, docCount: dCount };
+    });
 
     const backupsDir = fs.existsSync(path.join(root, 'Backups')) 
       ? path.join(root, 'Backups') 
@@ -82,11 +87,14 @@ localRouter.get('/status', async (req, res) => {
 
     res.json({
       status: 'online',
-      mode: 'LOCAL MODE',
+      mode: 'LOCAL MODE (SQLITE ZKT SYNC)',
       database: 'SQLite',
       storage: 'Local Disk',
+      punchMode: 'READ_WRITE',
+      externalWriterMode: false,
       internetRequired: false,
       rootFolder: root,
+      dbPath: getSqliteDbPath(),
       stats: {
         employees: empCount,
         punches: punchCount,
@@ -109,7 +117,7 @@ localRouter.post('/config/root', (req, res) => {
   res.json({ success: true, rootFolder: getSanitizedRootFolder() });
 });
 
-// 3. Generic Get Table Data
+// 3. Generic Get Table Data (100% Read-Only Snapshot — Zero SQLite Writes!)
 localRouter.get('/data/:table', async (req, res) => {
   const { table } = req.params;
   const sqlTable = SQL_TABLE_MAP[table];
@@ -118,158 +126,163 @@ localRouter.get('/data/:table', async (req, res) => {
   }
 
   try {
-    const db = await getSqliteDb();
-
-    // Auto-sync zk_user_mappings with Active Employees in Directory so User Mapping matches Directory
-    if (sqlTable === 'zk_user_mappings') {
+    const rows = await withReadOnlySqliteSnapshot((db) => {
+      let result: ReturnType<typeof db.exec> = [];
       try {
-        const empRes = db.exec('SELECT id, name, department, status, data FROM employees');
-        if (empRes.length > 0 && empRes[0].values.length > 0) {
-          const existingRes = db.exec('SELECT id, employee_id FROM zk_user_mappings');
-          const mappedEmpIds = new Set<string>();
-          if (existingRes.length > 0) {
-            for (const r of existingRes[0].values) {
-              if (r[1]) mappedEmpIds.add(String(r[1]).trim());
-            }
-          }
+        result = db.exec(`SELECT * FROM ${sqlTable}`);
+      } catch {
+        return [];
+      }
 
-          const nowIso = new Date().toISOString();
-          let addedAny = false;
-          const mapStmt = db.prepare(`
-            INSERT OR IGNORE INTO zk_user_mappings (id, device_user_id, employee_id, data)
-            VALUES (?, ?, ?, ?)
-          `);
+      const columns = result.length > 0 ? result[0].columns : [];
+      const dataIdx = columns.indexOf('data');
 
-          for (const row of empRes[0].values) {
-            const empId = String(row[0] || '').trim();
-            const empName = String(row[1] || empId).trim();
-            const empDept = String(row[2] || 'General').trim();
-            let empStatus = String(row[3] || 'Active').trim();
-            let empData: any = {};
-            if (row[4]) {
+      const baseRows: any[] = result.length > 0
+        ? result[0].values.map(valArr => {
+            const colObj: Record<string, any> = {};
+            columns.forEach((col, i) => {
+              colObj[col] = valArr[i];
+            });
+
+            let parsedData: Record<string, any> | null = null;
+            if (dataIdx !== -1 && valArr[dataIdx]) {
               try {
-                empData = JSON.parse(String(row[4]));
-                if (empData.status) empStatus = String(empData.status).trim();
-              } catch {}
+                parsedData = JSON.parse(valArr[dataIdx] as string);
+              } catch {
+                parsedData = null;
+              }
             }
-            if (!empId || empStatus.toLowerCase() !== 'active') continue;
-            if (mappedEmpIds.has(empId)) continue;
 
-            const devUserId = String(empData.deviceUserId || empData.biometricId || empData.acNo || empData.zkPin || empId).trim();
-            const mapId = `map_${devUserId}`;
-            const mapObj = {
-              id: mapId,
-              deviceUserId: devUserId,
-              employeeId: empId,
-              employeeName: empName,
-              department: empDept,
-              mappedAt: empData.joiningDate || nowIso
-            };
-            mapStmt.run([mapId, devUserId, empId, JSON.stringify(mapObj)]);
-            mappedEmpIds.add(empId);
-            addedAny = true;
-          }
-          mapStmt.free();
-          if (addedAny) saveSqliteDb();
-        }
-      } catch (e) {
-        console.warn('[SQLite] Auto-sync zk_user_mappings notice:', e);
-      }
-    }
+            // Normalize raw biometric punches read-only so external SQLite writers work cleanly
+            // whether they write JSON into `data` or direct SQL columns (employee_id, punch_datetime, etc.)
+            if (sqlTable === 'attendance_punches') {
+              const rawDt = String(parsedData?.punchDatetime || colObj.punch_datetime || '').trim().replace(' ', 'T');
+              const empId = String(parsedData?.employeeId || colObj.employee_id || '').trim();
+              return {
+                ...(parsedData || {}),
+                id: String(parsedData?.id || colObj.id || `${empId}_${rawDt}`),
+                employeeId: empId,
+                punchDatetime: rawDt,
+                deviceId: String(parsedData?.deviceId ?? colObj.device_id ?? ''),
+                source: String(parsedData?.source || colObj.source || 'ZKTeco')
+              };
+            }
 
-    const result = db.exec(`SELECT * FROM ${sqlTable}`);
-    if (result.length === 0) return res.json([]);
+            return parsedData || colObj;
+          })
+        : [];
 
-    const columns = result[0].columns;
-    const dataIdx = columns.indexOf('data');
-
-    const rows = result[0].values.map(valArr => {
-      if (dataIdx !== -1 && valArr[dataIdx]) {
+      // Compute missing active-employee mappings in-memory for response only (ZERO SQLite writes)
+      if (sqlTable === 'zk_user_mappings') {
         try {
-          return JSON.parse(valArr[dataIdx] as string);
-        } catch (e) {
-          // fallback
-        }
-      }
-      const obj: Record<string, any> = {};
-      columns.forEach((col, i) => {
-        obj[col] = valArr[i];
-      });
-      return obj;
-    });
-
-    // Dynamically reconcile zk_devices userCount & logCount with actual SQLite attendance_punches & active employees
-    if (sqlTable === 'zk_devices' && rows.length > 0) {
-      try {
-        // If there are unassigned DIA punches in attendance_punches (device_id = ''), link them to the primary enabled device
-        const assignedCheck = db.exec("SELECT COUNT(*) FROM attendance_punches WHERE device_id != '' AND device_id IS NOT NULL");
-        const assignedCnt = assignedCheck.length > 0 ? Number(assignedCheck[0].values[0][0] || 0) : 0;
-        const unassignedCheck = db.exec("SELECT COUNT(*) FROM attendance_punches WHERE device_id = '' OR device_id IS NULL");
-        const unassignedCnt = unassignedCheck.length > 0 ? Number(unassignedCheck[0].values[0][0] || 0) : 0;
-
-        if (assignedCnt === 0 && unassignedCnt > 0) {
-          const primaryDev = rows.find((d: any) => d && d.id && d.enabled !== false) || rows[0];
-          if (primaryDev && primaryDev.id) {
-            const linkStmt = db.prepare(
-              "UPDATE attendance_punches SET device_id = ?, source = 'ZKTeco', data = json_set(data, '$.deviceId', ?, '$.deviceName', ?, '$.deviceIP', ?, '$.source', 'ZKTeco') WHERE device_id = '' OR device_id IS NULL"
+          const empRes = db.exec('SELECT id, name, department, status, data FROM employees');
+          if (empRes.length > 0 && empRes[0].values.length > 0) {
+            const mappedEmpIds = new Set<string>(
+              baseRows.map((r: any) => String(r?.employeeId || r?.employee_id || '').trim()).filter(Boolean)
             );
-            linkStmt.run([primaryDev.id, primaryDev.id, primaryDev.name || 'ZKTeco Device', primaryDev.ip || '']);
-            linkStmt.free();
-            saveSqliteDb();
-          }
-        }
+            const nowIso = new Date().toISOString();
 
-        const statsByDev = new Map<string, { logs: number; users: number }>();
-        const devPunchRes = db.exec(
-          "SELECT device_id, COUNT(*) as log_cnt, COUNT(DISTINCT CASE WHEN employee_id != '' THEN employee_id END) as user_cnt FROM attendance_punches GROUP BY device_id"
-        );
-        let totalLogsAll = 0;
-        if (devPunchRes.length > 0) {
-          for (const r of devPunchRes[0].values) {
-            const dId = String(r[0] || '');
-            const lCnt = Number(r[1] || 0);
-            const uCnt = Number(r[2] || 0);
-            totalLogsAll += lCnt;
-            if (dId) {
-              statsByDev.set(dId, { logs: lCnt, users: uCnt });
+            for (const row of empRes[0].values) {
+              const empId = String(row[0] || '').trim();
+              const empName = String(row[1] || empId).trim();
+              const empDept = String(row[2] || 'General').trim();
+              let empStatus = String(row[3] || 'Active').trim();
+              let empData: any = {};
+              if (row[4]) {
+                try {
+                  empData = JSON.parse(String(row[4]));
+                  if (empData.status) empStatus = String(empData.status).trim();
+                } catch {}
+              }
+              if (!empId || empStatus.toLowerCase() !== 'active') continue;
+              if (mappedEmpIds.has(empId)) continue;
+
+              const devUserId = String(empData.deviceUserId || empData.biometricId || empData.acNo || empData.zkPin || empId).trim();
+              baseRows.push({
+                id: `map_${devUserId}`,
+                deviceUserId: devUserId,
+                employeeId: empId,
+                employeeName: empName,
+                department: empDept,
+                mappedAt: empData.joiningDate || nowIso
+              });
+              mappedEmpIds.add(empId);
             }
           }
+        } catch (e) {
+          console.warn('[SQLite Read-Only] Virtual zk_user_mappings enrichment note:', e);
         }
-
-        let activeEmpCount = 0;
-        const activeEmpRes = db.exec("SELECT COUNT(*) FROM employees WHERE LOWER(status) = 'active'");
-        if (activeEmpRes.length > 0 && activeEmpRes[0].values.length > 0) {
-          activeEmpCount = Number(activeEmpRes[0].values[0][0] || 0);
-        }
-
-        let updatedAnyDev = false;
-        const updStmt = db.prepare('UPDATE zk_devices SET data = ? WHERE id = ?');
-
-        for (const dev of rows) {
-          if (!dev || !dev.id) continue;
-          const exactStats = statsByDev.get(dev.id) || { logs: 0, users: 0 };
-          const exactLogCount = exactStats.logs;
-          const exactUserCount = exactStats.users;
-
-          if (
-            dev.logCount !== exactLogCount ||
-            dev.userCount !== exactUserCount ||
-            dev.activeDirectoryUsers !== activeEmpCount
-          ) {
-            dev.logCount = exactLogCount;
-            dev.userCount = exactUserCount;
-            dev.activeDirectoryUsers = activeEmpCount;
-            dev.totalSystemLogs = totalLogsAll;
-            updStmt.run([JSON.stringify(dev), dev.id]);
-            updatedAnyDev = true;
-          }
-        }
-        updStmt.free();
-        if (updatedAnyDev) saveSqliteDb();
-      } catch (e) {
-        console.warn('[SQLite] Reconcile zk_devices counts notice:', e);
       }
-    }
+
+      // Compute device user/log counts dynamically in-memory for response only (ZERO SQLite writes)
+      if (sqlTable === 'zk_devices' && baseRows.length > 0) {
+        try {
+          const statsByDev = new Map<string, { logs: number; users: number }>();
+          let unassignedLogs = 0;
+          const unassignedUsersSet = new Set<string>();
+          let totalLogsAll = 0;
+
+          const devPunchRes = db.exec(
+            "SELECT device_id, employee_id FROM attendance_punches"
+          );
+          if (devPunchRes.length > 0) {
+            const usersPerDev = new Map<string, Set<string>>();
+            for (const r of devPunchRes[0].values) {
+              const dId = String(r[0] || '').trim();
+              const eId = String(r[1] || '').trim();
+              totalLogsAll += 1;
+              if (dId) {
+                const entry = statsByDev.get(dId) || { logs: 0, users: 0 };
+                entry.logs += 1;
+                statsByDev.set(dId, entry);
+                if (eId) {
+                  let uSet = usersPerDev.get(dId);
+                  if (!uSet) {
+                    uSet = new Set<string>();
+                    usersPerDev.set(dId, uSet);
+                  }
+                  uSet.add(eId);
+                }
+              } else {
+                unassignedLogs += 1;
+                if (eId) unassignedUsersSet.add(eId);
+              }
+            }
+            for (const [dId, uSet] of usersPerDev.entries()) {
+              const entry = statsByDev.get(dId);
+              if (entry) entry.users = uSet.size;
+            }
+          }
+
+          let activeEmpCount = 0;
+          try {
+            const activeEmpRes = db.exec("SELECT COUNT(*) FROM employees WHERE LOWER(status) = 'active'");
+            if (activeEmpRes.length > 0 && activeEmpRes[0].values.length > 0) {
+              activeEmpCount = Number(activeEmpRes[0].values[0][0] || 0);
+            }
+          } catch {}
+
+          const primaryDev = baseRows.find((d: any) => d && d.id && d.enabled !== false) || baseRows[0];
+
+          return baseRows.map((dev: any) => {
+            if (!dev || !dev.id) return dev;
+            const exactStats = statsByDev.get(dev.id) || { logs: 0, users: 0 };
+            const includeUnassigned = statsByDev.size === 0 && primaryDev?.id === dev.id;
+            return {
+              ...dev,
+              logCount: exactStats.logs + (includeUnassigned ? unassignedLogs : 0),
+              userCount: Math.max(exactStats.users, includeUnassigned ? unassignedUsersSet.size : 0),
+              activeDirectoryUsers: activeEmpCount,
+              totalSystemLogs: totalLogsAll
+            };
+          });
+        } catch (e) {
+          console.warn('[SQLite Read-Only] Device stats enrichment note:', e);
+        }
+      }
+
+      return baseRows;
+    });
 
     res.json(rows);
   } catch (error: any) {
@@ -328,6 +341,10 @@ localRouter.post('/data/:table', async (req, res) => {
         INSERT INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          punch_datetime=excluded.punch_datetime,
+          device_id=excluded.device_id,
+          source=excluded.source,
           data=excluded.data
       `);
       for (const item of items) {
@@ -830,28 +847,33 @@ localRouter.post('/data/:table/delete', async (req, res) => {
   });
 });
 
-// 5b. Database Verification Health Check
+// 5b. Database Verification Health Check (100% Read-Only)
 localRouter.get('/verify-db', async (req, res) => {
   try {
-    const db = await getSqliteDb();
-    const checkRes = db.exec('PRAGMA integrity_check;');
-    const integrity = (checkRes.length > 0 && checkRes[0].values?.[0]?.[0] === 'ok') ? 'PASSED' : 'WARNING';
     const dbPath = getSqliteDbPath();
-    
-    // Get counts
-    const counts: Record<string, number> = {};
-    const tables = ['employees', 'attendance_punches', 'payroll_runs', 'roster_assignments', 'documents', 'audit_logs'];
-    for (const t of tables) {
+    const { integrity, counts } = await withReadOnlySqliteSnapshot((db) => {
+      let check = 'WARNING';
       try {
-        const cRes = db.exec(`SELECT COUNT(*) FROM ${t}`);
-        counts[t] = cRes.length > 0 ? Number(cRes[0].values[0][0]) : 0;
-      } catch {
-        counts[t] = 0;
+        const checkRes = db.exec('PRAGMA integrity_check;');
+        check = (checkRes.length > 0 && checkRes[0].values?.[0]?.[0] === 'ok') ? 'PASSED' : 'WARNING';
+      } catch {}
+
+      const tableCounts: Record<string, number> = {};
+      const tables = ['employees', 'attendance_punches', 'payroll_runs', 'roster_assignments', 'documents', 'audit_logs'];
+      for (const t of tables) {
+        try {
+          const cRes = db.exec(`SELECT COUNT(*) FROM ${t}`);
+          tableCounts[t] = cRes.length > 0 ? Number(cRes[0].values[0][0]) : 0;
+        } catch {
+          tableCounts[t] = 0;
+        }
       }
-    }
+      return { integrity: check, counts: tableCounts };
+    });
 
     res.json({
       status: 'healthy',
+      punchMode: 'READ_WRITE',
       integrityCheck: integrity,
       databasePath: dbPath,
       rootFolder: getSanitizedRootFolder(),
@@ -1421,7 +1443,11 @@ localRouter.post('/data/:table/purge', async (req, res) => {
     audit_decisions: 'audit_decisions',
     tax_rules: 'tax_rules',
     deduction_rules: 'deduction_rules',
-    salary_components: 'salary_components'
+    salary_components: 'salary_components',
+    zk_devices: 'zk_devices',
+    zk_user_mappings: 'zk_user_mappings',
+    zk_sync_logs: 'zk_sync_logs',
+    zk_unmapped_punches: 'zk_unmapped_punches'
   };
 
   const sqlTable = validTables[table];
@@ -1630,15 +1656,31 @@ localRouter.post('/migrate-from-firestore', async (req, res) => {
     }
 
     if (Array.isArray(punches) && punches.length > 0) {
-      const stmt = db.prepare(`
+      const pStmt = db.prepare(`
         INSERT INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          punch_datetime=excluded.punch_datetime,
+          device_id=excluded.device_id,
+          source=excluded.source,
+          data=excluded.data
       `);
-      punches.forEach(p => {
-        if (p.id) stmt.run([p.id, p.employeeId || '', p.punchDatetime || '', p.deviceId || '', p.source || 'Manual', JSON.stringify(p), new Date().toISOString()]);
+      const nowIso = new Date().toISOString();
+      punches.forEach((p: any) => {
+        if (p && p.id) {
+          pStmt.run([
+            p.id,
+            p.employeeId || '',
+            p.punchDatetime || nowIso,
+            p.deviceId || '',
+            p.source || 'FileImport',
+            JSON.stringify(p),
+            nowIso
+          ]);
+        }
       });
-      stmt.free();
+      pStmt.free();
     }
 
     if (settings) {
@@ -1710,30 +1752,25 @@ localRouter.post('/import-excel', async (req, res) => {
       const stmt = db.prepare(`
         INSERT INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET data=excluded.data
+        ON CONFLICT(id) DO UPDATE SET
+          employee_id=excluded.employee_id,
+          punch_datetime=excluded.punch_datetime,
+          device_id=excluded.device_id,
+          source=excluded.source,
+          data=excluded.data
       `);
       for (const r of rows) {
-        const empId = String(r.employeeId || r.id || r.EmployeeID || r.code || '').trim();
-        const punchTime = String(r.punchDatetime || r.punchTime || r.time || r.date || now).replace(' ', 'T');
-        if (!empId) continue;
-        const id = `import_${empId}_${punchTime.replace(/[^a-zA-Z0-9]/g, '_')}`;
-        const punchObj = {
-          id,
-          employeeId: empId,
-          punchDatetime: punchTime,
-          deviceId: r.deviceId || 'ExcelImport',
-          source: r.source || 'Excel/CSV Import',
-          importFormat: 'excel'
-        };
-        stmt.run([id, empId, punchTime, punchObj.deviceId, punchObj.source, JSON.stringify(punchObj), now]);
+        const empId = String(r.employeeId || r.employee_id || '').trim();
+        const pDt = String(r.punchDatetime || r.punch_datetime || '').trim();
+        const id = String(r.id || `${empId}_${pDt.replace(/[:.-]/g, '')}`).trim();
+        if (!id || !empId || !pDt) continue;
+        stmt.run([id, empId, pDt, r.deviceId || '', r.source || 'FileImport', JSON.stringify(r), now]);
         importedCount++;
       }
       stmt.free();
-    } else {
-      // Generic batch save
-      const targetTable = type === 'shift_assignments' ? 'shift_assignments' : 'attendance_punches';
+    } else if (type === 'shift_assignments') {
       const stmt = db.prepare(`
-        INSERT INTO ${targetTable} (id, data)
+        INSERT INTO shift_assignments (id, data)
         VALUES (?, ?)
         ON CONFLICT(id) DO UPDATE SET data=excluded.data
       `);
@@ -1743,6 +1780,9 @@ localRouter.post('/import-excel', async (req, res) => {
         importedCount++;
       }
       stmt.free();
+    } else {
+      try { db.run('ROLLBACK'); } catch {}
+      return res.status(400).json({ error: 'Unsupported import type for SQLite persistence.' });
     }
 
     db.run('COMMIT');

@@ -5,7 +5,7 @@ import {
   Clock, Search, Download, 
   RefreshCw, Plus, Save, Trash2,
   Calendar, ChevronLeft, ChevronRight, X,
-  FileSpreadsheet, Upload
+  FileSpreadsheet, Upload, Calculator, CheckCircle2, CheckSquare, Square, Info, ShieldCheck, DollarSign
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -18,9 +18,12 @@ import { cn, normalizeEmployeeId, formatPunchTime, getAttendanceInAndOut, toDevi
 
 export default function Overtime() {
   const { 
-    overtimeRecords, employees, processedData, settings, punches,
-    updateOvertime, addOvertime, deleteOvertime, setOvertimeBatch, deleteOvertimeBatch, user, openEmployeeProfile, globalSearchTerm 
+    overtimeRecords, employees, processedData, settings, punches, setSettings,
+    updateOvertime, addOvertime, deleteOvertime, setOvertimeBatch, deleteOvertimeBatch, user, openEmployeeProfile, globalSearchTerm,
+    effectiveUserProfile
   } = useAppStore();
+  const canApproveOt = !effectiveUserProfile || effectiveUserProfile.role === 'Super Admin' || Boolean(effectiveUserProfile.permissions?.canApproveOt);
+  const canSubmitOt = !effectiveUserProfile || effectiveUserProfile.role === 'Super Admin' || Boolean(effectiveUserProfile.permissions?.canSubmitSupervisorOt);
   
   const [searchTerm, setSearchTerm] = useState('');
   const activeSearch = searchTerm || globalSearchTerm;
@@ -108,24 +111,86 @@ export default function Overtime() {
     }).sort((a, b) => b.date.localeCompare(a.date));
   }, [overtimeRecords, empMap, activeSearch, statusFilter, dateRange, designationFilter, contractorFilter]);
 
+  const otCalculationBasis: 'basic' | 'gross' = settings.payrollConfig?.overtimeCalculationBasis || 'basic';
+  const otMultiplier = Number(settings.payrollConfig?.overtimeMultiplier || 1.5);
+
+  const calculateOtDetails = (emp?: Employee, hours = 0, standardHours = 8, basisOverride?: 'basic' | 'gross') => {
+    const effectiveBasis = basisOverride || otCalculationBasis;
+    const monthlyBasic = Number(emp?.basicSalary || 0);
+    const monthlyAllowances = Number(emp?.allowances || (Number(emp?.dearnessAllowance || 0) + Number(emp?.otherAllowance || 0)) || 0);
+    const monthlyGross = Number(emp?.grossSalary && emp.grossSalary >= monthlyBasic ? emp.grossSalary : (monthlyBasic + monthlyAllowances));
+    
+    const wageBase = effectiveBasis === 'gross' ? monthlyGross : monthlyBasic;
+    const dutyHours = Number(standardHours || emp?.targetWorkingHours || 8) || 8;
+    const divisor = 26 * dutyHours;
+    const hourlyRate = wageBase > 0 && divisor > 0 ? Number(((wageBase / divisor) * otMultiplier).toFixed(2)) : 0;
+    const otAmount = Math.round(Number(hours || 0) * hourlyRate);
+
+    return {
+      basis: effectiveBasis,
+      wageBase,
+      hourlyRate,
+      otAmount,
+      otMultiplier
+    };
+  };
+
+  const handleToggleOtBasis = async (newBasis: 'basic' | 'gross') => {
+    const currentConfig = settings.payrollConfig || {
+      fiscalYear: 'FY 2083/84',
+      effectiveBsYear: 2083,
+      singleSlabs: [],
+      marriedSlabs: [],
+      ssfEmployeeRate: 0.11,
+      ssfEmployerRate: 0.20,
+      pfNonSsfRate: 0.10,
+      healthInsuranceRate: 0,
+      ssfSlab1SstWaiver: true,
+      overtimeMultiplier: 1.5,
+      overtimeCalculationBasis: 'basic'
+    };
+    const updated = {
+      ...currentConfig,
+      overtimeCalculationBasis: newBasis
+    };
+    await setSettings({
+      ...settings,
+      payrollConfig: updated as any
+    });
+    toast.success(`OT Calculation Basis switched to ${newBasis === 'gross' ? 'Gross Salary' : 'Basic Salary'}. Approved OT will automatically reflect into Payroll.`);
+  };
+
   // Single-pass stats calculation
   const stats = useMemo(() => {
     let pending = 0;
     let approved = 0;
     let totalHours = 0;
+    let approvedHours = 0;
+    let totalApprovedPayout = 0;
+
     for (let i = 0; i < overtimeRecords.length; i++) {
       const r = overtimeRecords[i];
-      if (r.status === 'Pending') pending++;
-      else if (r.status === 'Approved') approved++;
-      totalHours += Number(r.hours) || 0;
+      const h = Number(r.hours) || 0;
+      totalHours += h;
+      if (r.status === 'Pending') {
+        pending++;
+      } else if (r.status === 'Approved') {
+        approved++;
+        approvedHours += h;
+        const emp = empMap.get(normalizeEmployeeId(r.employeeId)) || empMap.get(r.employeeId);
+        const details = calculateOtDetails(emp, h, Number(r.standardDutyHours) || 8, r.otBasis);
+        totalApprovedPayout += details.otAmount;
+      }
     }
     return {
       total: overtimeRecords.length,
       pending,
       approved,
-      totalHours
+      totalHours,
+      approvedHours,
+      totalApprovedPayout
     };
-  }, [overtimeRecords]);
+  }, [overtimeRecords, empMap, otCalculationBasis, otMultiplier]);
 
   const handleSyncAttendance = async () => {
     if (isSyncing) return;
@@ -229,20 +294,77 @@ export default function Overtime() {
   };
 
   const handleStatusChange = async (id: string, status: 'Approved' | 'Rejected') => {
+    if (!canApproveOt) {
+      toast.error('Your configured role does not have OT approval permission.');
+      return;
+    }
     try {
+      const rec = overtimeRecords.find(r => r.id === id);
+      const emp = rec ? (empMap.get(normalizeEmployeeId(rec.employeeId)) || empMap.get(rec.employeeId)) : undefined;
+      const otDetails = rec ? calculateOtDetails(emp, Number(rec.hours) || 0, Number(rec.standardDutyHours) || 8, rec.otBasis) : null;
+
       await updateOvertime(id, { 
         status, 
-        reviewedBy: user?.username || 'Admin',
-        reviewedDate: new Date().toISOString()
+        reviewedBy: effectiveUserProfile?.username || user?.username || 'Admin',
+        reviewedDate: new Date().toISOString(),
+        ...(status === 'Approved' && otDetails ? {
+          otBasis: otDetails.basis,
+          otRate: otDetails.hourlyRate,
+          otAmount: otDetails.otAmount
+        } : {})
       });
-      toast.success(`OT ${status.toLowerCase()} successfully`);
+      toast.success(status === 'Approved' && otDetails
+        ? `OT Approved: Rs. ${otDetails.otAmount.toLocaleString()} calculated pay (${otDetails.basis.toUpperCase()} basis, ${rec?.hours}h @ Rs.${otDetails.hourlyRate}/h) -> Linked to Payroll`
+        : `OT ${status.toLowerCase()} successfully`
+      );
     } catch (e) {
       toast.error('Operation failed');
     }
   };
 
+  const handleBulkApprove = async () => {
+    if (!canApproveOt) {
+      toast.error('Your configured role does not have OT approval permission.');
+      return;
+    }
+    if (selectedIds.length === 0) return;
+    try {
+      let totalAmount = 0;
+      const updates = selectedIds.map(id => {
+        const rec = overtimeRecords.find(r => r.id === id);
+        const emp = rec ? (empMap.get(normalizeEmployeeId(rec.employeeId)) || empMap.get(rec.employeeId)) : undefined;
+        const otDetails = rec ? calculateOtDetails(emp, Number(rec.hours) || 0, Number(rec.standardDutyHours) || 8, rec.otBasis) : null;
+        if (otDetails) totalAmount += otDetails.otAmount;
+        return {
+          id,
+          status: 'Approved' as const,
+          reviewedBy: user?.username || 'Admin',
+          reviewedDate: new Date().toISOString(),
+          ...(otDetails ? {
+            otBasis: otDetails.basis,
+            otRate: otDetails.hourlyRate,
+            otAmount: otDetails.otAmount
+          } : {})
+        };
+      });
+
+      for (const update of updates) {
+        await updateOvertime(update.id, update);
+      }
+
+      toast.success(`Approved ${selectedIds.length} OT records (Total: Rs. ${totalAmount.toLocaleString()}) -> Linked to Payroll!`);
+      setSelectedIds([]);
+    } catch (e) {
+      toast.error('Bulk approval failed');
+    }
+  };
+
   const handleSaveSupervisorOT = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canSubmitOt && !canApproveOt) {
+      toast.error('Your configured role is read-only for Overtime records.');
+      return;
+    }
     if (!selectedRecord) return;
 
     try {
@@ -250,6 +372,8 @@ export default function Overtime() {
       const supOt = Number(formData.supervisorOtHours) || 0;
       const finalOt = Math.min(bioOt, supOt);
       const hrSaving = Math.max(0, bioOt - finalOt);
+      const emp = empMap.get(normalizeEmployeeId(selectedRecord.employeeId)) || empMap.get(selectedRecord.employeeId);
+      const otDetails = calculateOtDetails(emp, finalOt, Number(selectedRecord.standardDutyHours) || 8, selectedRecord.otBasis);
 
       await updateOvertime(selectedRecord.id, {
         supervisorOtHours: Number(supOt.toFixed(2)),
@@ -258,7 +382,10 @@ export default function Overtime() {
         otStartTime: formData.otStartTime,
         otEndTime: formData.otEndTime,
         remarks: formData.remarks,
-        type: formData.type
+        type: formData.type,
+        otBasis: otDetails.basis,
+        otRate: otDetails.hourlyRate,
+        otAmount: otDetails.otAmount
       });
 
       toast.success('Supervisor OT saved successfully');
@@ -275,8 +402,10 @@ export default function Overtime() {
     try {
       const bioOt = 0; 
       const supOt = Number(formData.supervisorOtHours) || 0;
-      const finalOt = Math.min(bioOt, supOt);
-      const hrSaving = Math.max(0, bioOt - finalOt);
+      const finalOt = supOt;
+      const hrSaving = 0;
+      const emp = empMap.get(normalizeEmployeeId(formData.employeeId)) || empMap.get(formData.employeeId);
+      const otDetails = calculateOtDetails(emp, finalOt, 8);
 
       await addOvertime({
         employeeId: formData.employeeId,
@@ -291,7 +420,10 @@ export default function Overtime() {
         hours: finalOt,
         hrSaving: hrSaving,
         status: 'Pending',
-        shiftId: null 
+        shiftId: null,
+        otBasis: otDetails.basis,
+        otRate: otDetails.hourlyRate,
+        otAmount: otDetails.otAmount
       });
       toast.success('OT record added successfully');
       setIsModalOpen(false);
@@ -441,42 +573,56 @@ export default function Overtime() {
               <RefreshCw size={16} className={cn(isSyncing && "animate-spin")} />
               {isSyncing ? 'Syncing...' : 'Sync'}
             </Button>
-            <Button onClick={() => setIsModalOpen(true)} className="gap-2">
-              <Plus size={16} />
-              Manual Entry
-            </Button>
+            {canSubmitOt && (
+              <>
+                <Button onClick={() => setIsModalOpen(true)} className="gap-2">
+                  <Plus size={16} />
+                  Manual Entry
+                </Button>
+                <Button 
+                  variant="outline" 
+                  onClick={() => generateSupervisorOTTemplate(employees)} 
+                  className="gap-2 border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
+                  title="Download official Excel template with instructions and sample rows"
+                >
+                  <FileSpreadsheet size={16} />
+                  Export Template
+                </Button>
+                <Button 
+                  onClick={() => setIsImportModalOpen(true)} 
+                  className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm"
+                  title="Import Supervisor OT and Remarks from Excel"
+                >
+                  <Upload size={16} />
+                  Import Supervisor OT & Remarks
+                </Button>
+              </>
+            )}
             <Button variant="outline" onClick={handleExportCSV} className="gap-2">
               <Download size={16} />
               Export
             </Button>
-            <Button 
-              variant="outline" 
-              onClick={() => generateSupervisorOTTemplate(employees)} 
-              className="gap-2 border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
-              title="Download official Excel template with instructions and sample rows"
-            >
-              <FileSpreadsheet size={16} />
-              Export Template
-            </Button>
-            <Button 
-              onClick={() => setIsImportModalOpen(true)} 
-              className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm"
-              title="Import Supervisor OT and Remarks from Excel"
-            >
-              <Upload size={16} />
-              Import Supervisor OT & Remarks
-            </Button>
-            {selectedIds.length > 0 && (
-              <Button type="button" variant="danger" onClick={() => setIsDeleteModalOpen(true)} className="gap-2">
-                <Trash2 size={16} />
-                Delete Selected ({selectedIds.length})
-              </Button>
+            {selectedIds.length > 0 && canApproveOt && (
+              <>
+                <Button 
+                  type="button" 
+                  onClick={handleBulkApprove} 
+                  className="gap-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold shadow-xs"
+                >
+                  <CheckCircle2 size={16} />
+                  Approve Selected ({selectedIds.length})
+                </Button>
+                <Button type="button" variant="danger" onClick={() => setIsDeleteModalOpen(true)} className="gap-2">
+                  <Trash2 size={16} />
+                  Delete Selected ({selectedIds.length})
+                </Button>
+              </>
             )}
           </div>
         }
       />
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
         <KPICard 
           label="Total Records" 
           value={stats.total} 
@@ -492,11 +638,11 @@ export default function Overtime() {
           onClick={() => setStatusFilter('Pending')}
         />
         <KPICard 
-          label="Approved OT" 
+          label="Approved Records" 
           value={stats.approved} 
-          icon={Clock} 
+          icon={CheckCircle2} 
           trend="up"
-          trendValue="Finalized"
+          trendValue={`${Math.round(stats.approvedHours)}h Approved`}
           onClick={() => setStatusFilter('Approved')}
         />
         <KPICard 
@@ -506,6 +652,84 @@ export default function Overtime() {
           trend="up"
           trendValue="Total Cumulative"
         />
+        <KPICard 
+          label="Approved OT Payout" 
+          value={`Rs. ${stats.totalApprovedPayout.toLocaleString()}`} 
+          icon={DollarSign} 
+          trend="up"
+          trendValue={`${otCalculationBasis === 'gross' ? 'Gross' : 'Basic'} Salary Basis`}
+        />
+      </div>
+
+      {/* Interactive OT Calculation Wage Basis Switcher (Basic Salary vs Gross Salary) */}
+      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="p-1.5 rounded-lg bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400">
+                <Calculator size={18} />
+              </span>
+              <h3 className="text-sm font-bold text-slate-800 dark:text-slate-100">
+                OT Calculation Wage Basis & Formula
+              </h3>
+              <Badge variant={otCalculationBasis === 'gross' ? 'info' : 'success'}>
+                Active: {otCalculationBasis === 'gross' ? 'Gross Salary (Basic + Allowances)' : 'Basic Salary'}
+              </Badge>
+              <span className="text-[11px] font-mono text-slate-400">
+                • Rate Multiplier: {otMultiplier}x
+              </span>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 max-w-2xl">
+              Choose calculation wage base for overtime hours. Hourly Rate = (Wage Basis ÷ (26 Days × Standard Duty Hours)) × {otMultiplier}x.
+              Approved OT automatically links directly into Monthly Payroll calculations.
+            </p>
+          </div>
+
+          {/* Interactive Checkmark / Option Buttons for Gross vs Basic */}
+          <div className="flex items-center gap-2 bg-slate-100 dark:bg-slate-800/90 p-1.5 rounded-xl border border-slate-200/80 dark:border-slate-700 shrink-0">
+            <button
+              type="button"
+              onClick={() => handleToggleOtBasis('basic')}
+              className={cn(
+                "flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer",
+                otCalculationBasis === 'basic'
+                  ? "bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs border border-slate-200 dark:border-slate-700"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+              )}
+            >
+              <div className={cn(
+                "w-4 h-4 rounded flex items-center justify-center border transition-all",
+                otCalculationBasis === 'basic' 
+                  ? "bg-indigo-600 border-indigo-600 text-white" 
+                  : "border-slate-400 bg-white dark:bg-slate-800"
+              )}>
+                {otCalculationBasis === 'basic' && <CheckCircle2 size={12} className="stroke-[3]" />}
+              </div>
+              <span>Basic Salary Basis (Default)</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleToggleOtBasis('gross')}
+              className={cn(
+                "flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer",
+                otCalculationBasis === 'gross'
+                  ? "bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs border border-slate-200 dark:border-slate-700"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+              )}
+            >
+              <div className={cn(
+                "w-4 h-4 rounded flex items-center justify-center border transition-all",
+                otCalculationBasis === 'gross' 
+                  ? "bg-indigo-600 border-indigo-600 text-white" 
+                  : "border-slate-400 bg-white dark:bg-slate-800"
+              )}>
+                {otCalculationBasis === 'gross' && <CheckCircle2 size={12} className="stroke-[3]" />}
+              </div>
+              <span>Gross Salary Basis</span>
+            </button>
+          </div>
+        </div>
       </div>
 
       <Card className="p-4">
@@ -562,6 +786,8 @@ export default function Overtime() {
           attendanceData={processedData}
           shifts={settings.shifts || []}
           punches={punches || []}
+          otBasis={otCalculationBasis}
+          otMultiplier={otMultiplier}
           onEdit={openEditModal}
           onApprove={(id) => handleStatusChange(id, 'Approved')}
           onReject={(id) => handleStatusChange(id, 'Rejected')}

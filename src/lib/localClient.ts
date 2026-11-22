@@ -229,7 +229,7 @@ export async function migrateFirestoreToLocal(snapshot: any) {
   const res = await fetch('/api/local/migrate-from-firestore', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(snapshot)
+    body: JSON.stringify(snapshot || {})
   });
   if (!res.ok) throw new Error('Migration failed');
   return await res.json();

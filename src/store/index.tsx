@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
-import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch, EmployeeMovement } from '../types';
+import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch, EmployeeMovement, SystemUser, ModuleKey } from '../types';
 import type { FieldAttendanceRecord } from '../types/attendanceAudit';
 import { processPunches, detectExceptions } from '../lib/engine';
 import { generatePayrollRun, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
@@ -7,6 +7,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../lib/firebase';
 import { logAdminOverride } from '../lib/audit';
 import { normalizeEmployeeId } from '../lib/utils';
+import { isEmployeeInUserScope, normalizeSystemUser } from '../lib/accessControl';
 import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords, deleteLocalTableDetailed, purgeLocalTable } from '../lib/localClient';
 import { toast } from 'sonner';
 // Local SQLite-only no-op shims replacing firebase/firestore so zero gRPC Listen/Write streams are opened
@@ -69,6 +70,10 @@ interface StoreState {
   isInitializing: boolean;
   user: any;
   isAdmin: boolean;
+  isSuperAdmin: boolean;
+  currentUserProfile: SystemUser | null;
+  previewUserProfile: SystemUser | null;
+  effectiveUserProfile: SystemUser | null;
   selectedEmployeeId: string | null;
   lastError: string | null;
   quotaExceeded: boolean;
@@ -79,6 +84,10 @@ interface StoreState {
   // Actions
   setUser: (user: any) => void;
   setIsAdmin: (isAdmin: boolean) => void;
+  setCurrentUserProfile: (profile: SystemUser | null) => void;
+  setPreviewUserProfile: (profile: SystemUser | null) => void;
+  canAccessModule: (moduleKey: ModuleKey) => boolean;
+  refreshCurrentUserProfile: (emailOverride?: string) => Promise<void>;
   setIsOtpVerified: (isVerified: boolean) => void;
   setTheme: (theme: 'light' | 'dark') => void;
   setGlobalSearchTerm: (term: string) => void;
@@ -97,6 +106,7 @@ interface StoreState {
   deletePunchesBatch: (ids: string[]) => Promise<void>;
   clearPunches: (onProgress?: (msg: string) => void) => Promise<void>;
   fetchPunches: () => Promise<void>;
+  refreshPunchesFromSqlite: (showToast?: boolean) => Promise<number>;
   
   setSettings: (data: Settings) => Promise<void>;
   setShiftAssignments: (data: ShiftAssignment[]) => Promise<void>;
@@ -171,6 +181,8 @@ interface StoreState {
   mapZkUser: (mapping: Omit<ZkUserMapping, 'id' | 'mappedAt'>) => Promise<void>;
   unmapZkUser: (id: string) => Promise<void>;
   syncZkDevice: (deviceId: string) => Promise<{ success: boolean; recordsRead: number; newRecords: number; duplicates: number }>;
+  syncAllZkDevices: () => Promise<{ success: boolean; devicesPolled: number; totalNew: number; totalRead: number; reachableDevices: number }>;
+  reconcileSystemZkData: () => Promise<{ success: boolean; mappingsCreated: number; unmappedResolved: number; punchesAdded: number }>;
   resolveUnmappedPunches: (deviceUserId: string, employeeId: string) => Promise<void>;
   clearZkSyncLogs: () => Promise<void>;
 
@@ -248,7 +260,8 @@ function saveCache<T>(key: string, data: T) {
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [employees, setEmployeesState] = useState<Employee[]>(() => loadCache('employees', []));
-  const [punches, setPunchesState] = useState<RawPunch[]>(() => loadCache('punches', []));
+  const [punches, setPunchesState] = useState<RawPunch[]>([]);
+  const lastPunchDigestRef = React.useRef<string>('');
   const [settings, setSettingsState] = useState<Settings>(() => loadCache('settings', defaultSettings));
   const [shiftAssignments, setShiftAssignmentsState] = useState<ShiftAssignment[]>(() => loadCache('shift_assignments', []));
   const [assignmentLogs, setAssignmentLogsState] = useState<AssignmentLog[]>(() => loadCache('assignment_logs', []));
@@ -271,6 +284,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [calculationSource, setCalculationSource] = useState<'all' | 'standard' | 'multi-time'>('all');
   const [user, setUser] = useState<any>(null);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [currentUserProfile, setCurrentUserProfileState] = useState<SystemUser | null>(() => {
+    try {
+      const raw = sessionStorage.getItem('local_user_profile');
+      return raw ? normalizeSystemUser(JSON.parse(raw)) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [previewUserProfile, setPreviewUserProfile] = useState<SystemUser | null>(null);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
   const [isInitializing, setIsInitializing] = useState(true);
   const [lastError, setLastError] = useState<string | null>(null);
@@ -283,6 +305,75 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return sessionStorage.getItem('is_otp_verified') === 'true';
   });
   const hasAttemptedZkDeviceSeed = React.useRef(false);
+
+  const setCurrentUserProfile = useCallback((profile: SystemUser | null) => {
+    const normalized = profile ? normalizeSystemUser(profile) : null;
+    setCurrentUserProfileState(normalized);
+    if (normalized) {
+      sessionStorage.setItem('local_user_profile', JSON.stringify(normalized));
+    } else {
+      sessionStorage.removeItem('local_user_profile');
+    }
+  }, []);
+
+  const refreshCurrentUserProfile = useCallback(async (emailOverride?: string) => {
+    const emailToCheck = String(emailOverride || user?.email || auth.currentUser?.email || '').trim();
+    if (!emailToCheck) return;
+    try {
+      const res = await fetch(`/api/auth/session-profile?email=${encodeURIComponent(emailToCheck)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.user) {
+          setCurrentUserProfile(data.user);
+        }
+      }
+    } catch {
+      // ignore offline
+    }
+  }, [user?.email, setCurrentUserProfile]);
+
+  useEffect(() => {
+    const emailToCheck = String(user?.email || auth.currentUser?.email || '').trim();
+    if (emailToCheck) {
+      refreshCurrentUserProfile(emailToCheck);
+    } else {
+      setCurrentUserProfile(null);
+      setPreviewUserProfile(null);
+    }
+  }, [user?.email, refreshCurrentUserProfile, setCurrentUserProfile]);
+
+  const effectiveUserProfile = previewUserProfile || currentUserProfile;
+  const isSuperAdmin = useMemo(() => {
+    if (effectiveUserProfile) {
+      return effectiveUserProfile.role === 'Super Admin' && effectiveUserProfile.status === 'Active';
+    }
+    return isAdmin;
+  }, [effectiveUserProfile, isAdmin]);
+
+  const canAccessModule = useCallback((moduleKey: ModuleKey): boolean => {
+    if (!effectiveUserProfile) {
+      if (moduleKey === 'admin' || moduleKey === 'userAccess') return isAdmin;
+      return true;
+    }
+    if (effectiveUserProfile.status === 'Suspended') return false;
+    if (effectiveUserProfile.role === 'Super Admin') return true;
+    if (moduleKey === 'admin' || moduleKey === 'userAccess') return false;
+    return Boolean(effectiveUserProfile.permissions?.modules?.[moduleKey]);
+  }, [effectiveUserProfile, isAdmin]);
+
+  const computePunchesDigest = useCallback((list: RawPunch[]): string => {
+    if (!list || list.length === 0) return '0';
+    let hash = 2166136261;
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      const sig = `${p.id}|${p.employeeId}|${p.punchDatetime}|${p.deviceId || ''}`;
+      for (let j = 0; j < sig.length; j++) {
+        hash ^= sig.charCodeAt(j);
+        hash = Math.imul(hash, 16777619);
+      }
+    }
+    return `${list.length}:${(hash >>> 0).toString(16)}`;
+  }, []);
 
   const setIsOtpVerified = useCallback((isVerified: boolean) => {
     setIsOtpVerifiedState(isVerified);
@@ -358,15 +449,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return new Error(displayMessage);
   }, []);
 
-  const fetchPunches = useCallback(async () => {
+  const refreshPunchesFromSqlite = useCallback(async (showToast = false): Promise<number> => {
     try {
-      const q = query(collection(db, 'punches'), limit(10000));
-      const s = await getDocs(q);
-      setPunchesState(s.docs.map(d => d.data() as RawPunch));
+      const freshPunches = await fetchLocalTable<RawPunch>('punches');
+      const normalized = Array.isArray(freshPunches) ? freshPunches : [];
+      lastPunchDigestRef.current = computePunchesDigest(normalized);
+      setPunchesState(normalized);
+      if (showToast) {
+        toast.success(`Refreshed ${normalized.length} punch records from SQLite`);
+      }
+      return normalized.length;
     } catch (e) {
       handleFirestoreError(e, OperationType.LIST, 'punches');
+      return 0;
     }
-  }, [handleFirestoreError]);
+  }, [computePunchesDigest, handleFirestoreError]);
+
+  const fetchPunches = useCallback(async () => {
+    await refreshPunchesFromSqlite(false);
+  }, [refreshPunchesFromSqlite]);
 
   const processedData = useMemo(() => {
     if (employees.length === 0) return [];
@@ -514,22 +615,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             }
           }
 
+          try { localStorage.removeItem('hris_cache_punches'); } catch {}
           const localPunches = await fetchLocalTable<RawPunch>('punches');
-          if (localPunches && localPunches.length > 0) {
-            setPunchesState(prev => {
-              const pMap = new Map(prev.map(p => [p.id, p]));
-              localPunches.forEach(p => pMap.set(p.id, p));
-              const merged = Array.from(pMap.values());
-              saveCache('punches', merged);
-              return merged;
-            });
-          } else {
-            const cached = loadCache<RawPunch[]>('punches', []);
-            if (cached.length > 0) {
-              setPunchesState(cached);
-              saveLocalTable('punches', cached);
-            }
-          }
+          const safeLocalPunches = Array.isArray(localPunches) ? localPunches : [];
+          lastPunchDigestRef.current = computePunchesDigest(safeLocalPunches);
+          setPunchesState(safeLocalPunches);
 
           const localSettings = await fetchLocalTable<Settings>('settings');
           if (localSettings && localSettings.length > 0) {
@@ -760,21 +850,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           onSnapshot(query(collection(db, 'punches'), limit(10000)), 
             (s) => {
               if (s.empty) return;
+              const fresh = s.docs.map(d => d.data() as RawPunch);
               setPunchesState(prev => {
-                const fresh = s.docs.map(d => d.data() as RawPunch);
-                const map = new Map(fresh.map(p => [p.id, p]));
-                let hasNewLocal = false;
-                prev.forEach(p => {
-                  if (!map.has(p.id)) {
-                    map.set(p.id, p);
-                    hasNewLocal = true;
-                  }
-                });
-                const result = Array.from(map.values());
-                saveCache('punches', result);
-                saveLocalTable('punches', result);
-                return result;
+                const map = new Map<string, RawPunch>(prev.map(p => [p.id, p]));
+                fresh.forEach(p => { if (p && p.id) map.set(p.id, p); });
+                const merged = Array.from(map.values());
+                saveCache('punches', merged);
+                return merged;
               });
+              saveLocalTable('punches', fresh);
             },
             (error) => handleFirestoreError(error, OperationType.LIST, 'punches')
           ),
@@ -783,7 +867,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as Employee);
               setEmployeesState(prev => {
-                const map = new Map(fresh.map(e => [e.id, e]));
+                const map = new Map<string, Employee>(fresh.map(e => [e.id, e]));
                 prev.forEach(e => { if (!map.has(e.id)) map.set(e.id, e); });
                 const result = Array.from(map.values());
                 saveCache('employees', result);
@@ -814,7 +898,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as ShiftAssignment);
               setShiftAssignmentsState(prev => {
-                const map = new Map(fresh.map(a => [`${a.employeeId}_${a.date}`, a]));
+                const map = new Map<string, ShiftAssignment>(fresh.map(a => [`${a.employeeId}_${a.date}`, a]));
                 prev.forEach(a => {
                   const k = `${a.employeeId}_${a.date}`;
                   if (!map.has(k)) map.set(k, a);
@@ -832,7 +916,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as AssignmentLog);
               setAssignmentLogsState(prev => {
-                const map = new Map(fresh.map(l => [l.id, l]));
+                const map = new Map<string, AssignmentLog>(fresh.map(l => [l.id, l]));
                 prev.forEach(l => { if (!map.has(l.id)) map.set(l.id, l); });
                 const result = Array.from(map.values());
                 saveCache('assignment_logs', result);
@@ -846,7 +930,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as AttendanceException);
               setExceptionsState(prev => {
-                const map = new Map(fresh.map(e => [e.id, e]));
+                const map = new Map<string, AttendanceException>(fresh.map(e => [e.id, e]));
                 prev.forEach(e => { if (!map.has(e.id)) map.set(e.id, e); });
                 const result = Array.from(map.values());
                 saveCache('exceptions', result);
@@ -861,7 +945,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as AuditLog);
               setAuditLogsState(prev => {
-                const map = new Map(fresh.map(l => [l.id, l]));
+                const map = new Map<string, AuditLog>(fresh.map(l => [l.id, l]));
                 prev.forEach(l => { if (!map.has(l.id)) map.set(l.id, l); });
                 const result = Array.from(map.values());
                 saveCache('audit_logs', result);
@@ -875,7 +959,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as OvertimeRecord);
               setOvertimeRecordsState(prev => {
-                const map = new Map(fresh.map(r => [r.id, r]));
+                const map = new Map<string, OvertimeRecord>(fresh.map(r => [r.id, r]));
                 prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
                 const result = Array.from(map.values());
                 saveCache('overtime', result);
@@ -890,7 +974,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as SBLRecord);
               setSblRecordsState(prev => {
-                const map = new Map(fresh.map(r => [r.id, r]));
+                const map = new Map<string, SBLRecord>(fresh.map(r => [r.id, r]));
                 prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
                 const result = Array.from(map.values());
                 saveCache('sbl', result);
@@ -905,7 +989,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               if (s.empty) return;
               const fresh = s.docs.map(d => d.data() as ForceAttendanceRecord);
               setForceAttendanceRecordsState(prev => {
-                const map = new Map(fresh.map(r => [r.id, r]));
+                const map = new Map<string, ForceAttendanceRecord>(fresh.map(r => [r.id, r]));
                 prev.forEach(r => { if (!map.has(r.id)) map.set(r.id, r); });
                 const result = Array.from(map.values());
                 saveCache('force_attendance', result);
@@ -1034,7 +1118,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           ),
         );
         
-        // Periodic background SQLite poll to reflect ZKTeco auto-polling updates in real time
+        // Periodic 100% Read-Only SQLite poll to reflect external biometric software updates in real time
         const sqlitePollInterval = setInterval(async () => {
           if (!active) return;
           try {
@@ -1045,15 +1129,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
               fetchLocalTable<ZkUserMapping>('zk_user_mappings')
             ]);
-            if (freshPunches && freshPunches.length > 0) {
-              setPunchesState(prev => {
-                if (freshPunches.length === prev.length) return prev;
-                const pMap = new Map(prev.map(p => [p.id, p]));
-                freshPunches.forEach(p => pMap.set(p.id, p));
-                const merged = Array.from(pMap.values());
-                saveCache('punches', merged);
-                return merged;
-              });
+            if (Array.isArray(freshPunches)) {
+              const nextDigest = computePunchesDigest(freshPunches);
+              if (nextDigest !== lastPunchDigestRef.current) {
+                lastPunchDigestRef.current = nextDigest;
+                setPunchesState(freshPunches);
+              }
             }
             if (freshDevs && freshDevs.length > 0) {
               setZkDevicesState(freshDevs);
@@ -1170,158 +1251,65 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const addPunch = useCallback(async (data: Omit<RawPunch, 'id'>) => {
     const id = `${data.employeeId}_${data.punchDatetime.replace(/[:.-]/g, '')}`;
     const newPunch = { ...data, id };
-    setPunchesState(prev => [newPunch, ...prev.filter(p => p.id !== id)]);
-    saveLocalTable('punches', newPunch);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'punches', id), newPunch);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'punches/single');
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    setPunchesState(prev => {
+      const next = [...prev.filter(p => p.id !== id), newPunch];
+      lastPunchDigestRef.current = computePunchesDigest(next);
+      return next;
+    });
+    await saveLocalTable('punches', newPunch);
+  }, [computePunchesDigest]);
 
   const updatePunch = useCallback(async (id: string, data: Partial<RawPunch>) => {
+    const existing = punches.find(p => p.id === id);
+    if (!existing) return;
+    const updatedDoc = { ...existing, ...data };
     setPunchesState(prev => {
-      const updatedList = prev.map(p => p.id === id ? { ...p, ...data } : p);
-      const updatedDoc = updatedList.find(p => p.id === id);
-      if (updatedDoc) saveLocalTable('punches', updatedDoc);
-      return updatedList;
+      const next = prev.map(p => p.id === id ? updatedDoc : p);
+      lastPunchDigestRef.current = computePunchesDigest(next);
+      return next;
     });
-    if (checkQuota()) {
-      try {
-        const existing = punches.find(p => p.id === id);
-        if (existing) {
-          const updated = { ...existing, ...data };
-          await setDoc(doc(db, 'punches', id), updated);
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, `punches/${id}`);
-      }
-    }
-  }, [punches, handleFirestoreError, checkQuota]);
+    await saveLocalTable('punches', updatedDoc);
+  }, [punches, computePunchesDigest]);
 
   const deletePunch = useCallback(async (id: string) => {
-    setPunchesState(prev => prev.filter(p => p.id !== id));
-    deleteLocalTableRecords('punches', [id]);
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'punches', id));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `punches/${id}`);
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    setPunchesState(prev => {
+      const next = prev.filter(p => p.id !== id);
+      lastPunchDigestRef.current = computePunchesDigest(next);
+      return next;
+    });
+    await deleteLocalTableRecords('punches', [id]);
+  }, [computePunchesDigest]);
 
   const deletePunchBatch = useCallback(async (importId: string) => {
-    let idsToRemove: string[] = [];
+    const ids = punches.filter(p => p.importId === importId).map(p => p.id);
     setPunchesState(prev => {
-      const remaining = prev.filter(p => {
-        if (p.importId === importId) {
-          idsToRemove.push(p.id);
-          return false;
-        }
-        return true;
-      });
-      saveCache('punches', remaining);
-      return remaining;
+      const next = prev.filter(p => p.importId !== importId);
+      lastPunchDigestRef.current = computePunchesDigest(next);
+      return next;
     });
-
-    if (idsToRemove.length > 0) {
-      deleteLocalTableRecords('punches', idsToRemove);
+    if (ids.length > 0) {
+      await deleteLocalTableRecords('punches', ids);
     }
-
-    try {
-      const q = query(collection(db, 'punches'), where('importId', '==', importId));
-      const snapshot = await getDocs(q);
-      const docs = snapshot.docs;
-      
-      const batchSize = 300;
-      const chunks = [];
-      for (let i = 0; i < docs.length; i += batchSize) {
-        chunks.push(docs.slice(i, i + batchSize));
-      }
-      const CONCURRENCY = 5;
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const group = chunks.slice(i, i + CONCURRENCY);
-        await Promise.allSettled(
-          group.map(async (chunk) => {
-            const batch = writeBatch(db);
-            chunk.forEach(d => batch.delete(d.ref));
-            await batch.commit();
-          })
-        );
-      }
-    } catch (e) {
-      console.warn('deletePunchBatch note:', e);
-    }
-  }, []);
+  }, [punches, computePunchesDigest]);
 
   const deletePunchesBatch = useCallback(async (ids: string[]) => {
+    const idSet = new Set(ids);
     setPunchesState(prev => {
-      const filtered = prev.filter(p => !ids.includes(p.id));
-      saveCache('punches', filtered);
-      return filtered;
+      const next = prev.filter(p => !idSet.has(p.id));
+      lastPunchDigestRef.current = computePunchesDigest(next);
+      return next;
     });
-    deleteLocalTableRecords('punches', ids);
-
-    try {
-      const batchSize = 300;
-      const chunks = [];
-      for (let i = 0; i < ids.length; i += batchSize) {
-        chunks.push(ids.slice(i, i + batchSize));
-      }
-      const CONCURRENCY = 5;
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const group = chunks.slice(i, i + CONCURRENCY);
-        await Promise.allSettled(
-          group.map(async (chunk) => {
-            const batch = writeBatch(db);
-            chunk.forEach(id => batch.delete(doc(db, 'punches', id)));
-            await batch.commit();
-          })
-        );
-      }
-    } catch (e) {
-      console.warn('deletePunchesBatch note:', e);
+    if (ids.length > 0) {
+      await deleteLocalTableRecords('punches', ids);
     }
-  }, []);
+  }, [computePunchesDigest]);
 
   const clearPunches = useCallback(async (onProgress?: (msg: string) => void) => {
     setPunchesState([]);
-    saveCache('punches', []);
+    lastPunchDigestRef.current = '0';
+    if (onProgress) onProgress('Purging punches from SQLite database...');
     await purgeLocalTable('punches');
-    if (onProgress) onProgress('Local SQLite punches table purged.');
-
-    try {
-      const q = collection(db, 'punches');
-      const snapshot = await getDocs(q);
-      const docs = snapshot.docs;
-      const total = docs.length;
-      if (total === 0) return;
-      
-      const batchSize = 300;
-      const chunks = [];
-      for (let i = 0; i < total; i += batchSize) {
-        chunks.push(docs.slice(i, i + batchSize));
-      }
-      const CONCURRENCY = 5;
-      let completed = 0;
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const group = chunks.slice(i, i + CONCURRENCY);
-        await Promise.allSettled(
-          group.map(async (chunk) => {
-            const batch = writeBatch(db);
-            chunk.forEach(d => batch.delete(d.ref));
-            await batch.commit();
-          })
-        );
-        completed += group.reduce((acc, c) => acc + c.length, 0);
-        if (onProgress) onProgress(`Purging cloud records ${Math.min(completed, total)} of ${total}...`);
-      }
-    } catch (e) {
-      console.warn('clearPunches note:', e);
-    }
+    if (onProgress) onProgress('All punch records cleared from SQLite.');
   }, []);
 
   const clearAllData = useCallback(async (onProgress?: (msg: string) => void) => {
@@ -1444,59 +1432,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const setPunches = useCallback(async (data: RawPunch[], onProgress?: (msg: string) => void) => {
     setPunchesState(prev => {
       const pMap = new Map(prev.map(p => [p.id, p]));
-      data.forEach(p => pMap.set(p.id, p));
-      const res = Array.from(pMap.values());
-      saveCache('punches', res);
-      return res;
+      data.forEach(p => {
+        if (p && p.id) pMap.set(p.id, p);
+      });
+      const next = Array.from(pMap.values());
+      lastPunchDigestRef.current = computePunchesDigest(next);
+      return next;
     });
 
-    // Immediate non-blocking local SQLite persistence
-    saveLocalTable('punches', data).catch(err => console.warn('SQLite punches save note:', err));
-
-    if (onProgress) onProgress('Records loaded into local active workspace.');
-
-    // Background non-blocking persistence to Firestore
-    (async () => {
-      try {
-        const existingMap = new Map(punches.map(p => [p.id, p]));
-        const recordsToWrite = data.filter(newP => {
-          const existing = existingMap.get(newP.id);
-          if (!existing) return true;
-          return JSON.stringify(existing) !== JSON.stringify(newP);
-        });
-
-        if (recordsToWrite.length === 0) return;
-
-        const total = recordsToWrite.length;
-        const batchSize = 300;
-        const chunks: typeof recordsToWrite[] = [];
-        for (let i = 0; i < total; i += batchSize) {
-          chunks.push(recordsToWrite.slice(i, i + batchSize));
-        }
-
-        const CONCURRENCY = 5;
-        let completed = 0;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            group.map(async chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(p => {
-                batch.set(doc(db, 'punches', p.id), p);
-              });
-              await batch.commit();
-            })
-          );
-          completed += group.reduce((acc, c) => acc + c.length, 0);
-          if (onProgress) {
-            onProgress(`Syncing ${Math.min(completed, total)} of ${total} records to cloud...`);
-          }
-        }
-      } catch (e) {
-        console.warn('setPunches background sync note:', e);
+    if (onProgress) onProgress(`Saving ${data.length} punch records to SQLite...`);
+    const chunkSize = 500;
+    for (let i = 0; i < data.length; i += chunkSize) {
+      const chunk = data.slice(i, i + chunkSize);
+      await saveLocalTable('punches', chunk);
+      if (onProgress) {
+        onProgress(`Saved ${Math.min(i + chunkSize, data.length)} / ${data.length} records to SQLite`);
       }
-    })();
-  }, [punches]);
+    }
+    if (onProgress) onProgress(`Saved ${data.length} records to SQLite database.`);
+  }, [computePunchesDigest]);
 
   const setSettings = useCallback(async (data: Settings) => {
     setSettingsState(data);
@@ -1512,8 +1466,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [handleFirestoreError, checkQuota]);
 
   const setShiftAssignments = useCallback(async (data: ShiftAssignment[]) => {
-    setShiftAssignmentsState(data);
-    saveCache('shift_assignments', data);
+    let finalList = data;
+    if (effectiveUserProfile && effectiveUserProfile.role !== 'Super Admin') {
+      const allowedIds = new Set(
+        employees.filter(e => isEmployeeInUserScope(e, effectiveUserProfile)).map(e => String(e.id).trim())
+      );
+      const preservedOutOfScope = shiftAssignments.filter(a => !allowedIds.has(String(a.employeeId || '').trim()));
+      const map = new Map<string, ShiftAssignment>();
+      preservedOutOfScope.forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
+      data.forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
+      finalList = Array.from(map.values());
+    }
+    setShiftAssignmentsState(finalList);
+    saveCache('shift_assignments', finalList);
     saveLocalTable('shift_assignments', data);
     if (checkQuota()) {
       try {
@@ -2634,141 +2599,159 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     toast.success('User mapping removed from SQLite');
   }, []);
 
+  const refreshZkTablesFromSqlite = useCallback(async () => {
+    const [freshPunches, freshDevs, freshLogs, freshUnmapped, freshMappings] = await Promise.all([
+      fetchLocalTable<RawPunch>('punches'),
+      fetchLocalTable<ZkDevice>('zk_devices'),
+      fetchLocalTable<ZkSyncLog>('zk_sync_logs'),
+      fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
+      fetchLocalTable<ZkUserMapping>('zk_user_mappings')
+    ]);
+
+    const safePunches = Array.isArray(freshPunches) ? freshPunches : [];
+    lastPunchDigestRef.current = computePunchesDigest(safePunches);
+    setPunchesState(safePunches);
+
+    if (freshDevs && freshDevs.length > 0) {
+      setZkDevicesState(freshDevs);
+      saveCache('zk_devices', freshDevs);
+    }
+    if (freshLogs) {
+      setZkSyncLogsState(freshLogs);
+      saveCache('zk_sync_logs', freshLogs);
+    }
+    if (freshUnmapped) {
+      setZkUnmappedPunchesState(freshUnmapped);
+      saveCache('zk_unmapped_punches', freshUnmapped);
+    }
+    if (freshMappings) {
+      setZkUserMappingsState(freshMappings);
+      saveCache('zk_user_mappings', freshMappings);
+    }
+
+    return {
+      punches: safePunches,
+      devices: freshDevs || [],
+      logs: freshLogs || [],
+      unmapped: freshUnmapped || [],
+      mappings: freshMappings || []
+    };
+  }, [computePunchesDigest]);
+
   const syncZkDevice = useCallback(async (deviceId: string) => {
     const targetDev = zkDevices.find(d => d.id === deviceId);
     if (!targetDev) return { success: false, recordsRead: 0, newRecords: 0, duplicates: 0 };
 
-    const tId = toast.loading(`Fetching biometric punches from ${targetDev.name} (${targetDev.ip}:${targetDev.port}) into SQLite...`);
+    const tId = toast.loading(`Polling ZKTeco device "${targetDev.name}" (${targetDev.ip}) & syncing to SQLite...`);
     try {
-      let bridgePunches: any[] = [];
-      let bridgeLogCount: number | undefined;
-      let bridgeUserCount: number | undefined;
+      const response = await fetch('/api/zk/fetch-device', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: targetDev.id,
+          ip: targetDev.ip,
+          mode: 'Manual Device Poll'
+        })
+      });
+      const resData = await response.json();
+      await refreshZkTablesFromSqlite();
 
-      // Try pulling from Local Windows PC Agent Bridge (127.0.0.1:4375) if running
-      try {
-        const controller = new AbortController();
-        const tid = setTimeout(() => controller.abort(), 2000);
-        const bridgeRes = await fetch('http://127.0.0.1:4375/bridge/pull', { signal: controller.signal });
-        clearTimeout(tid);
-        if (bridgeRes.ok) {
-          const bData = await bridgeRes.json();
-          if (bData && Array.isArray(bData.devices)) {
-            const match = bData.devices.find((d: any) => d.deviceIP === targetDev.ip || d.deviceId === targetDev.id || d.deviceName === targetDev.name);
-            if (match && Array.isArray(match.punches) && match.punches.length > 0) {
-              bridgePunches = match.punches;
-              bridgeLogCount = match.logCount || match.punches.length;
-              bridgeUserCount = match.userCount || new Set(match.punches.map((p: any) => String(p.deviceUserId || p.userId || '').trim()).filter(Boolean)).size;
-            }
-          }
-        }
-      } catch {
-        // Local bridge not active
-      }
+      const recordsRead = Number(resData?.recordsRead || 0);
+      const newRecords = Number(resData?.newRecords || 0);
+      const duplicates = Number(resData?.duplicates || 0);
 
-      const BATCH_SIZE = 5000;
-      let totalRead = 0;
-      let totalNew = 0;
-      let totalDup = 0;
-      let syncOk = false;
-
-      if (bridgePunches.length > BATCH_SIZE) {
-        for (let i = 0; i < bridgePunches.length; i += BATCH_SIZE) {
-          const chunk = bridgePunches.slice(i, i + BATCH_SIZE);
-          const res = await fetch('/api/zk/fetch-device', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              deviceId: targetDev.id,
-              ip: targetDev.ip,
-              port: targetDev.port || 4370,
-              name: targetDev.name,
-              userCount: bridgeUserCount,
-              logCount: bridgeLogCount,
-              punches: chunk,
-              autoFetch: false
-            })
-          });
-          const d = await res.json();
-          if (res.ok && d.success) {
-            syncOk = true;
-            totalRead += Number(d.recordsRead || chunk.length);
-            totalNew += Number(d.newRecords || 0);
-            totalDup += Number(d.duplicates || 0);
-          }
-        }
+      if (resData?.success) {
+        toast.success(
+          resData.message || `Synced ${targetDev.name}: ${recordsRead} read, ${newRecords} new stored in SQLite (${duplicates} duplicates)`,
+          { id: tId }
+        );
       } else {
-        const res = await fetch('/api/zk/fetch-device', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            deviceId: targetDev.id,
-            ip: targetDev.ip,
-            port: targetDev.port || 4370,
-            name: targetDev.name,
-            userCount: bridgeUserCount,
-            logCount: bridgeLogCount,
-            punches: bridgePunches.length > 0 ? bridgePunches : undefined
-          })
-        });
-        const d = await res.json();
-        if (res.ok && d.success) {
-          syncOk = true;
-          totalRead = Number(d.recordsRead || 0);
-          totalNew = Number(d.newRecords || 0);
-          totalDup = Number(d.duplicates || 0);
-        }
+        toast.warning(
+          resData?.error || `Device ${targetDev.name} unreachable from server host; status logged in SQLite`,
+          { id: tId }
+        );
       }
 
-      if (syncOk) {
-        // Refresh punches, devices, logs, and unmapped punches from SQLite
-        const [freshPunches, freshDevs, freshLogs, freshUnmapped, freshMappings] = await Promise.all([
-          fetchLocalTable<RawPunch>('punches'),
-          fetchLocalTable<ZkDevice>('zk_devices'),
-          fetchLocalTable<ZkSyncLog>('zk_sync_logs'),
-          fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
-          fetchLocalTable<ZkUserMapping>('zk_user_mappings')
-        ]);
-        if (freshPunches) {
-          setPunchesState(freshPunches);
-          saveCache('punches', freshPunches);
-        }
-        if (freshDevs && freshDevs.length > 0) {
-          setZkDevicesState(freshDevs);
-          saveCache('zk_devices', freshDevs);
-        }
-        if (freshLogs && freshLogs.length > 0) {
-          setZkSyncLogsState(freshLogs);
-          saveCache('zk_sync_logs', freshLogs);
-        }
-        if (freshUnmapped) {
-          setZkUnmappedPunchesState(freshUnmapped);
-          saveCache('zk_unmapped_punches', freshUnmapped);
-        }
-        if (freshMappings && freshMappings.length > 0) {
-          setZkUserMappingsState(freshMappings);
-          saveCache('zk_user_mappings', freshMappings);
-        }
-
-        if (totalRead === 0 && totalNew === 0 && totalDup === 0) {
-          toast.success(`${targetDev.name} (${targetDev.ip}) synced — 0 new logs read from terminal. To import from private LAN IP, run start-zktime-sync.bat on your office PC or upload DAT/TXT logs.`, { id: tId, duration: 5000 });
-        } else {
-          toast.success(`Synced ${targetDev.name} (Active Employees Only): ${totalNew} new punches stored, ${totalDup} already-fetched duplicates skipped`, { id: tId });
-        }
-        return {
-          success: true,
-          recordsRead: totalRead,
-          newRecords: totalNew,
-          duplicates: totalDup
-        };
-      } else {
-        toast.error(`Sync failed: Device unreachable`, { id: tId });
-        return { success: false, recordsRead: 0, newRecords: 0, duplicates: 0 };
-      }
+      return {
+        success: Boolean(resData?.success),
+        recordsRead,
+        newRecords,
+        duplicates
+      };
     } catch (e: any) {
-      toast.error(`Device Offline - Unable to connect to ${targetDev.ip}:${targetDev.port}`, { id: tId });
+      toast.error(`Failed to poll ${targetDev.name}: ${e?.message || 'Network error'}`, { id: tId });
       return { success: false, recordsRead: 0, newRecords: 0, duplicates: 0 };
     }
-  }, [zkDevices]);
+  }, [zkDevices, refreshZkTablesFromSqlite]);
+
+  const syncAllZkDevices = useCallback(async () => {
+    const tId = toast.loading('Polling all enabled ZKTeco devices & reconciling SQLite system data...');
+    try {
+      const response = await fetch('/api/zk/fetch-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'Manual Batch Poll' })
+      });
+      const resData = await response.json();
+      await refreshZkTablesFromSqlite();
+
+      const devicesPolled = Number(resData?.devicesPolled || 0);
+      const totalNew = Number(resData?.totalNew || 0);
+      const totalRead = Number(resData?.totalRead || 0);
+      const reachableDevices = Number(resData?.reachableDevices || 0);
+
+      if (resData?.success) {
+        toast.success(
+          resData.message || `Polled ${devicesPolled} enabled devices (${reachableDevices} reachable) · ${totalNew} new punches stored in SQLite`,
+          { id: tId }
+        );
+      } else {
+        toast.error(resData?.error || 'Batch ZKT poll failed', { id: tId });
+      }
+
+      return {
+        success: Boolean(resData?.success),
+        devicesPolled,
+        totalNew,
+        totalRead,
+        reachableDevices
+      };
+    } catch (e: any) {
+      toast.error(`Batch ZKT poll error: ${e?.message || 'Network error'}`, { id: tId });
+      return { success: false, devicesPolled: 0, totalNew: 0, totalRead: 0, reachableDevices: 0 };
+    }
+  }, [refreshZkTablesFromSqlite]);
+
+  const reconcileSystemZkData = useCallback(async () => {
+    const tId = toast.loading('Reconciling Active Employees, mappings, and unmapped punches in SQLite...');
+    try {
+      const response = await fetch('/api/zk/reconcile-system', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const resData = await response.json();
+      await refreshZkTablesFromSqlite();
+
+      if (resData?.success) {
+        toast.success(
+          resData.message || `System synchronized: ${resData.mappingsCreated} mappings added, ${resData.punchesAdded} punches stored`,
+          { id: tId }
+        );
+      } else {
+        toast.error(resData?.error || 'System reconciliation failed', { id: tId });
+      }
+
+      return {
+        success: Boolean(resData?.success),
+        mappingsCreated: Number(resData?.mappingsCreated || 0),
+        unmappedResolved: Number(resData?.unmappedResolved || 0),
+        punchesAdded: Number(resData?.punchesAdded || 0)
+      };
+    } catch (e: any) {
+      toast.error(`Reconciliation failed: ${e?.message || 'Network error'}`, { id: tId });
+      return { success: false, mappingsCreated: 0, unmappedResolved: 0, punchesAdded: 0 };
+    }
+  }, [refreshZkTablesFromSqlite]);
 
   const resolveUnmappedPunches = useCallback(async (deviceUserId: string, employeeId: string) => {
     try {
@@ -2813,7 +2796,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
         updatedUnmappedToSave.push({ ...p, status: 'resolved' });
 
-        // Skip duplicate if already fetched
         if (existingIds.has(punchId) || existingEmpTimes.has(empTimeKey)) {
           continue;
         }
@@ -2838,17 +2820,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
       if (newPunchesToSave.length > 0) {
         await saveLocalTable('punches', newPunchesToSave);
-      }
-      await saveLocalTable('zk_unmapped_punches', updatedUnmappedToSave);
-
-      if (newPunchesToSave.length > 0) {
         setPunchesState(prev => {
-          const map = new Map(prev.map(x => [x.id, x]));
-          newPunchesToSave.forEach(x => map.set(x.id, x));
-          const next = Array.from(map.values());
-          saveCache('punches', next);
+          const pMap = new Map(prev.map(x => [x.id, x]));
+          newPunchesToSave.forEach(p => pMap.set(p.id, p));
+          const next = Array.from(pMap.values());
+          lastPunchDigestRef.current = computePunchesDigest(next);
           return next;
         });
+      }
+
+      if (updatedUnmappedToSave.length > 0) {
+        await saveLocalTable('zk_unmapped_punches', updatedUnmappedToSave);
       }
 
       setZkUnmappedPunchesState(prev => {
@@ -2858,11 +2840,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         return next;
       });
 
-      toast.success(`Imported ${newPunchesToSave.length} new punches for Active Employee ${emp?.name || employeeId} into SQLite`);
+      toast.success(`Mapped ${newPunchesToSave.length} punches to ${emp?.name || employeeId} and stored in SQLite`);
     } catch (e: any) {
       toast.error(e?.message || 'Failed to resolve unmapped punches');
     }
-  }, [mapZkUser, employees, zkUnmappedPunches, punches]);
+  }, [mapZkUser, employees, zkUnmappedPunches, punches, computePunchesDigest]);
 
   // Auto-resolve pending unmapped punches ONLY against Active Employees in Directory
   useEffect(() => {
@@ -2954,7 +2936,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             deviceName: item.p.deviceName || 'ZKTeco Device',
             deviceIP: item.p.deviceIP || '192.168.117.200',
             deviceUserId: item.p.deviceUserId,
-            source: 'biometric',
+            source: 'ZKTeco',
             syncTime: new Date().toISOString(),
             transactionId,
             location: item.p.deviceName ? `${item.p.deviceName} (${item.p.deviceIP || 'LAN'})` : 'Biometric Device',
@@ -2964,17 +2946,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
         if (newPunches.length > 0) {
           await saveLocalTable('punches', newPunches);
-        }
-        await saveLocalTable('zk_unmapped_punches', resolvedUnmapped);
-
-        if (newPunches.length > 0) {
           setPunchesState(prev => {
-            const pMap = new Map(prev.map(p => [p.id, p]));
+            const pMap = new Map(prev.map(x => [x.id, x]));
             newPunches.forEach(p => pMap.set(p.id, p));
             const next = Array.from(pMap.values());
-            saveCache('punches', next);
+            lastPunchDigestRef.current = computePunchesDigest(next);
             return next;
           });
+        }
+
+        if (resolvedUnmapped.length > 0) {
+          await saveLocalTable('zk_unmapped_punches', resolvedUnmapped);
         }
 
         setZkUnmappedPunchesState(prev => {
@@ -2989,7 +2971,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
 
     runAutoResolve();
-  }, [isAdmin, employees, zkUserMappings, zkUnmappedPunches, punches, quotaExceeded, checkQuota]);
+  }, [isAdmin, employees, zkUserMappings, zkUnmappedPunches, punches, quotaExceeded, checkQuota, computePunchesDigest]);
 
   const clearZkSyncLogs = useCallback(async () => {
     setZkSyncLogsState([]);
@@ -3051,16 +3033,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         console.warn('Firestore optional query note:', fsErr);
       }
 
-      // 3. Merge Local SQLite + Existing Memory State + Firestore without losing any data!
-      setPunchesState(prev => {
-        const pMap = new Map<string, RawPunch>();
-        prev.forEach(p => pMap.set(p.id, p));
-        (localPunches || []).forEach(p => pMap.set(p.id, p));
-        fsPunches.forEach(p => pMap.set(p.id, p));
-        const merged = Array.from(pMap.values());
-        saveCache('punches', merged);
-        return merged;
-      });
+      // 3. Refresh SQLite punches directly
+      const safeLocalPunches = Array.isArray(localPunches) ? localPunches : [];
+      lastPunchDigestRef.current = computePunchesDigest(safeLocalPunches);
+      setPunchesState(safeLocalPunches);
 
       setEmployeesState(prev => {
         const eMap = new Map<string, Employee>();
@@ -3144,7 +3120,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } catch (e: any) {
       toast.error('Sync failed: ' + (e?.message || 'Error syncing data'), { id: tId });
     }
-  }, []);
+  }, [computePunchesDigest]);
   const resetError = useCallback(() => setLastError(null), []);
 
   const openEmployeeProfile = useCallback((id: string) => setSelectedEmployeeId(id), []);
@@ -3207,22 +3183,110 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     handleFirestoreError(error, operationType, path);
   }, [handleFirestoreError]);
 
+  const allowedEmployeeIds = useMemo(() => {
+    if (!effectiveUserProfile || effectiveUserProfile.role === 'Super Admin') return null;
+    const allowed = new Set<string>();
+    for (const emp of employees) {
+      if (isEmployeeInUserScope(emp, effectiveUserProfile)) {
+        allowed.add(String(emp.id).trim());
+      }
+    }
+    return allowed;
+  }, [employees, effectiveUserProfile]);
+
+  const scopedEmployees = useMemo(() => {
+    if (!allowedEmployeeIds) return employees;
+    return employees.filter(e => allowedEmployeeIds.has(String(e.id).trim()));
+  }, [employees, allowedEmployeeIds]);
+
+  const scopedPunches = useMemo(() => {
+    if (!allowedEmployeeIds) return punches;
+    return punches.filter(p => allowedEmployeeIds.has(String(p.employeeId || '').trim()));
+  }, [punches, allowedEmployeeIds]);
+
+  const scopedProcessedData = useMemo(() => {
+    if (!allowedEmployeeIds) return processedData;
+    return processedData.filter(p => allowedEmployeeIds.has(String(p.employeeId || '').trim()));
+  }, [processedData, allowedEmployeeIds]);
+
+  const scopedShiftAssignments = useMemo(() => {
+    if (!allowedEmployeeIds) return shiftAssignments;
+    return shiftAssignments.filter(a => allowedEmployeeIds.has(String(a.employeeId || '').trim()));
+  }, [shiftAssignments, allowedEmployeeIds]);
+
+  const scopedAssignmentLogs = useMemo(() => {
+    if (!allowedEmployeeIds) return assignmentLogs;
+    return assignmentLogs.filter(a => allowedEmployeeIds.has(String(a.employeeId || '').trim()));
+  }, [assignmentLogs, allowedEmployeeIds]);
+
+  const scopedExceptions = useMemo(() => {
+    if (!allowedEmployeeIds) return exceptions;
+    return exceptions.filter(ex => allowedEmployeeIds.has(String(ex.employeeId || '').trim()));
+  }, [exceptions, allowedEmployeeIds]);
+
+  const scopedOvertimeRecords = useMemo(() => {
+    if (!allowedEmployeeIds) return overtimeRecords;
+    return overtimeRecords.filter(r => allowedEmployeeIds.has(String(r.employeeId || '').trim()));
+  }, [overtimeRecords, allowedEmployeeIds]);
+
+  const scopedSblRecords = useMemo(() => {
+    if (!allowedEmployeeIds) return sblRecords;
+    return sblRecords.filter(r => allowedEmployeeIds.has(String(r.employeeId || '').trim()));
+  }, [sblRecords, allowedEmployeeIds]);
+
+  const scopedForceAttendanceRecords = useMemo(() => {
+    if (!allowedEmployeeIds) return forceAttendanceRecords;
+    return forceAttendanceRecords.filter(r => allowedEmployeeIds.has(String(r.employeeId || '').trim()));
+  }, [forceAttendanceRecords, allowedEmployeeIds]);
+
+  const scopedMovements = useMemo(() => {
+    if (!allowedEmployeeIds) return movements;
+    return movements.filter(m => allowedEmployeeIds.has(String(m.employeeId || '').trim()));
+  }, [movements, allowedEmployeeIds]);
+
+  const scopedFieldRecords = useMemo(() => {
+    if (!allowedEmployeeIds) return fieldRecords;
+    return fieldRecords.filter(f => allowedEmployeeIds.has(String((f as any).employeeId || '').trim()));
+  }, [fieldRecords, allowedEmployeeIds]);
+
+  const scopedPayrollRuns = useMemo(() => {
+    if (!allowedEmployeeIds) return payrollRuns;
+    return payrollRuns.map(run => {
+      const filteredRecords = (run.records || []).filter(rec => allowedEmployeeIds.has(String(rec.employeeId || '').trim()));
+      const totalGrossSalary = filteredRecords.reduce((s, r) => s + (r.grossSalary || 0), 0);
+      const totalNetSalary = filteredRecords.reduce((s, r) => s + (r.netSalary || 0), 0);
+      const totalDeductions = filteredRecords.reduce((s, r) => s + (r.totalDeductions || 0), 0);
+      const totalOvertimePay = filteredRecords.reduce((s, r) => s + (r.overtimePay || 0), 0);
+      const totalTax = filteredRecords.reduce((s, r) => s + (r.incomeTaxTDS || 0), 0);
+      return {
+        ...run,
+        records: filteredRecords,
+        totalEmployees: filteredRecords.length,
+        totalGrossSalary,
+        totalNetSalary,
+        totalDeductions,
+        totalOvertimePay,
+        totalTax
+      };
+    });
+  }, [payrollRuns, allowedEmployeeIds]);
+
   const value: StoreState = {
-    employees, setEmployees, updateEmployee, addEmployee, deleteEmployeesBatch,
-    punches, setPunches, addPunch, updatePunch, deletePunch, deletePunchBatch, deletePunchesBatch, clearPunches, fetchPunches,
+    employees: scopedEmployees, setEmployees, updateEmployee, addEmployee, deleteEmployeesBatch,
+    punches: scopedPunches, setPunches, addPunch, updatePunch, deletePunch, deletePunchBatch, deletePunchesBatch, clearPunches, fetchPunches, refreshPunchesFromSqlite,
     settings, setSettings,
-    shiftAssignments, setShiftAssignments,
-    assignmentLogs,
+    shiftAssignments: scopedShiftAssignments, setShiftAssignments,
+    assignmentLogs: scopedAssignmentLogs,
     addAssignmentLog,
-    exceptions,
+    exceptions: scopedExceptions,
     auditLogs,
     addAuditLog,
     updateException,
     setExceptionsBatch,
-    overtimeRecords,
-    sblRecords,
-    forceAttendanceRecords,
-    payrollRuns,
+    overtimeRecords: scopedOvertimeRecords,
+    sblRecords: scopedSblRecords,
+    forceAttendanceRecords: scopedForceAttendanceRecords,
+    payrollRuns: scopedPayrollRuns,
     zkDevices,
     zkUserMappings,
     zkSyncLogs,
@@ -3233,9 +3297,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     mapZkUser,
     unmapZkUser,
     syncZkDevice,
+    syncAllZkDevices,
+    reconcileSystemZkData,
     resolveUnmappedPunches,
     clearZkSyncLogs,
-    fieldRecords,
+    fieldRecords: scopedFieldRecords,
     fieldMusterFileName,
     fieldImportType,
     auditDecisions,
@@ -3262,7 +3328,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     approvePayrollRun,
     disbursePayrollRun,
     deletePayrollRun,
-    movements,
+    movements: scopedMovements,
     addMovement,
     recordSeparation,
     recordGeneralMovement,
@@ -3270,9 +3336,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     deleteMovement,
     setMovementsBatch,
     calculationSource, setCalculationSource,
-    processedData,
+    processedData: scopedProcessedData,
     user, setUser,
-    isAdmin, setIsAdmin,
+    isAdmin: isSuperAdmin, setIsAdmin,
+    isSuperAdmin,
+    currentUserProfile, setCurrentUserProfile,
+    previewUserProfile, setPreviewUserProfile,
+    effectiveUserProfile,
+    canAccessModule,
+    refreshCurrentUserProfile,
     isOtpVerified, setIsOtpVerified,
     theme, setTheme,
     globalSearchTerm, setGlobalSearchTerm,

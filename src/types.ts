@@ -1,4 +1,57 @@
-export type Role = 'Admin' | 'Editor' | 'HR' | 'Supervisor';
+export type SystemRole =
+  | 'Super Admin'
+  | 'Department Head'
+  | 'Supervisor'
+  | 'Section Incharge'
+  | 'Employee';
+
+export type Role = SystemRole | 'Admin' | 'Editor' | 'HR';
+
+export type ModuleKey =
+  | 'dashboard'
+  | 'employees'
+  | 'movementAttrition'
+  | 'salaryAnalysis'
+  | 'devices'
+  | 'import'
+  | 'attendance'
+  | 'auditor'
+  | 'auditLogs'
+  | 'overtime'
+  | 'sbl'
+  | 'forceAttendance'
+  | 'payroll'
+  | 'reports'
+  | 'settings'
+  | 'userAccess'
+  | 'admin';
+
+export interface UserPermissions {
+  modules: Record<ModuleKey, boolean>;
+  canViewSalary: boolean;
+  canEditAttendance: boolean;
+  canSubmitSupervisorOt: boolean;
+  canApproveOt: boolean;
+  canApprovePayroll: boolean;
+  canExportReports: boolean;
+  canManageShifts: boolean;
+}
+
+export interface SystemUser {
+  id: string;
+  username: string;
+  email: string;
+  role: SystemRole;
+  status: 'Active' | 'Suspended';
+  assignedDepartments: string[];
+  assignedSections: string[];
+  linkedEmployeeId?: string;
+  permissions: UserPermissions;
+  notes?: string;
+  createdBy?: string;
+  createdAt?: string | { _seconds: number };
+  updatedAt?: string;
+}
 
 export interface User {
   id: string;
@@ -292,6 +345,8 @@ export interface RawPunch {
   transactionId?: string;
 }
 
+export type ZkProtocolMode = 'Auto' | 'TCP' | 'UDP' | 'ADMS' | 'Web-HTTP' | 'USB-Disk';
+
 export interface ZkDevice {
   id: string;
   name: string;
@@ -302,11 +357,19 @@ export interface ZkDevice {
   deviceNumber?: number;
   enabled: boolean;
   status: 'online' | 'offline';
+  protocolMode?: ZkProtocolMode;
+  commKey?: number;
+  lastProtocolUsed?: string;
   lastConnection?: string;
   lastSync?: string;
   userCount?: number;
   logCount?: number;
   autoSyncMinutes?: number; // 5, 15, 30, 60, 0 (0 = manual)
+  lastError?: string;
+  deviceCapacityUsers?: number;
+  deviceCapacityLogs?: number;
+  activeDirectoryUsers?: number;
+  totalSystemLogs?: number;
   createdAt?: string;
 }
 
@@ -332,6 +395,10 @@ export interface ZkSyncLog {
   duplicates: number;
   errors: number;
   durationMs: number;
+  unmappedCount?: number;
+  inactiveSkipped?: number;
+  mode?: string;
+  message?: string;
   errorMessage?: string;
 }
 

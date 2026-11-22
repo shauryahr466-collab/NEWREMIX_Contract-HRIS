@@ -1,0 +1,1325 @@
+import fs from 'fs';
+import path from 'path';
+import { getSqliteDb, saveSqliteDb, getSqliteDbPath, getSanitizedRootFolder, withSqliteWriteLock } from './sqliteDb.js';
+import { fetchZkHardwareData, testZkHardwareConnection, ZkDeviceUser, ZkRawPunch } from './zkProtocol.js';
+
+export interface ZkPollingStatus {
+  enabled: boolean;
+  readOnlyMode: boolean;
+  intervalSeconds: number;
+  intervalMinutes: number;
+  isPollingNow: boolean;
+  lastPollAt: string | null;
+  lastPollResult: any;
+  totalPollsRun: number;
+  database: string;
+  dbPath: string;
+}
+
+export const zkPollingState: ZkPollingStatus = {
+  enabled: true,
+  readOnlyMode: false,
+  intervalSeconds: 60,
+  intervalMinutes: 1,
+  isPollingNow: false,
+  lastPollAt: null,
+  lastPollResult: null,
+  totalPollsRun: 0,
+  database: 'SQLite',
+  dbPath: getSqliteDbPath()
+};
+
+function normalizeEmpId(raw: string): string {
+  const s = String(raw || '').trim();
+  const digits = s.replace(/[^0-9]/g, '').replace(/^0+/, '');
+  return digits || s.toLowerCase();
+}
+
+export function normalizeZkDateTime(raw: unknown): string | null {
+  if (!raw) return null;
+  if (raw instanceof Date && !isNaN(raw.getTime())) {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${raw.getFullYear()}-${pad(raw.getMonth() + 1)}-${pad(raw.getDate())}T${pad(raw.getHours())}:${pad(raw.getMinutes())}:${pad(raw.getSeconds())}`;
+  }
+  const s = String(raw).trim().replace(/^"|"$/g, '');
+  if (!s) return null;
+
+  // Preserve exact hardware wall-clock YYYY-MM-DD[T ]HH:mm:ss(.000Z)?
+  const isoMatch = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (isoMatch) {
+    const [, y, m, d, hh, mm, ss = '00'] = isoMatch;
+    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}T${hh.padStart(2, '0')}:${mm}:${ss.padStart(2, '0')}`;
+  }
+
+  // DD/MM/YYYY or MM/DD/YYYY with time
+  const dmyMatch = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*(AM|PM))?/i);
+  if (dmyMatch) {
+    const p1 = parseInt(dmyMatch[1], 10);
+    const p2 = parseInt(dmyMatch[2], 10);
+    const yr = dmyMatch[3];
+    let dy = p1;
+    let mo = p2;
+    if (p2 > 12) {
+      mo = p1;
+      dy = p2;
+    }
+    let hh = parseInt(dmyMatch[4], 10);
+    const mm = dmyMatch[5];
+    const ss = dmyMatch[6] || '00';
+    const ampm = dmyMatch[7]?.toUpperCase();
+    if (ampm === 'PM' && hh < 12) hh += 12;
+    if (ampm === 'AM' && hh === 12) hh = 0;
+    return `${yr}-${String(mo).padStart(2, '0')}-${String(dy).padStart(2, '0')}T${String(hh).padStart(2, '0')}:${mm}:${ss.padStart(2, '0')}`;
+  }
+
+  return null;
+}
+
+function extractKvField(line: string, keys: string[]): string {
+  for (const key of keys) {
+    const m = line.match(new RegExp(`(?:^|[\\t,&\\s])${key}\\s*=\\s*([^\\t,&\\r\\n]+)`, 'i'));
+    if (m && m[1]) return m[1].trim();
+  }
+  return '';
+}
+
+export function parseAdmsAttlogText(text: string): ZkRawPunch[] {
+  const punches: ZkRawPunch[] = [];
+  if (!text) return punches;
+  const trimmedWhole = text.trim();
+
+  // 1. Support JSON array or object payload directly
+  if (trimmedWhole.startsWith('[') || trimmedWhole.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmedWhole);
+      const list = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.punches)
+          ? parsed.punches
+          : Array.isArray(parsed?.data)
+            ? parsed.data
+            : [parsed];
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const uid = String(
+          item.deviceUserId ?? item.userId ?? item.PIN ?? item.pin ?? item.employeeId ?? item.acNo ?? ''
+        ).trim();
+        const dt = normalizeZkDateTime(
+          item.punchDateTime ?? item.punchDatetime ?? item.DateTime ?? item.recordTime ?? item.Time ?? item.timestamp
+        );
+        if (uid && dt) {
+          punches.push({
+            deviceUserId: uid,
+            punchDateTime: dt,
+            verifyMode: item.verifyMode !== undefined ? Number(item.verifyMode) : undefined,
+            inOutMode: item.inOutMode !== undefined ? Number(item.inOutMode) : undefined
+          });
+        }
+      }
+      if (punches.length > 0) return punches;
+    } catch {
+      // fall through to line-by-line parser
+    }
+  }
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    if (
+      lower.startsWith('ac-no') ||
+      lower.startsWith('user id') ||
+      lower.startsWith('emp id') ||
+      lower.startsWith('employee id') ||
+      lower.startsWith('no,') ||
+      lower.startsWith('oplog') ||
+      lower.startsWith('userinfo') ||
+      lower.startsWith('//') ||
+      lower.startsWith('#')
+    ) {
+      continue;
+    }
+
+    // 2. Key=Value ADMS / Push SDK format (e.g. PIN=101\tDateTime=2026-08-03 08:30:12\tVerified=1\tStatus=0)
+    if (/(?:PIN|UserID|UserSn)\s*=/i.test(line) && /(?:DateTime|Time|RecordTime|AttTime)\s*=/i.test(line)) {
+      const kvUid = extractKvField(line, ['PIN', 'UserID', 'UserSn']);
+      const kvDtRaw = extractKvField(line, ['DateTime', 'Time', 'RecordTime', 'AttTime']);
+      const kvVerify = extractKvField(line, ['Verified', 'VerifyMode']);
+      const kvStatus = extractKvField(line, ['Status', 'InOutMode']);
+      const dt = normalizeZkDateTime(kvDtRaw);
+      if (kvUid && dt) {
+        punches.push({
+          deviceUserId: kvUid,
+          punchDateTime: dt,
+          verifyMode: kvVerify ? Number(kvVerify) || 0 : undefined,
+          inOutMode: kvStatus ? Number(kvStatus) || 0 : undefined
+        });
+      }
+      continue;
+    }
+
+    // 3. Delimited ADMS / .dat / .txt / .csv formats
+    const parts = line.includes('\t')
+      ? line.split('\t').map(s => s.trim().replace(/^"|"$/g, ''))
+      : line.includes(',')
+        ? line.split(',').map(s => s.trim().replace(/^"|"$/g, ''))
+        : line.split(/\s+/).map(s => s.trim().replace(/^"|"$/g, ''));
+
+    if (parts.length < 2) continue;
+    const uid = parts[0].replace(/^PIN=/i, '').trim();
+    if (!uid) continue;
+
+    let dt: string | null = null;
+    if (parts[1].match(/\d{4}[-/]\d{1,2}[-/]\d{1,2}/) && parts[2] && /^\d{1,2}:\d{2}/.test(parts[2])) {
+      dt = normalizeZkDateTime(`${parts[1]} ${parts[2]}`);
+    } else if (parts[1].match(/\d{1,2}[/.-]\d{1,2}[/.-]\d{4}/) && parts[2] && /^\d{1,2}:\d{2}/.test(parts[2])) {
+      dt = normalizeZkDateTime(`${parts[1]} ${parts[2]}`);
+    } else {
+      dt = normalizeZkDateTime(parts[1]);
+    }
+
+    if (!dt) {
+      // Fallback: scan remaining tokens for embedded timestamp
+      for (let i = 1; i < parts.length; i++) {
+        const candidate = parts[i + 1] && /^\d{1,2}:\d{2}/.test(parts[i + 1])
+          ? `${parts[i]} ${parts[i + 1]}`
+          : parts[i];
+        dt = normalizeZkDateTime(candidate);
+        if (dt) break;
+      }
+    }
+    if (!dt) continue;
+
+    punches.push({
+      deviceUserId: uid,
+      punchDateTime: dt,
+      inOutMode: parts[2] && !parts[2].includes(':') ? Number(parts[2]) || 0 : undefined,
+      verifyMode: parts[3] ? Number(parts[3]) || 0 : undefined
+    });
+  }
+  return punches;
+}
+
+interface SystemDirectoryContext {
+  activeEmpIds: Set<string>;
+  inactiveEmpIds: Set<string>;
+  empLookup: Map<string, string>;
+  empNames: Map<string, string>;
+  empDepartments: Map<string, string>;
+  empJoiningDates: Map<string, string>;
+  existingMappingsByDevUser: Map<string, string>;
+  existingMappedEmpIds: Set<string>;
+  existingPunchIds: Set<string>;
+  existingPunchEmpTimes: Set<string>;
+  existingUnmappedKeys: Set<string>;
+}
+
+function loadSystemContext(db: any): SystemDirectoryContext {
+  const activeEmpIds = new Set<string>();
+  const inactiveEmpIds = new Set<string>();
+  const empLookup = new Map<string, string>();
+  const empNames = new Map<string, string>();
+  const empDepartments = new Map<string, string>();
+  const empJoiningDates = new Map<string, string>();
+  const existingMappingsByDevUser = new Map<string, string>();
+  const existingMappedEmpIds = new Set<string>();
+  const existingPunchIds = new Set<string>();
+  const existingPunchEmpTimes = new Set<string>();
+  const existingUnmappedKeys = new Set<string>();
+
+  try {
+    const empRes = db.exec('SELECT id, name, department, joining_date, status, data FROM employees');
+    if (empRes.length > 0) {
+      for (const row of empRes[0].values) {
+        const eid = String(row[0] || '').trim();
+        if (!eid) continue;
+        let name = String(row[1] || eid).trim();
+        let dept = String(row[2] || 'General').trim();
+        let joining = String(row[3] || '').trim().slice(0, 10);
+        let status = String(row[4] || 'Active').trim();
+        let dataObj: any = {};
+        if (row[5]) {
+          try {
+            dataObj = JSON.parse(String(row[5]));
+            if (dataObj.name) name = String(dataObj.name).trim();
+            if (dataObj.department) dept = String(dataObj.department).trim();
+            if (dataObj.joiningDate) joining = String(dataObj.joiningDate).trim().slice(0, 10);
+            if (dataObj.status) status = String(dataObj.status).trim();
+          } catch {}
+        }
+
+        empNames.set(eid, name);
+        empDepartments.set(eid, dept);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(joining)) {
+          empJoiningDates.set(eid, joining);
+        }
+
+        const isActive = !status || status.toLowerCase() === 'active';
+        if (isActive) {
+          activeEmpIds.add(eid);
+          empLookup.set(eid, eid);
+          empLookup.set(eid.toLowerCase(), eid);
+          const norm = normalizeEmpId(eid);
+          if (norm) {
+            empLookup.set(norm, eid);
+            empLookup.set(`emp${norm}`, eid);
+            empLookup.set(`emp-${norm}`, eid);
+          }
+          for (const alias of [dataObj.deviceUserId, dataObj.biometricId, dataObj.acNo, dataObj.zkPin]) {
+            if (alias) {
+              const a = String(alias).trim();
+              empLookup.set(a, eid);
+              empLookup.set(a.toLowerCase(), eid);
+              const na = normalizeEmpId(a);
+              if (na) empLookup.set(na, eid);
+            }
+          }
+        } else {
+          inactiveEmpIds.add(eid);
+          empLookup.set(eid, eid);
+          empLookup.set(eid.toLowerCase(), eid);
+          const norm = normalizeEmpId(eid);
+          if (norm) empLookup.set(norm, eid);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[ZKPoller] Employee context load note:', e);
+  }
+
+  try {
+    const mapRes = db.exec('SELECT device_user_id, employee_id FROM zk_user_mappings');
+    if (mapRes.length > 0) {
+      for (const row of mapRes[0].values) {
+        const devUid = String(row[0] || '').trim();
+        const empId = String(row[1] || '').trim();
+        if (!devUid || !empId) continue;
+        existingMappingsByDevUser.set(devUid, empId);
+        existingMappingsByDevUser.set(devUid.toLowerCase(), empId);
+        const norm = normalizeEmpId(devUid);
+        if (norm && !existingMappingsByDevUser.has(norm)) {
+          existingMappingsByDevUser.set(norm, empId);
+        }
+        existingMappedEmpIds.add(empId);
+      }
+    }
+  } catch (e) {
+    console.warn('[ZKPoller] Mapping context load note:', e);
+  }
+
+  try {
+    const pRes = db.exec('SELECT id, employee_id, punch_datetime FROM attendance_punches');
+    if (pRes.length > 0) {
+      for (const row of pRes[0].values) {
+        const pId = String(row[0] || '').trim();
+        const eId = String(row[1] || '').trim();
+        const pDt = String(row[2] || '').trim().replace(' ', 'T').slice(0, 19);
+        if (pId) existingPunchIds.add(pId);
+        if (eId && pDt) existingPunchEmpTimes.add(`${eId}|${pDt}`);
+      }
+    }
+  } catch (e) {
+    console.warn('[ZKPoller] Punch index load note:', e);
+  }
+
+  try {
+    const uRes = db.exec('SELECT data FROM zk_unmapped_punches');
+    if (uRes.length > 0) {
+      for (const row of uRes[0].values) {
+        try {
+          const u = JSON.parse(String(row[0]));
+          const key = `${String(u.deviceUserId || '').trim()}|${String(u.punchDateTime || '').replace(' ', 'T').slice(0, 19)}`;
+          existingUnmappedKeys.add(key);
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return {
+    activeEmpIds,
+    inactiveEmpIds,
+    empLookup,
+    empNames,
+    empDepartments,
+    empJoiningDates,
+    existingMappingsByDevUser,
+    existingMappedEmpIds,
+    existingPunchIds,
+    existingPunchEmpTimes,
+    existingUnmappedKeys
+  };
+}
+
+function resolveEmployeeForDeviceUser(ctx: SystemDirectoryContext, rawDevUserId: string): {
+  employeeId?: string;
+  isActive: boolean;
+  isInactive: boolean;
+} {
+  const uid = String(rawDevUserId || '').trim();
+  if (!uid) return { isActive: false, isInactive: false };
+  const norm = normalizeEmpId(uid);
+
+  const mappedEmp =
+    ctx.existingMappingsByDevUser.get(uid) ||
+    ctx.existingMappingsByDevUser.get(uid.toLowerCase()) ||
+    (norm ? ctx.existingMappingsByDevUser.get(norm) : undefined);
+
+  if (mappedEmp) {
+    if (ctx.activeEmpIds.has(mappedEmp)) return { employeeId: mappedEmp, isActive: true, isInactive: false };
+    if (ctx.inactiveEmpIds.has(mappedEmp)) return { employeeId: mappedEmp, isActive: false, isInactive: true };
+  }
+
+  const directEmp =
+    ctx.empLookup.get(uid) ||
+    ctx.empLookup.get(uid.toLowerCase()) ||
+    (norm ? ctx.empLookup.get(norm) : undefined);
+
+  if (directEmp) {
+    if (ctx.activeEmpIds.has(directEmp)) return { employeeId: directEmp, isActive: true, isInactive: false };
+    if (ctx.inactiveEmpIds.has(directEmp)) return { employeeId: directEmp, isActive: false, isInactive: true };
+  }
+
+  return { isActive: false, isInactive: false };
+}
+
+function updateDeviceStatsFromSqlite(db: any, overrides?: Map<string, Partial<any>>) {
+  const statsByDev = new Map<string, { logs: number; users: Set<string> }>();
+  let totalSystemLogs = 0;
+
+  try {
+    const pRes = db.exec('SELECT device_id, employee_id FROM attendance_punches');
+    if (pRes.length > 0) {
+      for (const r of pRes[0].values) {
+        const dId = String(r[0] || '').trim();
+        const eId = String(r[1] || '').trim();
+        totalSystemLogs++;
+        if (dId) {
+          let entry = statsByDev.get(dId);
+          if (!entry) {
+            entry = { logs: 0, users: new Set<string>() };
+            statsByDev.set(dId, entry);
+          }
+          entry.logs++;
+          if (eId) entry.users.add(eId);
+        }
+      }
+    }
+  } catch {}
+
+  let activeEmpCount = 0;
+  try {
+    const aRes = db.exec("SELECT COUNT(*) FROM employees WHERE status IS NULL OR status = '' OR LOWER(status) = 'active'");
+    if (aRes.length > 0 && aRes[0].values.length > 0) {
+      activeEmpCount = Number(aRes[0].values[0][0] || 0);
+    }
+  } catch {}
+
+  const devRes = db.exec('SELECT id, data FROM zk_devices');
+  if (devRes.length === 0) return { deviceCount: 0, totalSystemLogs, activeEmpCount };
+
+  const now = new Date().toISOString();
+  const upStmt = db.prepare('UPDATE zk_devices SET data = ?, updated_at = ? WHERE id = ?');
+  let count = 0;
+  for (const r of devRes[0].values) {
+    const devId = String(r[0]);
+    let devObj: any = {};
+    try { devObj = JSON.parse(String(r[1] || '{}')); } catch {}
+    const stats = statsByDev.get(devId);
+    const extra = overrides?.get(devId) || {};
+    const merged = {
+      ...devObj,
+      ...extra,
+      id: devId,
+      userCount: stats ? stats.users.size : Number(devObj.userCount || 0),
+      logCount: stats ? stats.logs : Number(devObj.logCount || 0),
+      activeDirectoryUsers: activeEmpCount,
+      totalSystemLogs
+    };
+    upStmt.run([JSON.stringify(merged), now, devId]);
+    count++;
+  }
+  upStmt.free();
+  return { deviceCount: count, totalSystemLogs, activeEmpCount };
+}
+
+function appendSyncLogToSqlite(db: any, logEntry: {
+  deviceId: string;
+  deviceName: string;
+  status: 'Success' | 'Failed';
+  recordsRead: number;
+  newRecords: number;
+  duplicates: number;
+  errors: number;
+  durationMs: number;
+  unmappedCount?: number;
+  inactiveSkipped?: number;
+  mode?: string;
+  message?: string;
+}) {
+  const now = new Date().toISOString();
+  const id = `synclog_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const full = { id, timestamp: now, ...logEntry };
+  const stmt = db.prepare('INSERT INTO zk_sync_logs (id, data, created_at) VALUES (?, ?, ?)');
+  stmt.run([id, JSON.stringify(full), now]);
+  stmt.free();
+
+  // Keep latest 200 sync logs to keep SQLite clean
+  try {
+    db.run(`
+      DELETE FROM zk_sync_logs WHERE id NOT IN (
+        SELECT id FROM zk_sync_logs ORDER BY created_at DESC LIMIT 200
+      )
+    `);
+  } catch {}
+}
+
+export async function reconcileSystemDataInSqlite(): Promise<{
+  success: boolean;
+  mappingsCreated: number;
+  unmappedResolved: number;
+  punchesAdded: number;
+  activeEmployees: number;
+  totalSystemLogs: number;
+}> {
+  return withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    const ctx = loadSystemContext(db);
+    const now = new Date().toISOString();
+
+    let mappingsCreated = 0;
+    let unmappedResolved = 0;
+    let punchesAdded = 0;
+
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+
+    // 1. Ensure all Active Employees have zk_user_mappings rows persisted in SQLite
+    const mapStmt = db.prepare(`
+      INSERT INTO zk_user_mappings (id, device_user_id, employee_id, data)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        device_user_id=excluded.device_user_id,
+        employee_id=excluded.employee_id,
+        data=excluded.data
+    `);
+
+    for (const empId of ctx.activeEmpIds) {
+      if (ctx.existingMappedEmpIds.has(empId)) continue;
+      const mapId = `map_${empId}`;
+      const mappingObj = {
+        id: mapId,
+        deviceUserId: empId,
+        employeeId: empId,
+        employeeName: ctx.empNames.get(empId) || empId,
+        department: ctx.empDepartments.get(empId) || 'General',
+        mappedAt: ctx.empJoiningDates.get(empId) || now
+      };
+      mapStmt.run([mapId, empId, empId, JSON.stringify(mappingObj)]);
+      ctx.existingMappingsByDevUser.set(empId, empId);
+      ctx.existingMappedEmpIds.add(empId);
+      mappingsCreated++;
+    }
+    mapStmt.free();
+
+    // 2. Auto-resolve pending zk_unmapped_punches against Active Employees & mappings
+    const punchStmt = db.prepare(`
+      INSERT OR IGNORE INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateUnmappedStmt = db.prepare('UPDATE zk_unmapped_punches SET data = ? WHERE id = ?');
+
+    try {
+      const uRes = db.exec('SELECT id, data FROM zk_unmapped_punches');
+      if (uRes.length > 0) {
+        for (const row of uRes[0].values) {
+          const uId = String(row[0]);
+          let uObj: any = {};
+          try { uObj = JSON.parse(String(row[1] || '{}')); } catch { continue; }
+          if (uObj.status && uObj.status !== 'pending') continue;
+
+          const resolved = resolveEmployeeForDeviceUser(ctx, String(uObj.deviceUserId || ''));
+          if (!resolved.employeeId || !resolved.isActive) continue;
+
+          const dt = normalizeZkDateTime(uObj.punchDateTime);
+          if (!dt) continue;
+
+          const jDate = ctx.empJoiningDates.get(resolved.employeeId);
+          if (jDate && dt.slice(0, 10) < jDate) {
+            uObj.status = 'resolved';
+            updateUnmappedStmt.run([JSON.stringify(uObj), uId]);
+            unmappedResolved++;
+            continue;
+          }
+
+          const empTimeKey = `${resolved.employeeId}|${dt}`;
+          if (!ctx.existingPunchEmpTimes.has(empTimeKey)) {
+            const txId = String(uObj.transactionId || `${uObj.deviceId || 'zk'}_${resolved.employeeId}_${dt.replace(/[:.-]/g, '')}`);
+            const pId = `zk_${txId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+            if (!ctx.existingPunchIds.has(pId)) {
+              const pObj = {
+                id: pId,
+                employeeId: resolved.employeeId,
+                punchDatetime: dt,
+                deviceId: uObj.deviceId || '',
+                deviceName: uObj.deviceName || 'ZKTeco Device',
+                deviceIP: uObj.deviceIP || '',
+                deviceUserId: uObj.deviceUserId,
+                source: 'ZKTeco',
+                syncTime: now,
+                transactionId: txId,
+                importFormat: 'standard'
+              };
+              punchStmt.run([pId, resolved.employeeId, dt, pObj.deviceId, 'ZKTeco', JSON.stringify(pObj), now]);
+              ctx.existingPunchIds.add(pId);
+              ctx.existingPunchEmpTimes.add(empTimeKey);
+              punchesAdded++;
+            }
+          }
+
+          uObj.status = 'resolved';
+          updateUnmappedStmt.run([JSON.stringify(uObj), uId]);
+          unmappedResolved++;
+        }
+      }
+    } catch (e) {
+      console.warn('[ZKPoller] Unmapped reconciliation note:', e);
+    }
+    punchStmt.free();
+    updateUnmappedStmt.free();
+
+    const stats = updateDeviceStatsFromSqlite(db);
+    db.run('COMMIT');
+    saveSqliteDb();
+
+    return {
+      success: true,
+      mappingsCreated,
+      unmappedResolved,
+      punchesAdded,
+      activeEmployees: ctx.activeEmpIds.size,
+      totalSystemLogs: stats.totalSystemLogs
+    };
+  });
+}
+
+export interface IngestZkBatchParams {
+  deviceId?: string;
+  deviceName?: string;
+  deviceIP?: string;
+  serialNumber?: string;
+  protocolUsed?: string;
+  punches: ZkRawPunch[];
+  users?: ZkDeviceUser[];
+  durationMs?: number;
+  mode?: string;
+  status?: 'Success' | 'Failed';
+  deviceStatus?: 'online' | 'offline';
+  errorMessage?: string;
+  freeSizes?: { userCount: number; logCount: number };
+}
+
+export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Promise<{
+  success: boolean;
+  deviceId: string;
+  deviceName: string;
+  recordsRead: number;
+  newRecords: number;
+  duplicates: number;
+  unmappedCount: number;
+  inactiveSkipped: number;
+  beforeJoiningSkipped: number;
+  mappingsAdded: number;
+}> {
+  return withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    const ctx = loadSystemContext(db);
+    const now = new Date().toISOString();
+
+    // Locate device in SQLite zk_devices
+    let resolvedDevId = String(params.deviceId || '').trim();
+    let resolvedDevName = String(params.deviceName || '').trim();
+    let resolvedDevIp = String(params.deviceIP || '').trim();
+
+    try {
+      const devRes = db.exec('SELECT id, data FROM zk_devices');
+      if (devRes.length > 0) {
+        for (const r of devRes[0].values) {
+          const id = String(r[0]);
+          let d: any = {};
+          try { d = JSON.parse(String(r[1] || '{}')); } catch {}
+          const matchesId = resolvedDevId && id === resolvedDevId;
+          const matchesSn = params.serialNumber && d.serialNumber && String(d.serialNumber).trim() === String(params.serialNumber).trim();
+          const matchesIp = resolvedDevIp && d.ip && String(d.ip).trim() === resolvedDevIp;
+          if (matchesId || matchesSn || matchesIp) {
+            resolvedDevId = id;
+            resolvedDevName = resolvedDevName || d.name || id;
+            resolvedDevIp = resolvedDevIp || d.ip || '';
+            break;
+          }
+        }
+      }
+    } catch {}
+
+    if (!resolvedDevId) {
+      resolvedDevId = 'dev_office_192_168_13_7';
+    }
+    resolvedDevName = resolvedDevName || 'ZKTeco Device';
+
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+
+    let newRecords = 0;
+    let duplicates = 0;
+    let unmappedCount = 0;
+    let inactiveSkipped = 0;
+    let beforeJoiningSkipped = 0;
+    let mappingsAdded = 0;
+
+    // 1. Store any enrolled users pulled from hardware that match Active Employees
+    if (Array.isArray(params.users) && params.users.length > 0) {
+      const mapStmt = db.prepare(`
+        INSERT INTO zk_user_mappings (id, device_user_id, employee_id, data)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET employee_id=excluded.employee_id, data=excluded.data
+      `);
+      for (const u of params.users) {
+        const uid = String(u.deviceUserId || '').trim();
+        if (!uid) continue;
+        const resolved = resolveEmployeeForDeviceUser(ctx, uid);
+        if (resolved.employeeId && resolved.isActive && !ctx.existingMappingsByDevUser.has(uid)) {
+          const mapId = `map_${uid}`;
+          const mObj = {
+            id: mapId,
+            deviceUserId: uid,
+            employeeId: resolved.employeeId,
+            employeeName: ctx.empNames.get(resolved.employeeId) || u.name || resolved.employeeId,
+            department: ctx.empDepartments.get(resolved.employeeId) || 'General',
+            mappedAt: now
+          };
+          mapStmt.run([mapId, uid, resolved.employeeId, JSON.stringify(mObj)]);
+          ctx.existingMappingsByDevUser.set(uid, resolved.employeeId);
+          mappingsAdded++;
+        }
+      }
+      mapStmt.free();
+    }
+
+    // 2. Process & store incoming attendance punches cleanly against system directory
+    const punchStmt = db.prepare(`
+      INSERT OR IGNORE INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    const unmappedStmt = db.prepare(`
+      INSERT OR IGNORE INTO zk_unmapped_punches (id, data, created_at)
+      VALUES (?, ?, ?)
+    `);
+
+    for (const raw of params.punches) {
+      const rawUid = String(raw.deviceUserId || '').trim();
+      const dt = normalizeZkDateTime(raw.punchDateTime);
+      if (!rawUid || !dt) continue;
+
+      const resolved = resolveEmployeeForDeviceUser(ctx, rawUid);
+      if (resolved.isInactive) {
+        inactiveSkipped++;
+        continue;
+      }
+
+      if (!resolved.employeeId || !resolved.isActive) {
+        const unmappedKey = `${rawUid}|${dt}`;
+        if (!ctx.existingUnmappedKeys.has(unmappedKey)) {
+          const txId = `${resolvedDevId}_${rawUid}_${dt.replace(/[:.-]/g, '')}`;
+          const uId = `unmapped_${txId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+          const uObj = {
+            id: uId,
+            deviceId: resolvedDevId,
+            deviceName: resolvedDevName,
+            deviceIP: resolvedDevIp,
+            deviceUserId: rawUid,
+            punchDateTime: dt,
+            transactionId: txId,
+            status: 'pending'
+          };
+          unmappedStmt.run([uId, JSON.stringify(uObj), now]);
+          ctx.existingUnmappedKeys.add(unmappedKey);
+          unmappedCount++;
+        } else {
+          duplicates++;
+        }
+        continue;
+      }
+
+      const empId = resolved.employeeId;
+      const jDate = ctx.empJoiningDates.get(empId);
+      if (jDate && dt.slice(0, 10) < jDate) {
+        beforeJoiningSkipped++;
+        continue;
+      }
+
+      const empTimeKey = `${empId}|${dt}`;
+      const pId = `zk_${empId}_${dt.replace(/[:.-]/g, '')}`;
+      if (ctx.existingPunchEmpTimes.has(empTimeKey) || ctx.existingPunchIds.has(pId)) {
+        duplicates++;
+        continue;
+      }
+
+      const pObj = {
+        id: pId,
+        employeeId: empId,
+        punchDatetime: dt,
+        deviceId: resolvedDevId,
+        deviceName: resolvedDevName,
+        deviceIP: resolvedDevIp,
+        deviceUserId: rawUid,
+        source: 'ZKTeco',
+        syncTime: now,
+        transactionId: pId,
+        location: resolvedDevIp ? `${resolvedDevName} (${resolvedDevIp})` : resolvedDevName,
+        importFormat: 'standard'
+      };
+
+      punchStmt.run([pId, empId, dt, resolvedDevId, 'ZKTeco', JSON.stringify(pObj), now]);
+      ctx.existingPunchIds.add(pId);
+      ctx.existingPunchEmpTimes.add(empTimeKey);
+      newRecords++;
+    }
+
+    punchStmt.free();
+    unmappedStmt.free();
+
+    const devOverrides = new Map<string, Partial<any>>();
+    devOverrides.set(resolvedDevId, {
+      status: params.deviceStatus || 'online',
+      lastProtocolUsed: params.protocolUsed || params.mode || undefined,
+      lastConnection: params.deviceStatus === 'offline' ? undefined : now,
+      lastSync: params.status === 'Failed' ? undefined : now,
+      lastError: params.errorMessage || '',
+      ...(params.freeSizes ? {
+        deviceCapacityUsers: params.freeSizes.userCount,
+        deviceCapacityLogs: params.freeSizes.logCount
+      } : {})
+    });
+    // Strip undefined override keys cleanly so old timestamps aren't wiped
+    const cleanOverride = devOverrides.get(resolvedDevId)!;
+    Object.keys(cleanOverride).forEach(k => cleanOverride[k] === undefined && delete cleanOverride[k]);
+
+    updateDeviceStatsFromSqlite(db, devOverrides);
+
+    appendSyncLogToSqlite(db, {
+      deviceId: resolvedDevId,
+      deviceName: resolvedDevName,
+      status: params.status || 'Success',
+      recordsRead: params.punches.length,
+      newRecords,
+      duplicates,
+      errors: params.status === 'Failed' ? 1 : 0,
+      durationMs: params.durationMs || 0,
+      unmappedCount,
+      inactiveSkipped,
+      mode: params.mode || 'ZKT Sync',
+      message: params.errorMessage || `Processed ${params.punches.length} logs (${newRecords} new stored, ${duplicates} skipped)`
+    });
+
+    db.run('COMMIT');
+    saveSqliteDb();
+
+    return {
+      success: params.status !== 'Failed',
+      deviceId: resolvedDevId,
+      deviceName: resolvedDevName,
+      recordsRead: params.punches.length,
+      newRecords,
+      duplicates,
+      unmappedCount,
+      inactiveSkipped,
+      beforeJoiningSkipped,
+      mappingsAdded
+    };
+  });
+}
+
+export function getWatchFolderPath(): string {
+  const root = getSanitizedRootFolder();
+  const dir = path.join(root, 'Imports');
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  } catch {}
+  return dir;
+}
+
+export function scanLocalDiskAttlogFiles(): Array<{ filePath: string; fileName: string; punches: ZkRawPunch[] }> {
+  const root = getSanitizedRootFolder();
+  const primaryWatchDir = getWatchFolderPath();
+  const candidates = [
+    primaryWatchDir,
+    path.join(root, 'imports'),
+    path.join(root, 'WatchFolder'),
+    'E:\\ZKTime5.0',
+    'E:\\'
+  ];
+
+  const found: Array<{ filePath: string; fileName: string; punches: ZkRawPunch[] }> = [];
+  const seenFiles = new Set<string>();
+
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const entries = fs.readdirSync(dir);
+      for (const name of entries) {
+        const lower = name.toLowerCase();
+        if (
+          !(
+            lower.endsWith('.dat') ||
+            lower.endsWith('.txt') ||
+            lower.endsWith('.csv') ||
+            lower.endsWith('.tsv') ||
+            lower.endsWith('.json') ||
+            lower.includes('attlog')
+          )
+        ) {
+          continue;
+        }
+        const full = path.join(dir, name);
+        if (seenFiles.has(full)) continue;
+        seenFiles.add(full);
+        const st = fs.statSync(full);
+        if (!st.isFile() || st.size === 0 || st.size > 30 * 1024 * 1024) continue;
+        const text = fs.readFileSync(full, 'utf8');
+        const punches = parseAdmsAttlogText(text);
+        if (punches.length > 0) {
+          found.push({ filePath: full, fileName: name, punches });
+        }
+      }
+    } catch {}
+  }
+
+  return found;
+}
+
+export async function recordAdmsDeviceHeartbeat(sn: string, remoteIp?: string) {
+  if (!sn) return;
+  const now = new Date().toISOString();
+  await withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+    const devRes = db.exec('SELECT id, data FROM zk_devices');
+    if (devRes.length > 0) {
+      const upStmt = db.prepare('UPDATE zk_devices SET data = ?, updated_at = ? WHERE id = ?');
+      for (const r of devRes[0].values) {
+        const id = String(r[0]);
+        let d: any = {};
+        try { d = JSON.parse(String(r[1] || '{}')); } catch {}
+        const matchesSn = d.serialNumber && String(d.serialNumber).trim().toLowerCase() === sn.trim().toLowerCase();
+        const matchesIp = remoteIp && d.ip && String(d.ip).trim() === remoteIp.trim();
+        if (matchesSn || matchesIp) {
+          d.status = 'online';
+          d.lastConnection = now;
+          d.lastProtocolUsed = 'ADMS Push';
+          d.lastError = '';
+          upStmt.run([JSON.stringify(d), now, id]);
+        }
+      }
+      upStmt.free();
+    }
+    db.run('COMMIT');
+    saveSqliteDb();
+  });
+}
+
+export async function scanWatchFolderAndIngestToSqlite(deviceId?: string) {
+  const startTime = Date.now();
+  const watchDir = getWatchFolderPath();
+  const files = scanLocalDiskAttlogFiles();
+  let totalRead = 0;
+  let totalNew = 0;
+  let totalDup = 0;
+  let totalUnmapped = 0;
+  let totalInactive = 0;
+
+  if (files.length > 0) {
+    for (const f of files) {
+      const res = await ingestZkPunchesToSqlite({
+        deviceId: deviceId || 'dev_local_disk_e',
+        deviceName: `Watch Folder (${f.fileName})`,
+        deviceIP: 'USB/File',
+        protocolUsed: 'USB/WatchFolder',
+        punches: f.punches,
+        durationMs: Date.now() - startTime,
+        mode: `Watch Folder (${f.fileName})`,
+        deviceStatus: 'online',
+        status: 'Success'
+      });
+      totalRead += res.recordsRead;
+      totalNew += res.newRecords;
+      totalDup += res.duplicates;
+      totalUnmapped += res.unmappedCount;
+      totalInactive += res.inactiveSkipped;
+    }
+  }
+
+  return {
+    success: true,
+    watchFolderPath: watchDir,
+    filesScanned: files.length,
+    fileNames: files.map(f => f.fileName),
+    recordsRead: totalRead,
+    newRecords: totalNew,
+    duplicates: totalDup,
+    unmappedCount: totalUnmapped,
+    inactiveSkipped: totalInactive,
+    durationMs: Date.now() - startTime
+  };
+}
+
+export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'Manual Poll') {
+  const startTime = Date.now();
+  const db = await getSqliteDb();
+  let targetDev: any = null;
+
+  try {
+    const devRes = db.exec('SELECT id, data FROM zk_devices');
+    if (devRes.length > 0) {
+      for (const r of devRes[0].values) {
+        const id = String(r[0]);
+        let d: any = {};
+        try { d = JSON.parse(String(r[1] || '{}')); } catch {}
+        if (id === deviceIdOrIp || d.ip === deviceIdOrIp) {
+          targetDev = { ...d, id };
+          break;
+        }
+      }
+    }
+  } catch {}
+
+  if (!targetDev) {
+    return {
+      success: false,
+      deviceId: deviceIdOrIp,
+      deviceName: deviceIdOrIp,
+      recordsRead: 0,
+      newRecords: 0,
+      duplicates: 0,
+      error: 'Device not found in SQLite zk_devices'
+    };
+  }
+
+  const protocolMode = targetDev.protocolMode || 'Auto';
+
+  if (targetDev.ip === 'USB/File' || targetDev.ip === 'Local Disk (E:)' || protocolMode === 'USB-Disk') {
+    const diskFiles = scanLocalDiskAttlogFiles();
+    const allPunches = diskFiles.flatMap(f => f.punches);
+    const res = await ingestZkPunchesToSqlite({
+      deviceId: targetDev.id,
+      deviceName: targetDev.name,
+      deviceIP: targetDev.ip,
+      protocolUsed: 'USB/WatchFolder',
+      punches: allPunches,
+      durationMs: Date.now() - startTime,
+      mode: `${mode} (Disk/Watch Scan)`,
+      deviceStatus: 'online',
+      status: 'Success'
+    });
+    return { ...res, message: `Scanned local disk/watch folder (${diskFiles.length} files) for ${targetDev.name}: ${res.newRecords} new punches saved to SQLite.` };
+  }
+
+  if (targetDev.ip === 'ADMS Push' || protocolMode === 'ADMS') {
+    const recon = await reconcileSystemDataInSqlite();
+    return {
+      success: true,
+      deviceId: targetDev.id,
+      deviceName: targetDev.name,
+      recordsRead: 0,
+      newRecords: recon.punchesAdded,
+      duplicates: 0,
+      message: `ADMS Push listener active for ${targetDev.name}; reconciled ${recon.activeEmployees} active employees & ${recon.totalSystemLogs} SQLite logs.`
+    };
+  }
+
+  const hw = await fetchZkHardwareData(
+    targetDev.ip,
+    Number(targetDev.port) || 4370,
+    Number(targetDev.commKey) || 0,
+    3500,
+    protocolMode
+  );
+  if (hw.reachable) {
+    const res = await ingestZkPunchesToSqlite({
+      deviceId: targetDev.id,
+      deviceName: targetDev.name,
+      deviceIP: targetDev.ip,
+      serialNumber: hw.serialNumber || targetDev.serialNumber,
+      protocolUsed: hw.protocol,
+      punches: hw.punches,
+      users: hw.users,
+      freeSizes: hw.freeSizes ? { userCount: hw.freeSizes.userCount, logCount: hw.freeSizes.logCount } : undefined,
+      durationMs: Date.now() - startTime,
+      mode: `${mode} (${hw.protocol})`,
+      deviceStatus: 'online',
+      status: 'Success'
+    });
+    return {
+      ...res,
+      reachable: true,
+      protocol: hw.protocol,
+      attempts: hw.attempts,
+      message: `Polled ${targetDev.name} (${targetDev.ip}) via ${hw.protocol}: ${res.recordsRead} read, ${res.newRecords} new stored in SQLite, ${res.duplicates} duplicates skipped.`
+    };
+  }
+
+  const failRes = await ingestZkPunchesToSqlite({
+    deviceId: targetDev.id,
+    deviceName: targetDev.name,
+    deviceIP: targetDev.ip,
+    punches: [],
+    durationMs: Date.now() - startTime,
+    mode: `${mode} (Unreachable)`,
+    deviceStatus: 'offline',
+    status: 'Failed',
+    errorMessage: hw.error || `TCP/UDP/Web unreachable at ${targetDev.ip}:${targetDev.port || 4370}`
+  });
+
+  return {
+    ...failRes,
+    success: false,
+    reachable: false,
+    attempts: hw.attempts,
+    error: hw.error || `Device ${targetDev.name} (${targetDev.ip}:${targetDev.port || 4370}) unreachable on current network`
+  };
+}
+
+export async function testAndStoreZkDeviceConnection(params: {
+  deviceId?: string;
+  ip: string;
+  port?: number;
+  commKey?: number;
+  model?: string;
+  protocolMode?: any;
+}) {
+  const port = Number(params.port) || 4370;
+  const res = await testZkHardwareConnection(
+    params.ip,
+    port,
+    Number(params.commKey) || 0,
+    2500,
+    params.protocolMode || 'Auto'
+  );
+  const now = new Date().toISOString();
+
+  await withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    try { db.run('ROLLBACK'); } catch {}
+    db.run('BEGIN TRANSACTION');
+
+    const devRes = db.exec('SELECT id, data FROM zk_devices');
+    if (devRes.length > 0) {
+      const upStmt = db.prepare('UPDATE zk_devices SET data = ?, updated_at = ? WHERE id = ?');
+      for (const r of devRes[0].values) {
+        const id = String(r[0]);
+        let d: any = {};
+        try { d = JSON.parse(String(r[1] || '{}')); } catch {}
+        if ((params.deviceId && id === params.deviceId) || d.ip === params.ip) {
+          d.status = res.reachable ? 'online' : 'offline';
+          if (res.reachable) {
+            d.lastConnection = now;
+            d.lastProtocolUsed = res.protocol;
+          }
+          d.lastError = res.reachable ? '' : (res.error || 'Unreachable');
+          if (res.serialNumber) d.serialNumber = res.serialNumber;
+          if (res.freeSizes) {
+            d.deviceCapacityUsers = res.freeSizes.userCount;
+            d.deviceCapacityLogs = res.freeSizes.logCount;
+          }
+          upStmt.run([JSON.stringify(d), now, id]);
+        }
+      }
+      upStmt.free();
+    }
+
+    db.run('COMMIT');
+    saveSqliteDb();
+  });
+
+  return res;
+}
+
+export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mode?: string } = {}) {
+  if (zkPollingState.isPollingNow) {
+    return {
+      success: true,
+      skippedBusy: true,
+      message: 'ZKT polling cycle already in progress',
+      results: []
+    };
+  }
+
+  zkPollingState.isPollingNow = true;
+  const startTime = Date.now();
+  try {
+    const db = await getSqliteDb();
+    const devRes = db.exec('SELECT id, data FROM zk_devices');
+    const devices: any[] = [];
+    if (devRes.length > 0) {
+      for (const r of devRes[0].values) {
+        try {
+          const d = JSON.parse(String(r[1] || '{}'));
+          devices.push({ ...d, id: String(r[0]) });
+        } catch {}
+      }
+    }
+
+    const enabledDevices = devices.filter(d => d.enabled !== false);
+    const nowMs = Date.now();
+    const targetDevices = options.dueOnly
+      ? enabledDevices.filter(d => {
+          const mins = Number(d.autoSyncMinutes ?? 15);
+          if (mins <= 0) return false;
+          if (!d.lastSync) return true;
+          const lastMs = Date.parse(String(d.lastSync));
+          return isNaN(lastMs) || nowMs - lastMs >= mins * 60 * 1000;
+        })
+      : enabledDevices;
+
+    const results: any[] = [];
+    let totalRead = 0;
+    let totalNew = 0;
+    let totalDup = 0;
+    let reachableDevices = 0;
+
+    for (const dev of targetDevices) {
+      const r = await pollSingleZkDeviceToSqlite(dev.id, options.mode || (options.dueOnly ? 'Scheduled Auto-Poll' : 'Manual Batch Poll'));
+      results.push(r);
+      totalRead += Number(r.recordsRead || 0);
+      totalNew += Number(r.newRecords || 0);
+      totalDup += Number(r.duplicates || 0);
+      if ((r as any).reachable) reachableDevices++;
+    }
+
+    let diskNew = 0;
+    let diskRead = 0;
+    const diskFiles = scanLocalDiskAttlogFiles();
+    if (diskFiles.length > 0) {
+      const primaryDev = enabledDevices[0] || devices[0];
+      for (const df of diskFiles) {
+        const diskRes = await ingestZkPunchesToSqlite({
+          deviceId: primaryDev?.id || 'dev_local_disk_e',
+          deviceName: primaryDev?.name || `Local Disk (${df.fileName})`,
+          deviceIP: primaryDev?.ip || 'Local Disk (E:)',
+          protocolUsed: 'WatchFolder',
+          punches: df.punches,
+          mode: `Disk/Watch Auto-Scan (${df.fileName})`,
+          deviceStatus: 'online',
+          status: 'Success'
+        });
+        diskRead += diskRes.recordsRead;
+        diskNew += diskRes.newRecords;
+      }
+    }
+
+    const recon = await reconcileSystemDataInSqlite();
+
+    const nowIso = new Date().toISOString();
+    const summary = {
+      success: true,
+      skippedBusy: false,
+      mode: options.mode || (options.dueOnly ? 'Scheduled Auto-Poll' : 'Manual Poll'),
+      polledAt: nowIso,
+      durationMs: Date.now() - startTime,
+      devicesEnabled: enabledDevices.length,
+      devicesPolled: targetDevices.length,
+      reachableDevices,
+      totalRead: totalRead + diskRead,
+      totalNew: totalNew + diskNew + recon.punchesAdded,
+      totalDup,
+      mappingsCreated: recon.mappingsCreated,
+      unmappedResolved: recon.unmappedResolved,
+      activeEmployees: recon.activeEmployees,
+      totalSystemLogs: recon.totalSystemLogs,
+      watchFolderFiles: diskFiles.length,
+      results
+    };
+
+    zkPollingState.lastPollAt = nowIso;
+    zkPollingState.totalPollsRun += 1;
+    zkPollingState.lastPollResult = summary;
+
+    return summary;
+  } finally {
+    zkPollingState.isPollingNow = false;
+  }
+}
+
+export async function getZkPollingSummaryFromSqlite() {
+  const db = await getSqliteDb();
+  let deviceCount = 0;
+  let enabledDeviceCount = 0;
+  let onlineDeviceCount = 0;
+  let punchCount = 0;
+  let activeEmployeeCount = 0;
+  let mappedUserCount = 0;
+  let pendingUnmappedCount = 0;
+  let latestPunchDatetime: string | null = null;
+
+  try {
+    const devRes = db.exec('SELECT data FROM zk_devices');
+    if (devRes.length > 0) {
+      deviceCount = devRes[0].values.length;
+      for (const r of devRes[0].values) {
+        try {
+          const d = JSON.parse(String(r[0]));
+          if (d.enabled !== false) enabledDeviceCount++;
+          if (d.status === 'online') onlineDeviceCount++;
+        } catch {}
+      }
+    }
+  } catch {}
+
+  try {
+    const pRes = db.exec('SELECT COUNT(*), MAX(punch_datetime) FROM attendance_punches');
+    if (pRes.length > 0 && pRes[0].values.length > 0) {
+      punchCount = Number(pRes[0].values[0][0] || 0);
+      latestPunchDatetime = pRes[0].values[0][1] ? String(pRes[0].values[0][1]) : null;
+    }
+  } catch {}
+
+  try {
+    const eRes = db.exec("SELECT COUNT(*) FROM employees WHERE status IS NULL OR status = '' OR LOWER(status) = 'active'");
+    if (eRes.length > 0 && eRes[0].values.length > 0) {
+      activeEmployeeCount = Number(eRes[0].values[0][0] || 0);
+    }
+  } catch {}
+
+  try {
+    const mRes = db.exec('SELECT COUNT(*) FROM zk_user_mappings');
+    if (mRes.length > 0 && mRes[0].values.length > 0) {
+      mappedUserCount = Number(mRes[0].values[0][0] || 0);
+    }
+  } catch {}
+
+  try {
+    const uRes = db.exec('SELECT data FROM zk_unmapped_punches');
+    if (uRes.length > 0) {
+      for (const r of uRes[0].values) {
+        try {
+          const u = JSON.parse(String(r[0]));
+          if (!u.status || u.status === 'pending') pendingUnmappedCount++;
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return {
+    ...zkPollingState,
+    dbPath: getSqliteDbPath(),
+    watchFolderPath: getWatchFolderPath(),
+    deviceCount,
+    enabledDeviceCount,
+    onlineDeviceCount,
+    punchCount,
+    activeEmployeeCount,
+    mappedUserCount,
+    pendingUnmappedCount,
+    latestPunchDatetime
+  };
+}

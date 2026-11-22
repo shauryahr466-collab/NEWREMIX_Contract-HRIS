@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Database, HardDrive, CheckCircle2, RefreshCw, ShieldAlert, ArrowDownToLine, DownloadCloud, X, Activity, Loader2, ShieldCheck, Radio, Zap } from 'lucide-react';
+import { Database, HardDrive, RefreshCw, ArrowDownToLine, DownloadCloud, X, Activity, Loader2, ShieldCheck, Radio } from 'lucide-react';
 import { fetchLocalStatus, setLocalRootFolder, triggerLocalBackup, migrateFirestoreToLocal, runPersistenceTest } from '../lib/localClient';
 import { useAppStore } from '../store';
 import { toast } from 'sonner';
@@ -13,10 +13,22 @@ export function LocalModeIndicator() {
   const [isMigrating, setIsMigrating] = useState(false);
   const [isDiagRunning, setIsDiagRunning] = useState(false);
   const [isPersistTestRunning, setIsPersistTestRunning] = useState(false);
-  const [isFetchingBio, setIsFetchingBio] = useState(false);
+  const [isPollingNow, setIsPollingNow] = useState(false);
   const [isTogglingPoll, setIsTogglingPoll] = useState(false);
 
-  const { employees, punches, settings, shiftAssignments, exceptions, overtimeRecords, sblRecords, forceAttendanceRecords, payrollRuns, recalculate } = useAppStore();
+  const {
+    employees,
+    punches,
+    settings,
+    shiftAssignments,
+    exceptions,
+    overtimeRecords,
+    sblRecords,
+    forceAttendanceRecords,
+    payrollRuns,
+    syncAllZkDevices,
+    recalculate
+  } = useAppStore();
 
   const loadStatus = async () => {
     const res = await fetchLocalStatus();
@@ -34,7 +46,7 @@ export function LocalModeIndicator() {
 
   useEffect(() => {
     loadStatus();
-    const interval = setInterval(loadStatus, 30000); // refresh every 30s
+    const interval = setInterval(loadStatus, 30000);
     return () => clearInterval(interval);
   }, []);
 
@@ -49,34 +61,29 @@ export function LocalModeIndicator() {
       }).then(r => r.json());
       if (res.success) {
         setAutoPollStatus(res);
-        toast.success(nextEnabled ? 'ZKT Auto-Polling Enabled (Direct SQLite Sync)' : 'ZKT Auto-Polling Paused');
+        toast.success(
+          nextEnabled
+            ? 'ZKTeco Auto-Polling to SQLite Enabled'
+            : 'ZKTeco Auto-Polling Paused'
+        );
       }
-    } catch (e: any) {
-      toast.error('Failed to toggle ZKT Auto-Polling');
+    } catch {
+      toast.error('Failed to toggle ZKTeco Auto-Polling');
     } finally {
       setIsTogglingPoll(false);
     }
   };
 
-  const handleFetchBioNow = async () => {
-    setIsFetchingBio(true);
-    const tId = toast.loading('Fetching biometric punches from ZKTeco devices & local disk into SQLite...');
+  const handlePollZkAndSyncSqlite = async () => {
+    setIsPollingNow(true);
     try {
-      const res = await fetch('/api/zk/fetch-all', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      }).then(r => r.json());
-      if (res.success) {
-        toast.success(res.message || `Fetched ${res.totalRead} punches (${res.totalNew} new saved to SQLite)`, { id: tId });
-        await recalculate();
-        await loadStatus();
-      } else {
-        toast.error(res.error || 'Failed to fetch from biometric device', { id: tId });
-      }
+      await syncAllZkDevices();
+      await recalculate();
+      await loadStatus();
     } catch (e: any) {
-      toast.error('Biometric fetch error: ' + e.message, { id: tId });
+      toast.error('ZKT polling error: ' + e.message);
     } finally {
-      setIsFetchingBio(false);
+      setIsPollingNow(false);
     }
   };
 
@@ -120,7 +127,7 @@ export function LocalModeIndicator() {
         payrollRuns
       };
       const res = await migrateFirestoreToLocal(snapshot);
-      toast.success(res.message || 'All workspace data saved to local SQLite database!');
+      toast.success(res.message || 'Workspace data synchronized to local SQLite database!');
       await loadStatus();
     } catch (e: any) {
       toast.error(e.message || 'Sync failed');
@@ -133,17 +140,20 @@ export function LocalModeIndicator() {
     <>
       <button
         onClick={() => { setIsOpen(true); loadStatus(); }}
-        className="px-2.5 py-1 bg-emerald-500/10 border border-emerald-500/30 hover:bg-emerald-500/20 rounded-full text-emerald-700 dark:text-emerald-400 text-[11px] font-bold flex items-center gap-2 transition-all cursor-pointer shadow-xs"
-        title="Click to view Local SQLite Database & ZKT Auto-Polling controls"
+        className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-emerald-500/40 rounded-lg text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-2 transition-colors cursor-pointer"
+        title="Inspect SQLite Database & ZKTeco Polling Engine status"
       >
-        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-        <span className="hidden sm:inline uppercase tracking-wider font-extrabold">SQLITE ACTIVE</span>
-        <span className="text-[10px] opacity-80 border-l border-emerald-500/30 pl-2 hidden md:inline">ZKT Auto-Poll • ON</span>
+        <Database size={13} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+        <span className="hidden sm:inline font-bold tracking-tight">SQLite</span>
+        <span className="text-slate-300 dark:text-slate-700 hidden md:inline">·</span>
+        <span className="text-[11px] text-emerald-700 dark:text-emerald-400 font-semibold hidden md:inline tabular-nums">
+          ZKT Poll {autoPollStatus?.enabled !== false ? 'ON' : 'PAUSED'}
+        </span>
       </button>
 
       {isOpen && (
         <div className="fixed inset-0 z-[200] bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl relative space-y-5">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl max-w-lg w-full p-6 shadow-2xl relative space-y-5">
             <button
               onClick={() => setIsOpen(false)}
               className="absolute top-4 right-4 p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
@@ -152,34 +162,36 @@ export function LocalModeIndicator() {
             </button>
 
             <div className="flex items-center gap-3">
-              <div className="p-3 bg-emerald-500/10 text-emerald-600 rounded-xl">
-                <HardDrive size={24} />
+              <div className="p-2.5 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 rounded-lg border border-emerald-500/20">
+                <HardDrive size={22} />
               </div>
               <div>
-                <h3 className="text-base font-extrabold text-slate-900 dark:text-white flex items-center gap-2">
-                  Local-First Operating Mode
-                  <span className="px-2 py-0.5 bg-emerald-500 text-white text-[10px] font-black uppercase rounded-full">Active</span>
+                <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  SQLite ZKTeco Polling Engine
+                  <span className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">· Read &amp; Store</span>
                 </h3>
-                <p className="text-xs text-slate-500">100% SQLite Database (No Firestore/Firebase) & Direct ZKTeco Biometric Sync</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Polls ZKTeco terminals, validates against Active Employees, and persists punches &amp; logs in SQLite.
+                </p>
               </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3 text-xs">
-              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
-                <span className="text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">Local Database (Disk E)</span>
-                <span className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 truncate">
-                  <Database size={14} className="text-indigo-500 shrink-0" /> SQLite (E:\SHRM_HRIS\Database.db)
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200 dark:border-slate-800">
+                <span className="text-slate-500 dark:text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">Local SQLite Database</span>
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 truncate font-mono text-[11px]">
+                  <Database size={13} className="text-indigo-500 shrink-0" /> {status?.dbPath || 'E:\\SHRM_HRIS\\Database.db'}
                 </span>
               </div>
 
-              <div className="p-3 bg-emerald-50/70 dark:bg-emerald-950/30 rounded-xl border border-emerald-200 dark:border-emerald-800/60 flex flex-col justify-between">
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200 dark:border-slate-800 flex flex-col justify-between">
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-emerald-700 dark:text-emerald-400 font-bold block text-[10px] uppercase tracking-wider">ZKT Auto-Polling</span>
+                  <span className="text-slate-500 dark:text-slate-400 font-medium block text-[10px] uppercase tracking-wider">Auto-Polling</span>
                   <button
                     type="button"
                     onClick={handleToggleAutoPoll}
                     disabled={isTogglingPoll}
-                    className={`px-2 py-0.5 rounded text-[9px] font-black uppercase cursor-pointer transition-colors ${
+                    className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase cursor-pointer transition-colors ${
                       autoPollStatus?.enabled !== false
                         ? 'bg-emerald-600 text-white hover:bg-emerald-700'
                         : 'bg-slate-300 text-slate-700 hover:bg-slate-400'
@@ -188,23 +200,25 @@ export function LocalModeIndicator() {
                     {autoPollStatus?.enabled !== false ? 'ENABLED' : 'PAUSED'}
                   </button>
                 </div>
-                <span className="font-bold text-emerald-700 dark:text-emerald-300 flex items-center gap-1.5">
-                  <Radio size={14} className="text-emerald-500 shrink-0 animate-pulse" />
-                  {autoPollStatus?.enabled !== false ? 'Enabled (Auto + Manual Fetch)' : 'Paused (Click to Enable)'}
+                <span className="font-semibold text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5 tabular-nums">
+                  <Radio size={13} className="text-emerald-600 dark:text-emerald-400 shrink-0" />
+                  {punches.length.toLocaleString()} stored logs
                 </span>
               </div>
 
-              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
-                <span className="text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">Data Write & Upload</span>
-                <span className="font-bold text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
-                  <CheckCircle2 size={14} className="text-emerald-500 shrink-0" /> Direct SQLite Write
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200 dark:border-slate-800">
+                <span className="text-slate-500 dark:text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">Active Directory Match</span>
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 tabular-nums">
+                  <ShieldCheck size={13} className="text-indigo-500 shrink-0" />
+                  {autoPollStatus?.activeEmployeeCount ?? employees.filter(e => !e.status || e.status.toLowerCase() === 'active').length} Active Staff
                 </span>
               </div>
 
-              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-100 dark:border-slate-800">
-                <span className="text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">Deletion Safeguard</span>
-                <span className="font-bold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
-                  <ShieldAlert size={14} className="text-amber-500 shrink-0" /> Manual Confirmation Only
+              <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-lg border border-slate-200 dark:border-slate-800">
+                <span className="text-slate-500 dark:text-slate-400 font-medium block text-[10px] uppercase tracking-wider mb-1">Enabled Devices</span>
+                <span className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 tabular-nums">
+                  <ShieldCheck size={13} className="text-emerald-500 shrink-0" />
+                  {autoPollStatus?.enabledDeviceCount ?? 0} of {autoPollStatus?.deviceCount ?? 0} Active
                 </span>
               </div>
             </div>
@@ -212,12 +226,12 @@ export function LocalModeIndicator() {
             <div className="pt-1">
               <button
                 type="button"
-                onClick={handleFetchBioNow}
-                disabled={isFetchingBio}
-                className="w-full py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white text-xs font-extrabold rounded-xl shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
+                onClick={handlePollZkAndSyncSqlite}
+                disabled={isPollingNow}
+                className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer"
               >
-                {isFetchingBio ? <Loader2 size={15} className="animate-spin" /> : <Zap size={15} />}
-                Fetch Bio From ZKTeco Device Now (Direct to SQLite)
+                {isPollingNow ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+                Poll ZKT Devices &amp; Sync SQLite Now
               </button>
             </div>
 
@@ -271,7 +285,7 @@ export function LocalModeIndicator() {
                 disabled={isPersistTestRunning}
                 className="w-full py-2 bg-emerald-700 text-white text-xs font-bold rounded-xl hover:bg-emerald-800 transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
               >
-                {isPersistTestRunning ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Run Physical File Persistence Test (POST /api/local/persistence-test)
+                {isPersistTestRunning ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />} Run Physical File Persistence Test
               </button>
 
               <button

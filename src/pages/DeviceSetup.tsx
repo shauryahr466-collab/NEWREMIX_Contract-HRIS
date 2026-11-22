@@ -1,16 +1,14 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAppStore } from '../store';
-import { ZkDevice, ZkUserMapping } from '../types';
+import { ZkDevice, ZkProtocolMode } from '../types';
 import { 
   Cpu, 
   Wifi, 
-  WifiOff, 
   RefreshCw, 
   Plus, 
   Edit3, 
   Trash2, 
   CheckCircle2, 
-  XCircle, 
   UserCheck, 
   Link2, 
   Unlink, 
@@ -23,12 +21,13 @@ import {
   AlertTriangle,
   Play,
   Activity,
-  ShieldAlert,
+  ShieldCheck,
   HelpCircle,
   HardDrive,
   FileUp,
   Radio,
-  Zap
+  Zap,
+  FolderSearch
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -46,6 +45,9 @@ export const DeviceSetup: React.FC = () => {
     mapZkUser,
     unmapZkUser,
     syncZkDevice,
+    syncAllZkDevices,
+    reconcileSystemZkData,
+    fetchPunches,
     resolveUnmappedPunches,
     clearZkSyncLogs,
     isAdmin
@@ -54,6 +56,14 @@ export const DeviceSetup: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'devices' | 'mapping' | 'unmapped' | 'history' | 'connector' | 'usb_dat'>('devices');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDatDeviceId, setSelectedDatDeviceId] = useState<string>('');
+  const [pollSummary, setPollSummary] = useState<any>(null);
+  const [isTogglingPoll, setIsTogglingPoll] = useState(false);
+  const [isBatchPolling, setIsBatchPolling] = useState(false);
+  const [isReconciling, setIsReconciling] = useState(false);
+  const [isScanningWatch, setIsScanningWatch] = useState(false);
+  const [rawPasteText, setRawPasteText] = useState('');
+  const [isUploadingRaw, setIsUploadingRaw] = useState(false);
+  const [lastDiagnosticResult, setLastDiagnosticResult] = useState<any>(null);
   
   // Modal States
   const [isDeviceModalOpen, setIsDeviceModalOpen] = useState(false);
@@ -64,7 +74,18 @@ export const DeviceSetup: React.FC = () => {
   const [testUserId, setTestUserId] = useState('121');
 
   // Form State
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<{
+    name: string;
+    ip: string;
+    port: number;
+    model: string;
+    serialNumber: string;
+    deviceNumber: number;
+    enabled: boolean;
+    autoSyncMinutes: number;
+    protocolMode: ZkProtocolMode;
+    commKey: number;
+  }>({
     name: '',
     ip: '192.168.117.200',
     port: 4370,
@@ -72,7 +93,9 @@ export const DeviceSetup: React.FC = () => {
     serialNumber: '',
     deviceNumber: 1,
     enabled: true,
-    autoSyncMinutes: 15
+    autoSyncMinutes: 15,
+    protocolMode: 'Auto',
+    commKey: 0
   });
 
   // Mapping Form State
@@ -82,6 +105,140 @@ export const DeviceSetup: React.FC = () => {
   // Handle DAT / CSV / TXT File Upload for ZKTime 5.0
   const [isProcessingDat, setIsProcessingDat] = useState(false);
   const [showZkTimeGuideModal, setShowZkTimeGuideModal] = useState(false);
+
+  const loadPollSummary = useCallback(async () => {
+    try {
+      const res = await fetch('/api/zk/auto-poll/status');
+      if (res.ok) {
+        const data = await res.json();
+        setPollSummary(data);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    loadPollSummary();
+    const timer = setInterval(loadPollSummary, 20000);
+    return () => clearInterval(timer);
+  }, [loadPollSummary]);
+
+  const handleToggleAutoPoll = async () => {
+    setIsTogglingPoll(true);
+    try {
+      const nextEnabled = !(pollSummary?.enabled !== false);
+      const res = await fetch('/api/zk/auto-poll/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: nextEnabled })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setPollSummary(data);
+        toast.success(nextEnabled ? 'ZKTeco Auto-Polling Enabled' : 'ZKTeco Auto-Polling Paused');
+      }
+    } catch {
+      toast.error('Failed to update auto-polling schedule');
+    } finally {
+      setIsTogglingPoll(false);
+    }
+  };
+
+  const handleChangePollInterval = async (intervalSeconds: number) => {
+    try {
+      const res = await fetch('/api/zk/auto-poll/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ intervalSeconds })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setPollSummary(data);
+        toast.success(`Auto-poll schedule updated (${intervalSeconds >= 60 ? `${Math.round(intervalSeconds / 60)}m` : `${intervalSeconds}s`})`);
+      }
+    } catch {
+      toast.error('Failed to update poll interval');
+    }
+  };
+
+  const handleScanWatchFolder = async () => {
+    setIsScanningWatch(true);
+    try {
+      const targetDevId = selectedDatDeviceId || zkDevices[0]?.id;
+      const res = await fetch('/api/zk/watch-folder/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: targetDevId })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        await fetchPunches();
+        await loadPollSummary();
+        toast.success(data.message || `Scanned Watch Folder (${data.filesScanned} files)`);
+      } else {
+        toast.error(data.error || 'Watch folder scan failed');
+      }
+    } catch (e: any) {
+      toast.error(e.message || 'Watch folder scan failed');
+    } finally {
+      setIsScanningWatch(false);
+    }
+  };
+
+  const handleUploadRawText = async () => {
+    if (!rawPasteText.trim()) {
+      toast.error('Paste punch log lines first (ATTLOG, PIN=..., CSV, or JSON)');
+      return;
+    }
+    setIsUploadingRaw(true);
+    try {
+      const targetDev = zkDevices.find(d => d.id === selectedDatDeviceId) || zkDevices[0];
+      const res = await fetch('/api/zk/upload-raw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rawText: rawPasteText,
+          deviceId: targetDev?.id,
+          deviceName: targetDev?.name || 'Direct Raw Paste',
+          deviceIP: targetDev?.ip || 'USB/File'
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        await fetchPunches();
+        await loadPollSummary();
+        setRawPasteText('');
+        toast.success(data.message);
+      } else {
+        toast.error(data.error || 'Failed to parse raw punch lines');
+      }
+    } catch (e: any) {
+      toast.error(e.message || 'Raw import failed');
+    } finally {
+      setIsUploadingRaw(false);
+    }
+  };
+
+  const handlePollAllEnabled = async () => {
+    setIsBatchPolling(true);
+    try {
+      await syncAllZkDevices();
+      await loadPollSummary();
+    } finally {
+      setIsBatchPolling(false);
+    }
+  };
+
+  const handleReconcileSystem = async () => {
+    setIsReconciling(true);
+    try {
+      await reconcileSystemZkData();
+      await loadPollSummary();
+    } finally {
+      setIsReconciling(false);
+    }
+  };
 
   // Helper to parse ZK date/time string variants safely (Exact DIA Local Hardware Time — NO UTC/ISO timezone shift!)
   const parseZkDateTime = (dateStr: string, timeStr?: string): string | null => {
@@ -199,93 +356,46 @@ export const DeviceSetup: React.FC = () => {
         return;
       }
 
-      // Filter to ONLY Active Employees in Directory and their active dates
-      const activeEmps = employees.filter(emp => !emp.status || emp.status.toLowerCase() === 'active');
-      const activeEmpIds = new Set(activeEmps.map(e => String(e.id).trim()));
-      const activeEmpNormMap = new Map<string, string>();
-      const activeEmpJoiningDate = new Map<string, string>();
-
-      activeEmps.forEach(emp => {
-        const eid = String(emp.id).trim();
-        activeEmpNormMap.set(eid, eid);
-        activeEmpNormMap.set(eid.toLowerCase(), eid);
-        const norm = eid.replace(/[^0-9]/g, '').replace(/^0+/, '');
-        if (norm) {
-          activeEmpNormMap.set(norm, eid);
-          activeEmpNormMap.set(`EMP${norm}`, eid);
-          activeEmpNormMap.set(`EMP-${norm}`, eid);
-          activeEmpNormMap.set(`EMP${norm.padStart(3, '0')}`, eid);
-          activeEmpNormMap.set(`EMP-${norm.padStart(3, '0')}`, eid);
-        }
-        if (emp.joiningDate) {
-          activeEmpJoiningDate.set(eid, String(emp.joiningDate).slice(0, 10));
-        }
-      });
-
-      zkUserMappings.forEach(m => {
-        if (m.deviceUserId && m.employeeId && activeEmpIds.has(String(m.employeeId).trim())) {
-          const raw = String(m.deviceUserId).trim();
-          const eid = String(m.employeeId).trim();
-          activeEmpNormMap.set(raw, eid);
-          const norm = raw.replace(/[^0-9]/g, '').replace(/^0+/, '');
-          if (norm) activeEmpNormMap.set(norm, eid);
-        }
-      });
-
-      const distinctMatchedUsers = new Set<string>();
-      const activeFilteredPunches = punches.filter(p => {
-        if (activeEmpIds.size === 0) return true;
-        const uid = String(p.deviceUserId || '').trim();
-        const norm = uid.replace(/[^0-9]/g, '').replace(/^0+/, '') || uid;
-        const matchedEid = activeEmpNormMap.get(uid) || activeEmpNormMap.get(norm) || activeEmpNormMap.get(uid.toLowerCase());
-        if (!matchedEid || !activeEmpIds.has(matchedEid)) return false;
-
-        const jDate = activeEmpJoiningDate.get(matchedEid);
-        const pDate = String(p.punchDateTime || '').slice(0, 10);
-        if (jDate && /^\d{4}-\d{2}-\d{2}$/.test(jDate) && /^\d{4}-\d{2}-\d{2}$/.test(pDate) && pDate < jDate) {
-          return false;
-        }
-        distinctMatchedUsers.add(matchedEid);
-        return true;
-      });
-
-      if (activeFilteredPunches.length === 0) {
-        toast.error('No punches matched Active Employees in the Employee Directory.', { id: tId });
-        return;
-      }
-
-      // Sync ALL active employee punches in batches to the selected target device so userCount & logCount match 100%
       const targetDev = zkDevices.find(d => d.id === selectedDatDeviceId) || zkDevices[0] || { id: 'dev_usb', name: 'ZKTime 5.0 Import', ip: 'USB/File' };
-      const BATCH_SIZE = 5000;
-      let totalNew = 0;
-      let totalDuplicates = 0;
 
-      for (let i = 0; i < activeFilteredPunches.length; i += BATCH_SIZE) {
-        const batch = activeFilteredPunches.slice(i, i + BATCH_SIZE);
-        const res = await fetch('/api/zk/agent/sync', {
+      // Send parsed punches to backend ZKTeco Poller -> validates Active Employees, deduplicates & stores directly in SQLite
+      let totalNew = 0;
+      let totalDup = 0;
+      let totalUnmapped = 0;
+      let totalInactive = 0;
+
+      const batchSize = 2000;
+      for (let i = 0; i < punches.length; i += batchSize) {
+        const chunk = punches.slice(i, i + batchSize);
+        const resp = await fetch('/api/zk/agent/sync', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             deviceId: targetDev.id,
             deviceName: targetDev.name,
             deviceIP: targetDev.ip,
-            userCount: distinctMatchedUsers.size,
-            logCount: activeFilteredPunches.length,
-            punches: batch,
-            autoFetch: false
+            mode: `File Import (${file.name})`,
+            punches: chunk
           })
         });
-
-        const data = await res.json();
-        if (res.ok && data.success) {
-          totalNew += Number(data.newRecords || 0);
-          totalDuplicates += Number(data.duplicates || 0);
+        const data = await resp.json();
+        if (!resp.ok || !data.success) {
+          throw new Error(data?.error || 'Failed to store DAT punches in SQLite');
         }
+        totalNew += Number(data.newRecords || 0);
+        totalDup += Number(data.duplicates || 0);
+        totalUnmapped += Number(data.unmappedCount || 0);
+        totalInactive += Number(data.inactiveSkipped || 0);
       }
 
-      toast.success(`Synced ${activeFilteredPunches.length} logs across ${distinctMatchedUsers.size} Active Employees to "${targetDev.name}": ${totalNew} new stored, ${totalDuplicates} duplicates skipped!`, { id: tId });
+      await fetchPunches();
+      await loadPollSummary();
+      toast.success(
+        `Stored ${totalNew} new punches in SQLite for "${targetDev.name}" (${totalDup} duplicates, ${totalInactive} inactive skipped, ${totalUnmapped} unmapped).`,
+        { id: tId }
+      );
     } catch (err: any) {
-      toast.error(`Failed to read file: ${err.message}`, { id: tId });
+      toast.error(`Failed to import file: ${err.message}`, { id: tId });
     } finally {
       setIsProcessingDat(false);
       e.target.value = '';
@@ -1020,7 +1130,9 @@ pause
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        toast.success(`Test Punch Processed! ${data.newRecords ? 'New record created' : 'Skipped (Duplicate or Inactive Employee)'}.`, { id: tId });
+        await fetchPunches();
+        await loadPollSummary();
+        toast.success(`Test Punch Stored in SQLite! ${data.newRecords ? 'New record committed.' : `Skipped (${data.duplicates ? 'Duplicate' : 'Unmapped/Inactive'}).`}`, { id: tId });
       } else {
         toast.error(`Test Punch Error: ${data.error}`, { id: tId });
       }
@@ -1040,7 +1152,9 @@ pause
       serialNumber: `MB2000-${Math.floor(1000 + Math.random() * 9000)}`,
       deviceNumber: (zkDevices.length || 0) + 1,
       enabled: true,
-      autoSyncMinutes: 15
+      autoSyncMinutes: 15,
+      protocolMode: 'Auto',
+      commKey: 0
     });
     setIsDeviceModalOpen(true);
   };
@@ -1056,7 +1170,9 @@ pause
       serialNumber: dev.serialNumber || '',
       deviceNumber: dev.deviceNumber || 1,
       enabled: dev.enabled,
-      autoSyncMinutes: dev.autoSyncMinutes || 15
+      autoSyncMinutes: dev.autoSyncMinutes ?? 15,
+      protocolMode: dev.protocolMode || 'Auto',
+      commKey: Number(dev.commKey || 0)
     });
     setIsDeviceModalOpen(true);
   };
@@ -1095,7 +1211,7 @@ pause
     }
   };
 
-  // Test Connection
+  // Test Connection (Multi-Protocol Auto/TCP/UDP/Web-HTTP handshake + SQLite zk_devices status persistence)
   const handleTestConnection = async (dev: ZkDevice) => {
     setIsTestingId(dev.id);
     try {
@@ -1106,21 +1222,36 @@ pause
           deviceId: dev.id,
           ip: dev.ip,
           port: dev.port,
+          commKey: Number(dev.commKey || 0),
+          protocolMode: dev.protocolMode || 'Auto',
           model: dev.model
         })
       });
       const data = await res.json();
-      if (data.success) {
+      setLastDiagnosticResult(data);
+      if (data.reachable || data.success) {
         toast.success(data.message);
-        await updateZkDevice(dev.id, { status: 'online', lastConnection: new Date().toISOString() });
+        await updateZkDevice(dev.id, {
+          status: 'online',
+          lastConnection: new Date().toISOString(),
+          lastProtocolUsed: data.protocol,
+          lastError: '',
+          ...(data.serialNumber ? { serialNumber: data.serialNumber } : {}),
+          ...(data.freeSizes ? { deviceCapacityUsers: data.freeSizes.userCount, deviceCapacityLogs: data.freeSizes.logCount } : {})
+        });
         setDiagnosticDevice(dev);
       } else {
-        toast.error(`Connection failed: ${data.error}`);
-        await updateZkDevice(dev.id, { status: 'offline' });
+        toast.warning(data.message || `Device unreachable at ${dev.ip}:${dev.port} (use LAN Agent or ADMS Push)`);
+        await updateZkDevice(dev.id, {
+          status: 'offline',
+          lastError: data.error || 'LAN unreachable from host'
+        });
+        setDiagnosticDevice(dev);
       }
+      await loadPollSummary();
     } catch (err: any) {
-      toast.error(`Device unreachable at ${dev.ip}:${dev.port}`);
-      await updateZkDevice(dev.id, { status: 'offline' });
+      toast.error(`Device test failed at ${dev.ip}:${dev.port}: ${err?.message || 'Network error'}`);
+      await updateZkDevice(dev.id, { status: 'offline', lastError: err?.message || 'Test error' });
     } finally {
       setIsTestingId(null);
     }
@@ -1131,6 +1262,7 @@ pause
     setIsSyncingId(dev.id);
     try {
       await syncZkDevice(dev.id);
+      await loadPollSummary();
     } finally {
       setIsSyncingId(null);
     }
@@ -1263,13 +1395,12 @@ pause
           </button>
 
           <button
-            onClick={() => {
-              zkDevices.forEach(d => handleSyncNow(d));
-            }}
-            className="px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl font-medium text-sm flex items-center gap-2 transition-colors"
+            onClick={handlePollAllEnabled}
+            disabled={isBatchPolling}
+            className="px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl font-semibold text-sm flex items-center gap-2 transition-colors disabled:opacity-50"
           >
-            <RefreshCw className="w-4 h-4" />
-            Sync All
+            <RefreshCw className={`w-4 h-4 ${isBatchPolling ? 'animate-spin' : ''}`} />
+            {isBatchPolling ? 'Polling Devices...' : 'Poll Enabled Devices'}
           </button>
 
           {isAdmin && (
@@ -1288,12 +1419,12 @@ pause
       <div className="bg-gradient-to-r from-emerald-600 to-teal-700 text-white p-5 rounded-2xl shadow-md flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div className="flex items-start md:items-center gap-3">
           <div className="p-3 bg-white/20 rounded-xl backdrop-blur">
-            <Radio className="w-6 h-6 text-white animate-pulse" />
+            <Radio className="w-6 h-6 text-white" />
           </div>
           <div>
-            <h3 className="font-bold text-base">Using ZKTime 5.0 Desktop System on your PC?</h3>
+            <h3 className="font-bold text-base">ZKTeco Auto-Polling &amp; SQLite Storage Engine</h3>
             <p className="text-xs text-emerald-100 mt-0.5">
-              Connect your ZKTime 5.0 fingerprint machine directly to Cloud HRIS using our 1-click PC installer or direct log export.
+              Polls LAN hardware terminals, ADMS Cloud Push, local disk attlogs, or Windows LAN Bridge and stores verified punches into SQLite.
             </p>
           </div>
         </div>
@@ -1351,9 +1482,6 @@ pause
         >
           <AlertTriangle className="w-4 h-4 text-amber-400" />
           Unmapped Punches ({unmappedGrouped.length})
-          {unmappedGrouped.length > 0 && (
-            <span className="w-2 h-2 bg-amber-500 rounded-full animate-pulse" />
-          )}
         </button>
 
         <button
@@ -1365,7 +1493,7 @@ pause
           }`}
         >
           <FileUp className="w-4 h-4" />
-          Local PC Disk (E:) & DAT Import
+          Local PC Disk (E:) &amp; DAT Import
         </button>
 
         <button
@@ -1396,6 +1524,95 @@ pause
       {/* TAB 1: DEVICES LIST */}
       {activeTab === 'devices' && (
         <div className="space-y-4">
+          {/* ZKTeco Polling Engine Control Strip (Aligned with System SQLite Data) */}
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 flex-1">
+              <div className="border-r border-slate-100 dark:border-slate-800 pr-3">
+                <span className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold block">SQLite Punch Logs</span>
+                <span className="text-lg font-bold text-slate-900 dark:text-white tabular-nums">
+                  {(pollSummary?.punchCount ?? totalDiaStats.totalLogs).toLocaleString()}
+                </span>
+              </div>
+              <div className="border-r border-slate-100 dark:border-slate-800 pr-3">
+                <span className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold block">Active Employees</span>
+                <span className="text-lg font-bold text-indigo-600 dark:text-indigo-400 tabular-nums">
+                  {pollSummary?.activeEmployeeCount ?? activeDirectoryEmployeeCount}
+                </span>
+              </div>
+              <div className="border-r border-slate-100 dark:border-slate-800 pr-3">
+                <span className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold block">Mapped User IDs</span>
+                <span className="text-lg font-bold text-emerald-600 dark:text-emerald-400 tabular-nums">
+                  {pollSummary?.mappedUserCount ?? zkUserMappings.length}
+                </span>
+              </div>
+              <div>
+                <span className="text-[11px] uppercase tracking-wider text-slate-400 font-semibold block">Pending Unmapped</span>
+                <span className="text-lg font-bold text-amber-600 dark:text-amber-400 tabular-nums">
+                  {pollSummary?.pendingUnmappedCount ?? unmappedGrouped.length}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={handleToggleAutoPoll}
+                disabled={isTogglingPoll}
+                className={`px-3 py-2 rounded-xl text-xs font-semibold border transition-colors flex items-center gap-1.5 cursor-pointer ${
+                  pollSummary?.enabled !== false
+                    ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                }`}
+              >
+                <Activity className="w-3.5 h-3.5" />
+                Auto-Poll: {pollSummary?.enabled !== false ? 'ON' : 'PAUSED'}
+              </button>
+
+              <select
+                value={Number(pollSummary?.intervalSeconds || 60)}
+                onChange={(e) => handleChangePollInterval(Number(e.target.value))}
+                className="px-2.5 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 cursor-pointer"
+                title="Background Scheduler Check Interval"
+              >
+                <option value={30}>Check 30s</option>
+                <option value={60}>Check 1m</option>
+                <option value={300}>Check 5m</option>
+                <option value={900}>Check 15m</option>
+              </select>
+
+              <button
+                type="button"
+                onClick={handleScanWatchFolder}
+                disabled={isScanningWatch}
+                className="px-3 py-2 rounded-xl text-xs font-semibold bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer"
+                title="Scan local watch folder (Imports / Disk E:) for attlog files"
+              >
+                <FolderSearch className={`w-3.5 h-3.5 text-emerald-600 ${isScanningWatch ? 'animate-spin' : ''}`} />
+                {isScanningWatch ? 'Scanning...' : 'Scan Watch Folder'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleReconcileSystem}
+                disabled={isReconciling}
+                className="px-3 py-2 rounded-xl text-xs font-semibold bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                <ShieldCheck className={`w-3.5 h-3.5 text-indigo-500 ${isReconciling ? 'animate-spin' : ''}`} />
+                {isReconciling ? 'Reconciling...' : 'Reconcile System'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handlePollAllEnabled}
+                disabled={isBatchPolling}
+                className="px-3.5 py-2 rounded-xl text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isBatchPolling ? 'animate-spin' : ''}`} />
+                {isBatchPolling ? 'Polling...' : 'Poll All Enabled Now'}
+              </button>
+            </div>
+          </div>
+
           {/* Search bar */}
           <div className="relative max-w-md">
             <Search className="w-4 h-4 absolute left-3.5 top-3 text-slate-400" />
@@ -1425,22 +1642,22 @@ pause
                       <div className="flex items-center gap-2">
                         <span className="font-bold text-slate-900 dark:text-slate-100 text-base">{dev.name}</span>
                         {!dev.enabled && (
-                          <span className="px-2 py-0.5 text-xs font-semibold bg-slate-100 text-slate-500 rounded-md">Disabled</span>
+                          <span className="px-2 py-0.5 text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-500 rounded-md">Disabled</span>
                         )}
                       </div>
                       <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Model: <span className="font-mono font-medium text-slate-700 dark:text-slate-300">{dev.model}</span></p>
                     </div>
 
-                    {/* Status Badge */}
-                    <div className="flex items-center gap-1.5">
+                    {/* Status Indicator */}
+                    <div className="flex items-center gap-1.5 text-xs font-semibold">
                       {dev.status === 'online' ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-400 rounded-full border border-emerald-200/60 dark:border-emerald-800/60">
-                          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-emerald-700 dark:text-emerald-400 border border-emerald-200/70 dark:border-emerald-800/70 rounded-lg">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
                           Online
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold bg-rose-50 text-rose-700 dark:bg-rose-950/60 dark:text-rose-400 rounded-full border border-rose-200/60 dark:border-rose-800/60">
-                          <span className="w-2 h-2 rounded-full bg-rose-500"></span>
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-rose-700 dark:text-rose-400 border border-rose-200/70 dark:border-rose-800/70 rounded-lg">
+                          <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
                           Offline
                         </span>
                       )}
@@ -1450,8 +1667,15 @@ pause
                   {/* Config Details */}
                   <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800/60 space-y-2 text-xs">
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                      <span>IP & Port:</span>
+                      <span>IP &amp; Port:</span>
                       <span className="font-mono font-bold text-slate-900 dark:text-slate-100">{dev.ip}:{dev.port}</span>
+                    </div>
+
+                    <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                      <span>Compatible Mode:</span>
+                      <span className="font-mono font-semibold text-indigo-600 dark:text-indigo-400">
+                        {dev.protocolMode || 'Auto'}{dev.lastProtocolUsed ? ` (${dev.lastProtocolUsed})` : ''}
+                      </span>
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
@@ -1461,14 +1685,14 @@ pause
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
                       <span>Active Directory Users:</span>
-                      <span className="font-semibold text-indigo-600 dark:text-indigo-400">
+                      <span className="font-semibold text-indigo-600 dark:text-indigo-400 tabular-nums">
                         {activeDirectoryEmployeeCount} active mapped
                       </span>
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
                       <span>Punched Users (In Logs):</span>
-                      <span className="font-semibold text-slate-800 dark:text-slate-200">
+                      <span className="font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
                         {(liveDeviceStatsMap.get(dev.id)?.logs || 0) > 0
                           ? liveDeviceStatsMap.get(dev.id)?.users || 0
                           : (dev.logCount ? dev.userCount || 0 : 0)} users
@@ -1476,11 +1700,20 @@ pause
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                      <span>Total Punch Logs:</span>
-                      <span className="font-semibold text-slate-800 dark:text-slate-200">
-                        {Math.max(liveDeviceStatsMap.get(dev.id)?.logs || 0, dev.logCount || 0)} logs
+                      <span>Stored SQLite Logs:</span>
+                      <span className="font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
+                        {Math.max(liveDeviceStatsMap.get(dev.id)?.logs || 0, dev.logCount || 0).toLocaleString()} logs
                       </span>
                     </div>
+
+                    {typeof dev.deviceCapacityLogs === 'number' && dev.deviceCapacityLogs > 0 && (
+                      <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                        <span>Hardware Buffer Logs:</span>
+                        <span className="font-semibold text-emerald-600 dark:text-emerald-400 tabular-nums">
+                          {dev.deviceCapacityLogs.toLocaleString()} on device
+                        </span>
+                      </div>
+                    )}
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
                       <span>Auto-Sync Interval:</span>
@@ -1491,13 +1724,19 @@ pause
 
                     <div className="flex justify-between text-slate-500 dark:text-slate-400 pt-1">
                       <span>Last Connection:</span>
-                      <span>{dev.lastConnection ? new Date(dev.lastConnection).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Never'}</span>
+                      <span className="tabular-nums">{dev.lastConnection ? new Date(dev.lastConnection).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'Never'}</span>
                     </div>
 
                     <div className="flex justify-between text-slate-500 dark:text-slate-400">
                       <span>Last Attendance Sync:</span>
-                      <span>{dev.lastSync ? new Date(dev.lastSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Never'}</span>
+                      <span className="tabular-nums">{dev.lastSync ? new Date(dev.lastSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Never'}</span>
                     </div>
+
+                    {dev.lastError && dev.status === 'offline' && (
+                      <div className="mt-2 p-2 rounded-lg bg-rose-50 dark:bg-rose-950/30 border border-rose-200/60 dark:border-rose-900/50 text-[11px] text-rose-700 dark:text-rose-300 truncate" title={dev.lastError}>
+                        {dev.lastError}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -1508,7 +1747,7 @@ pause
                       onClick={() => handleTestConnection(dev)}
                       disabled={isTestingId === dev.id}
                       className="px-2.5 py-1.5 text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg flex items-center gap-1 transition-colors"
-                      title="Test local socket connection"
+                      title="Test hardware TCP/UDP connection & save status to SQLite"
                     >
                       {isTestingId === dev.id ? (
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
@@ -1521,7 +1760,7 @@ pause
                     <button
                       onClick={() => handleSyncNow(dev)}
                       disabled={isSyncingId === dev.id || !dev.enabled}
-                      className="px-2.5 py-1.5 text-xs font-medium bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 rounded-lg flex items-center gap-1 transition-colors"
+                      className="px-2.5 py-1.5 text-xs font-medium bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 rounded-lg flex items-center gap-1 transition-colors disabled:opacity-50"
                     >
                       {isSyncingId === dev.id ? (
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
@@ -1919,18 +2158,54 @@ pause
               </label>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs pt-2">
-              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-1">
-                <span className="font-bold text-slate-900 dark:text-slate-100">Step 1: Locate Database on PC</span>
-                <p className="text-slate-500 dark:text-slate-400">Open <code className="font-mono">Local Disk (E:)</code> &rarr; <code className="font-mono">ZKTime5.0</code> or USB drive to find your attendance database or log file.</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                    <FolderSearch className="w-4 h-4 text-emerald-600" />
+                    Auto-Ingest Watch Folder
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleScanWatchFolder}
+                    disabled={isScanningWatch}
+                    className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50"
+                  >
+                    {isScanningWatch ? 'Scanning...' : 'Scan Watch Folder'}
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Any <code className="font-mono text-indigo-600">.dat</code>, <code className="font-mono text-indigo-600">.txt</code>, <code className="font-mono text-indigo-600">.csv</code>, or <code className="font-mono text-indigo-600">.json</code> punch file saved in:
+                </p>
+                <code className="block px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-[11px] font-mono text-slate-700 dark:text-slate-300 truncate">
+                  {pollSummary?.watchFolderPath || 'local_hris_data/Imports'}
+                </code>
+                <p className="text-[11px] text-slate-400">
+                  is automatically fetched into SQLite on every scheduled poll cycle without duplicates.
+                </p>
               </div>
-              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-1">
-                <span className="font-bold text-slate-900 dark:text-slate-100">Step 2: Upload or Run Agent</span>
-                <p className="text-slate-500 dark:text-slate-400">Select file above for instant upload, or run <code className="font-mono text-emerald-600">start-zktime-sync.bat</code> for 24/7 background sync.</p>
-              </div>
-              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl space-y-1">
-                <span className="font-bold text-slate-900 dark:text-slate-100">Step 3: Auto AC-No Matching</span>
-                <p className="text-slate-500 dark:text-slate-400">Biometric User IDs / AC-No match Employee IDs automatically and log punches into HRIS Attendance records.</p>
+
+              <div className="p-4 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                    Quick Raw Log Paste (ATTLOG / Key=Value / CSV)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleUploadRawText}
+                    disabled={isUploadingRaw}
+                    className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[11px] font-semibold transition-colors disabled:opacity-50"
+                  >
+                    {isUploadingRaw ? 'Parsing...' : 'Parse & Save to SQLite'}
+                  </button>
+                </div>
+                <textarea
+                  rows={3}
+                  value={rawPasteText}
+                  onChange={(e) => setRawPasteText(e.target.value)}
+                  placeholder={'101\t2026-08-10 08:55:12\nPIN=102\tDateTime=2026-08-10 09:02:10'}
+                  className="w-full px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-[11px] font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
               </div>
             </div>
           </div>
@@ -2145,15 +2420,49 @@ DEVICES.forEach(pollDevice);`}</pre>
                 </div>
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Compatible Protocol
+                  </label>
+                  <select
+                    value={formData.protocolMode}
+                    onChange={(e) => setFormData({ ...formData, protocolMode: e.target.value as ZkProtocolMode })}
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
+                  >
+                    <option value="Auto">Auto (TCP → UDP → Web-HTTP)</option>
+                    <option value="TCP">TCP 4370 (SDK Binary)</option>
+                    <option value="UDP">UDP 4370 (Legacy ZKT)</option>
+                    <option value="ADMS">ADMS Cloud Push (/iclock)</option>
+                    <option value="Web-HTTP">Web HTTP / SOAP (Port 80)</option>
+                    <option value="USB-Disk">USB / Watch Folder</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Comm Key (Default 0)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={formData.commKey}
+                    onChange={(e) => setFormData({ ...formData, commKey: parseInt(e.target.value, 10) || 0 })}
+                    className="w-full px-3 py-2 font-mono bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
                   Auto-Sync Interval
                 </label>
                 <select
                   value={formData.autoSyncMinutes}
-                  onChange={(e) => setFormData({ ...formData, autoSyncMinutes: parseInt(e.target.value) })}
+                  onChange={(e) => setFormData({ ...formData, autoSyncMinutes: parseInt(e.target.value, 10) })}
                   className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
                 >
+                  <option value={1}>Every 1 Minute (Live Poll)</option>
                   <option value={5}>Every 5 Minutes</option>
                   <option value={15}>Every 15 Minutes</option>
                   <option value={30}>Every 30 Minutes</option>
@@ -2347,14 +2656,33 @@ DEVICES.forEach(pollDevice);`}</pre>
 
             <div className="space-y-4 text-xs">
               {/* Diagnostic Status Box */}
-              <div className="p-4 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 rounded-xl space-y-2">
-                <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-bold">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  <span>Connection Diagnostic: Cloud HRIS Listener Active</span>
+              <div className="p-4 bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 rounded-xl space-y-2">
+                <div className="flex items-center justify-between font-bold text-slate-900 dark:text-slate-100">
+                  <span className="flex items-center gap-2">
+                    <CheckCircle2 className={`w-4 h-4 ${lastDiagnosticResult?.reachable ? 'text-emerald-600' : 'text-amber-500'}`} />
+                    <span>Multi-Protocol Diagnostic ({diagnosticDevice.protocolMode || 'Auto'})</span>
+                  </span>
+                  {lastDiagnosticResult?.protocol && (
+                    <span className="font-mono text-[11px] text-indigo-600 dark:text-indigo-400">
+                      {lastDiagnosticResult.protocol}
+                    </span>
+                  )}
                 </div>
                 <p className="text-slate-600 dark:text-slate-300">
-                  Target device <span className="font-bold">{diagnosticDevice.model}</span> at <code className="font-mono">{diagnosticDevice.ip}</code> is configured.
+                  {lastDiagnosticResult?.message || `Target device ${diagnosticDevice.model} at ${diagnosticDevice.ip}:${diagnosticDevice.port}.`}
                 </p>
+                {Array.isArray(lastDiagnosticResult?.attempts) && lastDiagnosticResult.attempts.length > 0 && (
+                  <div className="grid grid-cols-1 gap-1 pt-1">
+                    {lastDiagnosticResult.attempts.map((att: any, idx: number) => (
+                      <div key={idx} className="flex items-center justify-between text-[11px] font-mono px-2 py-1 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700">
+                        <span>{att.protocol}</span>
+                        <span className={att.reachable ? 'text-emerald-600 font-semibold' : 'text-rose-600'}>
+                          {att.reachable ? `OK (${att.latencyMs}ms)` : `FAIL (${att.latencyMs}ms)`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Direct Test Punch Trigger */}

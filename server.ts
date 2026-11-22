@@ -132,7 +132,11 @@ async function startServer() {
       const identifier = String(email || username || '').trim();
       const result = await authenticateLocalUser(identifier, String(password || ''));
       if ('error' in result) {
-        return res.status(result.statusCode).json({ success: false, error: result.error });
+        return res.status(result.statusCode).json({
+          success: false,
+          error: result.error,
+          noLocalPassword: Boolean(result.noLocalPassword)
+        });
       }
       return res.json({ success: true, user: result.user });
     } catch (e: any) {

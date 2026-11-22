@@ -223,7 +223,13 @@ export default function Overtime() {
         const workingHours = Number(att.workingHours) || 0;
         const bioOtHours = Math.max(0, workingHours - standardDutyHours);
         
-        if (bioOtHours <= 0 && att.status !== 'Present') continue;
+        const isHolidayRecord =
+          att.status === 'PPH' ||
+          att.status === 'Public Holiday' ||
+          att.status === 'Holiday' ||
+          Boolean(settings.holidays?.some(h => h.date === att.date));
+
+        if (bioOtHours <= 0 && att.status !== 'Present' && att.status !== 'PPH' && att.status !== 'PWO') continue;
 
         const punchInfo = getAttendanceInAndOut(att);
         const inTime = punchInfo.inTime !== '--:--' ? punchInfo.inTime : undefined;
@@ -271,7 +277,7 @@ export default function Overtime() {
             standardDutyHours: Number(standardDutyHours.toFixed(2)),
             hours: Number(finalOtEligible.toFixed(2)),
             hrSaving: Number(hrSaving.toFixed(2)),
-            type: att.status === 'Weekly Off' ? 'Weekly Off' : 'Regular',
+            type: isHolidayRecord ? 'Holiday' : (att.status === 'Weekly Off' || att.status === 'PWO' ? 'Weekly Off' : 'Regular'),
             status: 'Pending',
             remarks: '',
             shiftId: att.shiftId || null

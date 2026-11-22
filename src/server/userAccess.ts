@@ -117,7 +117,11 @@ export async function resolveSessionProfile(identifier: string): Promise<SystemU
 
   const users = await listSystemUsers();
   const matched = users.find(
-    u => u.email.toLowerCase() === target || u.username.toLowerCase() === target || u.id.toLowerCase() === target
+    u =>
+      u.email.toLowerCase() === target ||
+      u.username.toLowerCase() === target ||
+      u.id.toLowerCase() === target ||
+      (u.linkedEmployeeId && u.linkedEmployeeId.toLowerCase() === target)
   );
   if (matched) {
     if (isBootstrapSuperAdminEmail(matched.email)) {
@@ -150,7 +154,7 @@ export async function resolveSessionProfile(identifier: string): Promise<SystemU
 export async function authenticateLocalUser(
   identifier: string,
   password: string
-): Promise<{ success: true; user: SystemUser } | { success: false; error: string; statusCode: number }> {
+): Promise<{ success: true; user: SystemUser } | { success: false; error: string; statusCode: number; noLocalPassword?: boolean }> {
   const cleanId = String(identifier || '').trim().toLowerCase();
   const cleanPass = String(password || '');
   if (!cleanId || !cleanPass) {
@@ -161,7 +165,8 @@ export async function authenticateLocalUser(
   const matchingRows = rows.filter(
     r =>
       String(r.email || '').trim().toLowerCase() === cleanId ||
-      String(r.username || '').trim().toLowerCase() === cleanId
+      String(r.username || '').trim().toLowerCase() === cleanId ||
+      (r.linkedEmployeeId && String(r.linkedEmployeeId).trim().toLowerCase() === cleanId)
   );
 
   // Pick row with passwordHash if multiple legacy rows share email
@@ -180,7 +185,8 @@ export async function authenticateLocalUser(
     return {
       success: false,
       error: 'No local password set for this account. Sign in with Google/Instant Admin Access or ask Super Admin to set a password.',
-      statusCode: 401
+      statusCode: 401,
+      noLocalPassword: true
     };
   }
 

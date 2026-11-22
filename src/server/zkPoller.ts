@@ -794,8 +794,8 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       lastSync: params.status === 'Failed' ? undefined : now,
       lastError: params.errorMessage || '',
       ...(params.freeSizes ? {
-        deviceCapacityUsers: params.freeSizes.userCount,
-        deviceCapacityLogs: params.freeSizes.logCount
+        ...(params.freeSizes.userCount > 0 ? { deviceCapacityUsers: params.freeSizes.userCount } : {}),
+        ...(params.freeSizes.logCount > 0 ? { deviceCapacityLogs: params.freeSizes.logCount } : {})
       } : {})
     });
     // Strip undefined override keys cleanly so old timestamps aren't wiped

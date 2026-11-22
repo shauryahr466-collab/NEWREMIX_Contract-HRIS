@@ -168,6 +168,36 @@ localRouter.get('/data/:table', async (req, res) => {
               };
             }
 
+            if (sqlTable === 'audit_logs') {
+              let nestedPayload: Record<string, any> = {};
+              if (parsedData && typeof parsedData.data === 'string' && parsedData.data.trim().startsWith('{')) {
+                try { nestedPayload = JSON.parse(parsedData.data); } catch {}
+              } else if (parsedData && typeof parsedData.data === 'object' && parsedData.data !== null) {
+                nestedPayload = parsedData.data;
+              }
+              const merged = { ...nestedPayload, ...(parsedData || {}), ...colObj };
+              const rawTs =
+                merged.timestamp ||
+                merged.changedAt ||
+                merged.created_at ||
+                nestedPayload.timestamp ||
+                (merged.date ? `${String(merged.date).slice(0, 10)}T00:00:00.000Z` : new Date().toISOString());
+              return {
+                id: String(merged.id || colObj.id || ''),
+                employeeId: String(merged.employeeId || colObj.employee_id || nestedPayload.recordId || 'SYSTEM'),
+                employeeName: String(merged.employeeName || nestedPayload.recordName || merged.employeeId || colObj.employee_id || 'System Operation'),
+                date: String(merged.date || colObj.date || String(rawTs).slice(0, 10)),
+                field: String(merged.field || (nestedPayload.module ? `${nestedPayload.module}${nestedPayload.action ? ` (${nestedPayload.action})` : ''}` : merged.action || 'System Event')),
+                oldValue: merged.oldValue !== undefined && merged.oldValue !== null ? String(merged.oldValue) : '',
+                newValue: merged.newValue !== undefined && merged.newValue !== null ? String(merged.newValue) : (nestedPayload.status ? `${nestedPayload.status}${nestedPayload.affectedCount !== undefined ? ` (${nestedPayload.affectedCount} records)` : ''}` : ''),
+                changedBy: String(merged.changedBy || merged.user || nestedPayload.user || 'System Admin'),
+                timestamp: String(rawTs),
+                changedAt: String(merged.changedAt || rawTs),
+                remarks: String(merged.remarks || merged.reason || (nestedPayload.operationId ? `Operation ${nestedPayload.operationId}` : '')),
+                action: merged.action ? String(merged.action) : undefined
+              };
+            }
+
             return parsedData || colObj;
           })
         : [];
@@ -1140,29 +1170,37 @@ localRouter.post('/movement/separation', async (req, res) => {
 
       // 6. Record in Audit Log
       const auditId = `audit_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-      const auditStmt = db.prepare(`
-        INSERT INTO audit_logs (id, employee_id, employee_name, date, field, old_value, new_value, changed_by, reason, source, data, changed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      auditStmt.run([
-        auditId,
-        empId,
-        empData.name,
-        effectiveDate,
-        'status',
-        previousStatus,
-        'Inactive',
-        approvedBy || 'HR Administrator',
-        `Separation recorded (${separationType}): ${cleanReason}`,
-        'Separation Workflow',
-        JSON.stringify({
+      const auditPayload = {
+        id: auditId,
+        employeeId: empId,
+        employeeName: empData.name,
+        date: effectiveDate,
+        field: 'status',
+        oldValue: previousStatus,
+        newValue: 'Inactive',
+        changedBy: approvedBy || 'HR Administrator',
+        timestamp: now,
+        changedAt: now,
+        remarks: `Separation recorded (${separationType}): ${cleanReason}`,
+        source: 'Separation Workflow',
+        details: {
           separationType,
           exitType,
           reason: cleanReason,
           noticePeriod,
           lastWorkingDate: lastWorkingDate || effectiveDate,
           remarks
-        }),
+        }
+      };
+      const auditStmt = db.prepare(`
+        INSERT INTO audit_logs (id, employee_id, date, data, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      auditStmt.run([
+        auditId,
+        empId,
+        effectiveDate,
+        JSON.stringify(auditPayload),
         now
       ]);
       auditStmt.free();
@@ -1361,22 +1399,30 @@ localRouter.post('/movement/record', async (req, res) => {
 
       // 4. Audit Log
       const auditId = `audit_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      const auditPayload = {
+        id: auditId,
+        employeeId: empId,
+        employeeName: empData.name,
+        date: effectiveDate,
+        field: movementType,
+        oldValue: previousDesignation || previousDepartment || '',
+        newValue: newDesignation || newDepartment || '',
+        changedBy: changedBy || 'HR Administrator',
+        timestamp: now,
+        changedAt: now,
+        remarks: reason || `Movement recorded: ${movementType}`,
+        source: 'Movement Workflow',
+        details: movementRecord
+      };
       const auditStmt = db.prepare(`
-        INSERT INTO audit_logs (id, employee_id, employee_name, date, field, old_value, new_value, changed_by, reason, source, data, changed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO audit_logs (id, employee_id, date, data, created_at)
+        VALUES (?, ?, ?, ?, ?)
       `);
       auditStmt.run([
         auditId,
         empId,
-        empData.name,
         effectiveDate,
-        movementType,
-        previousDesignation || previousDepartment || '',
-        newDesignation || newDepartment || '',
-        changedBy || 'HR Administrator',
-        reason || `Movement recorded: ${movementType}`,
-        'Movement Workflow',
-        JSON.stringify(movementRecord),
+        JSON.stringify(auditPayload),
         now
       ]);
       auditStmt.free();

@@ -255,13 +255,14 @@ const PRESENT_STATUSES = new Set([
   'Early',
   'Overtime',
   'PWO',
+  'PPH',
   'Forced',
   'Regularized',
   'On Duty',
   'Half Day'
 ]);
 
-const OFF_LEAVE_STATUSES = new Set(['Weekly Off', 'Holiday', 'Leave', 'Paid Leave', 'On Leave']);
+const OFF_LEAVE_STATUSES = new Set(['Weekly Off', 'Public Holiday', 'Holiday', 'Leave', 'Paid Leave', 'On Leave']);
 
 export function buildIsoDailyRows(
   filteredAttendance: ProcessedAttendance[],

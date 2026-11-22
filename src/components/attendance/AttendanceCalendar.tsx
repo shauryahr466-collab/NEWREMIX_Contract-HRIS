@@ -223,6 +223,38 @@ export function AttendanceCalendar() {
       };
     }
 
+    if (record.status === 'PPH') {
+      return {
+        statusText: record.remarks || 'Present on Holiday',
+        code: 'PPH',
+        bg: 'bg-sky-50 dark:bg-sky-950/30 border-sky-200 dark:border-sky-900/50',
+        statusBadge: 'bg-sky-600 text-white',
+        timeBadge: inTimeStr ? `In-${inTimeStr},Out-${outTimeStr || ''}` : 'Holiday Worked',
+        timeBadgeStyle: 'bg-sky-800 text-white',
+        lateBadge: null,
+        shiftBadge: shiftCode,
+        assignedShift,
+        isOverrideShift,
+        record
+      };
+    }
+
+    if (record.status === 'Public Holiday' || record.status === 'Holiday') {
+      return {
+        statusText: record.remarks || 'Public Holiday',
+        code: 'PH',
+        bg: 'bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-900/50',
+        statusBadge: 'bg-blue-600 text-white',
+        timeBadge: record.remarks || 'Holiday',
+        timeBadgeStyle: 'bg-blue-800 text-white',
+        lateBadge: null,
+        shiftBadge: shiftCode,
+        assignedShift,
+        isOverrideShift,
+        record
+      };
+    }
+
     if (record.status === 'PWO') {
       return {
         statusText: 'Present on Off',

@@ -468,10 +468,14 @@ function AttendanceReconciliation() {
             data.cell.styles.textColor = [21, 128, 61];
           }
           if (status === 'Weekly Off') {
-            data.cell.styles.textColor = [67, 56,  202];
+            data.cell.styles.textColor = [67, 56, 202];
           }
-          if (status === 'PWO') {
-            data.cell.styles.textColor = [79, 70, 229];
+          if (status === 'Public Holiday' || status === 'Holiday') {
+            data.cell.styles.textColor = [2, 132, 199];
+            data.cell.styles.fontStyle = 'bold';
+          }
+          if (status === 'PWO' || status === 'PPH') {
+            data.cell.styles.textColor = [15, 118, 110];
             data.cell.styles.fontStyle = 'bold';
           }
         }
@@ -676,7 +680,7 @@ function AttendanceReconciliation() {
 
   const summaryStats = useMemo(() => {
     const uniqueEmployees = new Set(filteredData.map(d => d.employeeId)).size;
-    const totalPresent = filteredData.filter(d => ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status)).length;
+    const totalPresent = filteredData.filter(d => ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO', 'PPH'].includes(d.status)).length;
     const totalAbsent = filteredData.filter(d => d.status === 'Absent').length;
     const totalLate = filteredData.filter(d => d.lateMinutes > 0).length;
     const totalOT = filteredData.reduce((acc, d) => acc + (d.overtime || 0), 0);
@@ -845,7 +849,7 @@ function AttendanceReconciliation() {
             />
             <MultiSelect 
               label="Status"
-              options={['All', 'Present', 'Absent', 'Late', 'PWO', 'Early', 'Weekly Off', 'SPF']}
+              options={['All', 'Present', 'Absent', 'Late', 'PWO', 'PPH', 'Public Holiday', 'Early', 'Weekly Off', 'SPF']}
               selected={statusFilter}
               onChange={setStatusFilter}
               placeholder="All Status"
@@ -1085,14 +1089,22 @@ function AttendanceReconciliation() {
                       ) : '-'}
                     </td>
                     <td className="px-6 py-2.5">
-                      <StatusBadge 
-                        status={d.status} 
-                        type={
-                          ['Present', 'On Time', 'Early', 'PWO'].includes(d.status) ? 'success' :
-                          ['Late'].includes(d.status) ? 'warning' :
-                          ['Absent', 'SPF'].includes(d.status) ? 'danger' : 'muted'
-                        } 
-                      />
+                      <div className="flex flex-col gap-0.5">
+                        <StatusBadge 
+                          status={d.status} 
+                          type={
+                            ['Present', 'On Time', 'Early', 'PWO', 'PPH'].includes(d.status) ? 'success' :
+                            ['Public Holiday', 'Holiday'].includes(d.status) ? 'info' :
+                            ['Late'].includes(d.status) ? 'warning' :
+                            ['Absent', 'SPF'].includes(d.status) ? 'danger' : 'muted'
+                          } 
+                        />
+                        {d.remarks && ['Public Holiday', 'Holiday', 'PPH'].includes(d.status) && (
+                          <span className="text-[10px] text-sky-600 dark:text-sky-400 font-medium truncate max-w-[140px]" title={d.remarks}>
+                            {d.remarks}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-6 py-2.5 text-center">
                       <Button variant="ghost" size="sm" onClick={() => setAssignmentModal({ isOpen: true, employeeId: d.employeeId, date: d.date })} className="h-8 w-8 p-0 opacity-0 group-hover:opacity-100 transition-opacity">

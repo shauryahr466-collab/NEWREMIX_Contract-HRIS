@@ -158,17 +158,22 @@ export function MonthlyMuster() {
       return { code: 'A', bg: 'bg-rose-100 dark:bg-rose-950 text-rose-700 dark:text-rose-300', record: null };
     }
 
-    // 1. Present in Public Holiday
-    if (isHoliday && (record.status === 'Present' || record.status === 'On Time' || record.status === 'Early' || record.firstPunch)) {
+    // 1. Present in Public Holiday (PPH)
+    if (record.status === 'PPH' || (isHoliday && (record.status === 'Present' || record.status === 'On Time' || record.status === 'Early' || record.firstPunch))) {
       return { code: 'PPH', bg: 'bg-sky-100 dark:bg-sky-950 text-sky-900 dark:text-sky-200 font-extrabold', record };
     }
 
-    // 2. Present in Weekly Off (PWO)
+    // 2. Public Holiday without worked punches (PH)
+    if (record.status === 'Public Holiday' || record.status === 'Holiday' || isHoliday) {
+      return { code: 'PH', bg: 'bg-blue-100 dark:bg-blue-950 text-blue-800 dark:text-blue-200 font-semibold', record };
+    }
+
+    // 3. Present in Weekly Off (PWO)
     if (record.status === 'PWO' || (isWeeklyOff && (record.firstPunch || record.workingHours > 0 || record.status === 'Present' || record.status === 'Late' || record.status === 'On Time' || record.status === 'Early'))) {
       return { code: 'PWO', bg: 'bg-indigo-100 dark:bg-indigo-950 text-indigo-900 dark:text-indigo-200 font-bold', record };
     }
 
-    // 3. Weekly Off without attendance
+    // 4. Weekly Off without attendance
     if (record.status === 'Weekly Off' || (isWeeklyOff && !record.firstPunch && record.status !== 'Present')) {
       return { code: 'WO', bg: 'bg-amber-100/80 dark:bg-amber-950/60 text-amber-900 dark:text-amber-300 font-semibold', record };
     }

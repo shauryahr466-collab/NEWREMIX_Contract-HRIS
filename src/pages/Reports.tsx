@@ -53,13 +53,13 @@ const REPORT_MODULE_OPTIONS: Array<{ id: IsoReportModule; label: string; code: s
 function StatusText({ status }: { status: string }) {
   const s = (status || '').trim();
   let cls = 'text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700';
-  if (['Present', 'On Time', 'Approved', 'PWO', 'Regularized', 'Forced'].includes(s)) {
+  if (['Present', 'On Time', 'Approved', 'PWO', 'PPH', 'Regularized', 'Forced'].includes(s)) {
     cls = 'text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-900/60';
   } else if (['Absent', 'Rejected', 'HIGH'].includes(s)) {
     cls = 'text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-900/60';
   } else if (['SPF', 'SPF-01', 'Late', 'Pending', 'Early'].includes(s)) {
     cls = 'text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-900/60';
-  } else if (['Weekly Off', 'Holiday', 'Leave', 'Paid Leave', 'On Leave'].includes(s)) {
+  } else if (['Weekly Off', 'Public Holiday', 'Holiday', 'Leave', 'Paid Leave', 'On Leave'].includes(s)) {
     cls = 'text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-900/60';
   }
   return (

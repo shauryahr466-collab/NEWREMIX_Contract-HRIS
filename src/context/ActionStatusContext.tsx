@@ -267,23 +267,30 @@ export function ActionStatusProvider({ children }: { children: React.ReactNode }
 
         // Automatically log audit entry in local SQLite
         try {
+          let actorName = 'System Admin';
+          try {
+            const profRaw = sessionStorage.getItem('local_user_profile');
+            const sessRaw = sessionStorage.getItem('local_session_user');
+            const parsedProf = profRaw ? JSON.parse(profRaw) : (sessRaw ? JSON.parse(sessRaw) : null);
+            actorName = parsedProf?.username || parsedProf?.displayName || parsedProf?.email || actorName;
+          } catch {}
+          const nowIso = new Date().toISOString();
+          const changedSummary = Array.isArray(conf.changedFields) && conf.changedFields.length > 0
+            ? conf.changedFields.map((c: any) => c?.label || c?.field).filter(Boolean).join(', ')
+            : '';
           const auditEntry = {
             id: `audit_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
             employeeId: conf.recordId || 'SYSTEM',
-            date: new Date().toISOString().split('T')[0],
-            data: JSON.stringify({
-              operationId: currentOpId,
-              user: 'Sandip Rajak (HR Admin)',
-              module: conf.module,
-              action: conf.actionType.toUpperCase(),
-              recordId: conf.recordId,
-              recordName: conf.recordName,
-              changedFields: conf.changedFields || [],
-              status: 'SUCCESS',
-              affectedCount: statusRes.affectedCount,
-              dbPath: statusRes.dbPath,
-              timestamp: new Date().toISOString()
-            })
+            employeeName: conf.recordName || conf.module || 'System Operation',
+            date: nowIso.split('T')[0],
+            field: `${conf.module} (${conf.actionType.toUpperCase()})`,
+            oldValue: changedSummary || 'Previous State',
+            newValue: `${statusRes.affectedCount} record${statusRes.affectedCount === 1 ? '' : 's'} ${statusRes.verificationStatus || 'COMMITTED'}`,
+            changedBy: actorName,
+            timestamp: nowIso,
+            changedAt: nowIso,
+            action: conf.actionType.toUpperCase(),
+            remarks: `${conf.title.replace(/\?$/, '')} · Op ${currentOpId}${changedSummary ? ` · Fields: ${changedSummary}` : ''}`
           };
           saveLocalTableDetailed('audit_logs', [auditEntry]).catch(() => {});
         } catch (aErr) {

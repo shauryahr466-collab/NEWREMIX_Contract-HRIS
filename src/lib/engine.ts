@@ -128,6 +128,11 @@ export function processPunches(
   const assignmentMap = new Map(shiftAssignments.map(a => [`${normalizeEmployeeId(a.employeeId)}_${a.date}`, a]));
   const shiftMap = new Map(settings.shifts?.map(s => [s.id, s]) || []);
   const shiftNameMap = new Map(settings.shifts?.map(s => [s.name?.toLowerCase() || '', s]) || []);
+  const holidayMap = new Map<string, string>(
+    (settings.holidays || [])
+      .filter(h => h && h.date)
+      .map(h => [String(h.date).trim().slice(0, 10), String(h.name || 'Public Holiday').trim() || 'Public Holiday'])
+  );
 
   // Helper to ensure every punch timestamp is in exact local device wall-clock time (DIA accuracy).
   // Note: Legacy Excel imports created via new Date("YYYY-MM-DD HH:mm").toISOString() in Nepal (+05:45)
@@ -253,6 +258,8 @@ export function processPunches(
     allDatesList.forEach(dateStr => {
       const dateInfo = dateInfoMap.get(dateStr)!;
       const isWeeklyOff = empWO.includes(dateInfo.dayName);
+      const holidayName = holidayMap.get(dateStr);
+      const isPublicHoliday = Boolean(holidayName);
 
       const assignment = assignmentMap.get(`${normId}_${dateStr}`);
       
@@ -389,14 +396,22 @@ export function processPunches(
         const isSameOrSinglePunch = dayPunches.length === 1 || !firstPunchStr || !lastPunchStr || firstPunchObj._time === lastPunchObj._time;
 
         if (isSameOrSinglePunch) {
-          status = isWeeklyOff ? 'Weekly Off' : 'SPF';
-        } else if (isWeeklyOff && workHours < 4) {
+          status = isPublicHoliday ? 'Public Holiday' : (isWeeklyOff ? 'Weekly Off' : 'SPF');
+        } else if (isPublicHoliday && workHours < 4) {
+          // Short duration on Public Holiday (< 4 hours) remains Public Holiday, not PPH
+          status = 'Public Holiday';
+        } else if (isWeeklyOff && !isPublicHoliday && workHours < 4) {
           // Short duration on Weekly Off (< 4 hours) is counted as Weekly Off (WO), not PWO
           status = 'Weekly Off';
-        } else if (workHours < 1 && !isWeeklyOff) {
+        } else if (workHours < 1 && !isWeeklyOff && !isPublicHoliday) {
           status = 'SPF';
         } else {
-          if (isWeeklyOff) {
+          if (isPublicHoliday) {
+            status = 'PPH';
+            if (isOtEligible && workHours > threshold) {
+              overtime = workHours - threshold;
+            }
+          } else if (isWeeklyOff) {
             status = 'PWO';
             if (isOtEligible && workHours > threshold) {
               overtime = workHours - threshold;
@@ -427,11 +442,12 @@ export function processPunches(
           shiftSource,
           expectedHours: Number(shiftDuration.toFixed(2)),
           status,
+          remarks: isPublicHoliday ? holidayName : undefined,
           logs: validLogs,
           rawLogs: dayPunches.map(p => p.punchDatetime)
         });
       } else {
-        // Absent or Weekly Off
+        // Absent, Public Holiday, or Weekly Off
         processed.push({
           id: `${emp.id}_${dateStr}`,
           employeeId: emp.id,
@@ -447,7 +463,8 @@ export function processPunches(
           shiftName: shift?.name || 'Day Shift',
           shiftSource,
           expectedHours: Number(shiftDuration.toFixed(2)),
-          status: isWeeklyOff ? 'Weekly Off' : 'Absent',
+          status: isPublicHoliday ? 'Public Holiday' : (isWeeklyOff ? 'Weekly Off' : 'Absent'),
+          remarks: isPublicHoliday ? holidayName : undefined,
           logs: [],
           rawLogs: []
         });
@@ -456,7 +473,7 @@ export function processPunches(
   });
 
   // Post-processing: Apply Sandwich Rule & Minimum 5 Working Days Requirement for Weekly Offs
-  const validWorkedStatuses = new Set(['Present', 'Late', 'Early', 'On Time', 'PWO', 'Overtime']);
+  const validWorkedStatuses = new Set(['Present', 'Late', 'Early', 'On Time', 'PWO', 'PPH', 'Overtime', 'Public Holiday', 'Holiday']);
   const empRecordsGrouped = new Map<string, ProcessedAttendance[]>();
   processed.forEach(p => {
     const list = empRecordsGrouped.get(p.employeeId) || [];
@@ -490,7 +507,7 @@ export function processPunches(
         for (let i = idx - 1; i >= 0; i--) {
           const prev = empRecords[i];
           const prevDayName = format(parseISO(prev.date), 'EEEE');
-          const isPrevScheduledWO = empWO.includes(prevDayName.toLowerCase());
+          const isPrevScheduledWO = empWO.includes(prevDayName.toLowerCase()) || holidayMap.has(prev.date);
           if (!isPrevScheduledWO) {
             prevWorkingDayRec = prev;
             break;
@@ -501,7 +518,7 @@ export function processPunches(
         for (let i = idx + 1; i < empRecords.length; i++) {
           const next = empRecords[i];
           const nextDayName = format(parseISO(next.date), 'EEEE');
-          const isNextScheduledWO = empWO.includes(nextDayName.toLowerCase());
+          const isNextScheduledWO = empWO.includes(nextDayName.toLowerCase()) || holidayMap.has(next.date);
           if (!isNextScheduledWO) {
             nextWorkingDayRec = next;
             break;

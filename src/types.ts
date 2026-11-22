@@ -355,6 +355,7 @@ export interface ZkDevice {
   model: string;
   serialNumber?: string;
   deviceNumber?: number;
+  commType?: 'Ethernet' | 'USB' | 'Serial' | 'WiFi';
   enabled: boolean;
   status: 'online' | 'offline';
   protocolMode?: ZkProtocolMode;
@@ -368,6 +369,11 @@ export interface ZkDevice {
   lastError?: string;
   deviceCapacityUsers?: number;
   deviceCapacityLogs?: number;
+  adminCount?: number;
+  fpCount?: number;
+  faceCount?: number;
+  passwordCount?: number;
+  opLogCount?: number;
   activeDirectoryUsers?: number;
   totalSystemLogs?: number;
   createdAt?: string;
@@ -424,7 +430,7 @@ export interface ProcessedAttendance {
   overtime: number; // in hours
   shiftId?: string; // Assigned or default shift ID
   expectedHours?: number; // Duration of the shift in hours
-  status: 'Present' | 'Absent' | 'Late' | 'SPF' | 'Weekly Off' | 'Early' | 'On Time' | 'Overtime' | 'PWO' | 'Half Day' | 'Paid Leave' | 'Leave' | 'On Leave' | 'Forced' | 'On Duty' | 'Regularized';
+  status: 'Present' | 'Absent' | 'Late' | 'SPF' | 'Weekly Off' | 'Public Holiday' | 'Holiday' | 'PPH' | 'Early' | 'On Time' | 'Overtime' | 'PWO' | 'Half Day' | 'Paid Leave' | 'Leave' | 'On Leave' | 'Forced' | 'On Duty' | 'Regularized';
   employeeName?: string;
   department?: string;
   inTime?: string;

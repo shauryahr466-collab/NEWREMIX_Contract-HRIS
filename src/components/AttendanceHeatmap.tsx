@@ -81,12 +81,14 @@ const DayCell = React.memo(({ day, record, employeeId, onDayClick, shiftAssignme
           <>
             <div className={`px-1 py-0.5 text-[9px] font-bold text-white truncate leading-tight uppercase
               ${status === 'Present' ? 'bg-[#4caf50]' : 
+                status === 'PPH' ? 'bg-[#0284c7]' :
+                status === 'Public Holiday' || status === 'Holiday' ? 'bg-[#2563eb]' :
                 status === 'Absent' ? 'bg-[#f44336]' :
                 status === 'Weekly Off' ? 'bg-[#b0bec5]' :
                 status === 'SPF' ? 'bg-[#00bcd4]' :
-                'bg-slate-300'}
+                'bg-[#4caf50]'}
             `}>
-              {status === 'Weekly Off' ? 'WeeklyOff' : status}
+              {status === 'Weekly Off' ? 'WeeklyOff' : (holiday && (status === 'Public Holiday' || status === 'Holiday') ? holiday.name : status)}
             </div>
 
             {record.overtime > 0 && (

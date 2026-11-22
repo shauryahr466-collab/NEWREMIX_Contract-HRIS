@@ -928,14 +928,16 @@ export function generatePayrollRun(
       a.status === 'SPF' ||
       a.status === 'Forced' ||
       a.status === 'On Duty' ||
-      a.status === 'Regularized'
+      a.status === 'Regularized' ||
+      a.status === 'PPH'
     ).length;
     const halfDays = empLogs.filter(a => a.status === 'Half Day').length;
     const paidLeaveDays = empLogs.filter(a => a.status === 'Paid Leave' || a.status === 'Leave' || a.status === 'On Leave').length;
+    const publicHolidays = empLogs.filter(a => a.status === 'Public Holiday' || a.status === 'Holiday').length;
     const weeklyOffs = empLogs.filter(a => a.status === 'Weekly Off' || a.status === 'PWO').length;
 
     const creditedPresentDays = presentDays + (0.5 * halfDays);
-    const totalCalculatedDays = creditedPresentDays + weeklyOffs + paidLeaveDays;
+    const totalCalculatedDays = creditedPresentDays + weeklyOffs + publicHolidays + paidLeaveDays;
 
     let payableDays = daysInMonth;
     if (monthAttendance.length > 0) {

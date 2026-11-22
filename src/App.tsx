@@ -63,58 +63,62 @@ function QuotaBanner() {
 }
 
 function AppContent() {
-  const { quotaExceeded, reportError, setUser, setIsAdmin, isOtpVerified, isSuperAdmin, canAccessModule } = useAppStore();
-  const [user, setUserLocal] = useState<any>(null);
+  const { quotaExceeded, user, setUser, setIsAdmin, isOtpVerified, setIsOtpVerified, isSuperAdmin, canAccessModule } = useAppStore();
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // 1. Initial local session user restoration
     const savedLocalUser = sessionStorage.getItem('local_session_user');
     if (savedLocalUser) {
       try {
         const parsed = JSON.parse(savedLocalUser);
-        setUserLocal(parsed);
-        setUser(parsed);
-        setIsAdmin(ADMIN_EMAILS.some(email => parsed.email?.toLowerCase() === email.toLowerCase()));
-        setLoading(false);
-      } catch (e) {
-        // ignore
+        if (parsed && parsed.email) {
+          setUser(parsed);
+          setIsAdmin(
+            parsed?.role === 'Super Admin' ||
+            ADMIN_EMAILS.some(email => parsed.email?.toLowerCase() === email.toLowerCase())
+          );
+          if (sessionStorage.getItem('is_otp_verified') === 'true') {
+            setIsOtpVerified(true);
+          }
+          setLoading(false);
+        }
+      } catch {
+        // ignore invalid saved session
       }
     }
 
     return onAuthStateChanged(auth, async (u) => {
-      if (u) {
-        setUserLocal(u);
-        setUser(u);
-        sessionStorage.removeItem('local_session_user');
-      } else {
-        const currentSaved = sessionStorage.getItem('local_session_user');
-        if (currentSaved) {
-          try {
-            const parsed = JSON.parse(currentSaved);
-            setUserLocal(parsed);
+      const currentSaved = sessionStorage.getItem('local_session_user');
+      if (currentSaved) {
+        try {
+          const parsed = JSON.parse(currentSaved);
+          if (parsed && parsed.email) {
             setUser(parsed);
-          } catch (e) {
-            setUserLocal(null);
-            setUser(null);
+            setIsAdmin(
+              parsed?.role === 'Super Admin' ||
+              ADMIN_EMAILS.some(email => parsed.email?.toLowerCase() === email.toLowerCase())
+            );
+            setLoading(false);
+            return;
           }
-        } else {
-          setUserLocal(null);
-          setUser(null);
+        } catch {
+          sessionStorage.removeItem('local_session_user');
         }
       }
-      setLoading(false);
 
       if (u) {
+        setUser(u);
         const isAdminUser = ADMIN_EMAILS.some(email => u.email?.toLowerCase() === email.toLowerCase());
         setIsAdmin(isAdminUser);
+        if (isAdminUser && sessionStorage.getItem('is_otp_verified') !== 'false') {
+          setIsOtpVerified(true);
+        }
 
-        // Only attempt to sync role if not already synced this session
         const sessionKey = `admin_synced_${u.uid}`;
         const alreadySynced = sessionStorage.getItem(sessionKey);
 
         if (!quotaExceeded && isAdminUser && !alreadySynced) {
-          const timeout = setTimeout(async () => {
+          setTimeout(async () => {
             try {
               await fetch('/api/admin/create-user', {
                 method: 'POST',
@@ -132,62 +136,58 @@ function AppContent() {
               sessionStorage.setItem(sessionKey, 'true');
             }
           }, 1000);
-          return () => clearTimeout(timeout);
         }
+      } else {
+        setUser(null);
       }
+      setLoading(false);
     });
-  }, [quotaExceeded, reportError, setUser, setIsAdmin]);
+  }, [quotaExceeded, setUser, setIsAdmin, setIsOtpVerified]);
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center">
         <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
       </div>
     );
   }
 
-  if (!user || !isOtpVerified) {
-    return (
-      <BrowserRouter>
-        <Toaster position="top-right" richColors />
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route path="/signup" element={<SignUp />} />
-          <Route path="*" element={<Navigate to="/login" replace />} />
-        </Routes>
-      </BrowserRouter>
-    );
-  }
-
+  const isAuthenticated = Boolean(user && isOtpVerified);
   const guard = (moduleKey: Parameters<typeof canAccessModule>[0], element: React.ReactElement) =>
     canAccessModule(moduleKey) ? element : <Navigate to="/" replace />;
 
   return (
     <BrowserRouter>
       <Toaster position="top-right" richColors />
-      <QuotaBanner />
-      <GlobalActionModal />
+      {isAuthenticated && <QuotaBanner />}
+      {isAuthenticated && <GlobalActionModal />}
       <Routes>
-        <Route path="/" element={<Layout />}>
-          <Route index element={canAccessModule('dashboard') ? <ErrorBoundary moduleName="Dashboard"><Dashboard /></ErrorBoundary> : <Navigate to="/attendance" replace />} />
-          <Route path="employees" element={guard('employees', <ErrorBoundary moduleName="Employee Directory"><Employees /></ErrorBoundary>)} />
-          <Route path="salary-analysis" element={guard('salaryAnalysis', <ErrorBoundary moduleName="Salary Analysis"><SalaryAnalysisPage /></ErrorBoundary>)} />
-          <Route path="movement-attrition" element={guard('movementAttrition', <ErrorBoundary moduleName="Movement & Attrition"><MovementAttritionPage /></ErrorBoundary>)} />
-          <Route path="devices" element={guard('devices', <ErrorBoundary moduleName="Device Setup"><DeviceSetup /></ErrorBoundary>)} />
-          <Route path="import" element={guard('import', <ErrorBoundary moduleName="Punch Import"><Import /></ErrorBoundary>)} />
-          <Route path="attendance" element={guard('attendance', <ErrorBoundary moduleName="Attendance Logs"><Attendance /></ErrorBoundary>)} />
-          <Route path="auditor" element={guard('auditor', <ErrorBoundary moduleName="Attendance Auditor"><AttendanceAuditor /></ErrorBoundary>)} />
-          <Route path="overtime" element={guard('overtime', <ErrorBoundary moduleName="Overtime"><Overtime /></ErrorBoundary>)} />
-          <Route path="audit-logs" element={guard('auditLogs', <ErrorBoundary moduleName="Audit Logs"><AuditLogs /></ErrorBoundary>)} />
-          <Route path="sbl" element={guard('sbl', <ErrorBoundary moduleName="SBL Management"><SBL /></ErrorBoundary>)} />
-          <Route path="force-attendance" element={guard('forceAttendance', <ErrorBoundary moduleName="Manual Corrections"><ForceAttendance /></ErrorBoundary>)} />
-          <Route path="payroll" element={guard('payroll', <ErrorBoundary moduleName="Payroll & Disburse"><Payroll /></ErrorBoundary>)} />
-          <Route path="reports" element={guard('reports', <ErrorBoundary moduleName="Analytic Reports"><Reports /></ErrorBoundary>)} />
-          <Route path="settings" element={guard('settings', <ErrorBoundary moduleName="Configuration"><SettingsPage /></ErrorBoundary>)} />
-          {isSuperAdmin && <Route path="user-access" element={<ErrorBoundary moduleName="User & Role Config"><UserAccess /></ErrorBoundary>} />}
-          {isSuperAdmin && <Route path="admin" element={<ErrorBoundary moduleName="System Admin"><AdminDashboard /></ErrorBoundary>} />}
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
+        <Route path="/login" element={isAuthenticated ? <Navigate to="/" replace /> : <Login />} />
+        <Route path="/signup" element={isAuthenticated ? <Navigate to="/" replace /> : <SignUp />} />
+        {!isAuthenticated ? (
+          <Route path="*" element={<Navigate to="/login" replace />} />
+        ) : (
+          <Route path="/" element={<Layout />}>
+            <Route index element={canAccessModule('dashboard') ? <ErrorBoundary moduleName="Dashboard"><Dashboard /></ErrorBoundary> : <Navigate to="/attendance" replace />} />
+            <Route path="employees" element={guard('employees', <ErrorBoundary moduleName="Employee Directory"><Employees /></ErrorBoundary>)} />
+            <Route path="salary-analysis" element={guard('salaryAnalysis', <ErrorBoundary moduleName="Salary Analysis"><SalaryAnalysisPage /></ErrorBoundary>)} />
+            <Route path="movement-attrition" element={guard('movementAttrition', <ErrorBoundary moduleName="Movement & Attrition"><MovementAttritionPage /></ErrorBoundary>)} />
+            <Route path="devices" element={guard('devices', <ErrorBoundary moduleName="Device Setup"><DeviceSetup /></ErrorBoundary>)} />
+            <Route path="import" element={guard('import', <ErrorBoundary moduleName="Punch Import"><Import /></ErrorBoundary>)} />
+            <Route path="attendance" element={guard('attendance', <ErrorBoundary moduleName="Attendance Logs"><Attendance /></ErrorBoundary>)} />
+            <Route path="auditor" element={guard('auditor', <ErrorBoundary moduleName="Attendance Auditor"><AttendanceAuditor /></ErrorBoundary>)} />
+            <Route path="overtime" element={guard('overtime', <ErrorBoundary moduleName="Overtime"><Overtime /></ErrorBoundary>)} />
+            <Route path="audit-logs" element={guard('auditLogs', <ErrorBoundary moduleName="Audit Logs"><AuditLogs /></ErrorBoundary>)} />
+            <Route path="sbl" element={guard('sbl', <ErrorBoundary moduleName="SBL Management"><SBL /></ErrorBoundary>)} />
+            <Route path="force-attendance" element={guard('forceAttendance', <ErrorBoundary moduleName="Manual Corrections"><ForceAttendance /></ErrorBoundary>)} />
+            <Route path="payroll" element={guard('payroll', <ErrorBoundary moduleName="Payroll & Disburse"><Payroll /></ErrorBoundary>)} />
+            <Route path="reports" element={guard('reports', <ErrorBoundary moduleName="Analytic Reports"><Reports /></ErrorBoundary>)} />
+            <Route path="settings" element={guard('settings', <ErrorBoundary moduleName="Configuration"><SettingsPage /></ErrorBoundary>)} />
+            {isSuperAdmin && <Route path="user-access" element={<ErrorBoundary moduleName="User & Role Config"><UserAccess /></ErrorBoundary>} />}
+            {isSuperAdmin && <Route path="admin" element={<ErrorBoundary moduleName="System Admin"><AdminDashboard /></ErrorBoundary>} />}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
+        )}
       </Routes>
     </BrowserRouter>
   );

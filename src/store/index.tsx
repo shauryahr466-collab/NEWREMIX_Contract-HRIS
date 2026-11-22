@@ -5,7 +5,7 @@ import { processPunches, detectExceptions } from '../lib/engine';
 import { generatePayrollRun, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
 import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../lib/firebase';
-import { logAdminOverride } from '../lib/audit';
+import { logAdminOverride, normalizeAuditLog } from '../lib/audit';
 import { normalizeEmployeeId } from '../lib/utils';
 import { isEmployeeInUserScope, normalizeSystemUser } from '../lib/accessControl';
 import { saveLocalTable, fetchLocalTable, deleteLocalTableRecords, deleteLocalTableDetailed, purgeLocalTable } from '../lib/localClient';
@@ -266,7 +266,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [shiftAssignments, setShiftAssignmentsState] = useState<ShiftAssignment[]>(() => loadCache('shift_assignments', []));
   const [assignmentLogs, setAssignmentLogsState] = useState<AssignmentLog[]>(() => loadCache('assignment_logs', []));
   const [exceptions, setExceptionsState] = useState<AttendanceException[]>(() => loadCache('exceptions', []));
-  const [auditLogs, setAuditLogsState] = useState<AuditLog[]>(() => loadCache('audit_logs', []));
+  const [auditLogs, setAuditLogsState] = useState<AuditLog[]>(() =>
+    loadCache<any[]>('audit_logs', []).map(normalizeAuditLog)
+  );
   const [overtimeRecords, setOvertimeRecordsState] = useState<OvertimeRecord[]>(() => loadCache('overtime', []));
   const [sblRecords, setSblRecordsState] = useState<SBLRecord[]>(() => loadCache('sbl', []));
   const [forceAttendanceRecords, setForceAttendanceRecordsState] = useState<ForceAttendanceRecord[]>(() => loadCache('force_attendance', []));
@@ -282,7 +284,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [auditDecisions, setAuditDecisionsState] = useState<Record<string, any>>(() => loadCache('audit_decisions', {}));
   const [auditDateRange, setAuditDateRangeState] = useState<{ startDate: string; endDate: string }>(() => loadCache('audit_date_range', { startDate: '', endDate: '' }));
   const [calculationSource, setCalculationSource] = useState<'all' | 'standard' | 'multi-time'>('all');
-  const [user, setUser] = useState<any>(null);
+  const [user, setUser] = useState<any>(() => {
+    try {
+      const raw = sessionStorage.getItem('local_session_user');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
   const [isAdmin, setIsAdmin] = useState(false);
   const [currentUserProfile, setCurrentUserProfileState] = useState<SystemUser | null>(() => {
     try {
@@ -498,6 +507,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         'Half Day': 'Half Day',
         'Paid Leave': 'Paid Leave',
         'Weekly Off': 'Weekly Off',
+        'Public Holiday': 'Public Holiday',
+        'Holiday': 'Public Holiday',
+        'PPH': 'PPH',
         'Absent': 'Absent'
       };
       const mappedStatus = f.status ? (statusMap[f.status] || 'Present') : 'Present';
@@ -664,12 +676,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                   model: 'MB2000/ID',
                   serialNumber: 'BRC7233360063',
                   deviceNumber: 1,
+                  commType: 'Ethernet',
                   enabled: true,
                   status: 'online',
                   lastConnection: new Date().toISOString(),
                   lastSync: new Date().toISOString(),
                   userCount: 0,
                   logCount: 0,
+                  deviceCapacityUsers: 369,
+                  adminCount: 2,
+                  fpCount: 697,
+                  faceCount: 149,
+                  passwordCount: 0,
+                  opLogCount: 1,
+                  deviceCapacityLogs: 50049,
                   autoSyncMinutes: 15
                 },
                 {
@@ -679,13 +699,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                   port: 4370,
                   model: 'MB2000/ID',
                   serialNumber: 'BRC7233360027',
-                  deviceNumber: 2,
+                  deviceNumber: 1,
+                  commType: 'Ethernet',
                   enabled: true,
                   status: 'online',
                   lastConnection: new Date().toISOString(),
                   lastSync: new Date().toISOString(),
                   userCount: 0,
                   logCount: 0,
+                  deviceCapacityUsers: 362,
+                  adminCount: 3,
+                  fpCount: 687,
+                  faceCount: 209,
+                  passwordCount: 0,
+                  opLogCount: 2,
+                  deviceCapacityLogs: 32870,
                   autoSyncMinutes: 15
                 },
                 {
@@ -695,13 +723,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                   port: 4370,
                   model: 'MB2000',
                   serialNumber: 'MFP3241900135',
-                  deviceNumber: 3,
+                  deviceNumber: 1,
+                  commType: 'Ethernet',
                   enabled: true,
                   status: 'online',
                   lastConnection: new Date().toISOString(),
                   lastSync: new Date().toISOString(),
                   userCount: 0,
                   logCount: 0,
+                  deviceCapacityUsers: 103,
+                  adminCount: 3,
+                  fpCount: 204,
+                  faceCount: 67,
+                  passwordCount: 0,
+                  opLogCount: 2,
+                  deviceCapacityLogs: 67961,
                   autoSyncMinutes: 15
                 }
               ];
@@ -731,8 +767,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
           const localAudit = await fetchLocalTable<AuditLog>('audit_logs');
           if (localAudit && localAudit.length > 0) {
-            setAuditLogsState(localAudit);
-            saveCache('audit_logs', localAudit);
+            const normalizedAudit = localAudit.map(normalizeAuditLog);
+            setAuditLogsState(normalizedAudit);
+            saveCache('audit_logs', normalizedAudit);
           }
 
           const localAssignLogs = await fetchLocalTable<AssignmentLog>('assignment_logs');
@@ -843,8 +880,49 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         } finally {
           if (active) setIsInitializing(false);
         }
-        
-        if (!active || !user) return;
+        if (!active) return;
+
+        // Periodic 100% Read-Only SQLite poll to reflect external biometric software updates in real time
+        const sqlitePollInterval = setInterval(async () => {
+          if (!active) return;
+          try {
+            const [freshPunches, freshDevs, freshLogs, freshUnmapped, freshMappings] = await Promise.all([
+              fetchLocalTable<RawPunch>('punches'),
+              fetchLocalTable<ZkDevice>('zk_devices'),
+              fetchLocalTable<ZkSyncLog>('zk_sync_logs'),
+              fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
+              fetchLocalTable<ZkUserMapping>('zk_user_mappings')
+            ]);
+            if (Array.isArray(freshPunches)) {
+              const nextDigest = computePunchesDigest(freshPunches);
+              if (nextDigest !== lastPunchDigestRef.current) {
+                lastPunchDigestRef.current = nextDigest;
+                setPunchesState(freshPunches);
+              }
+            }
+            if (freshDevs && freshDevs.length > 0) {
+              setZkDevicesState(freshDevs);
+              saveCache('zk_devices', freshDevs);
+            }
+            if (freshLogs && freshLogs.length > 0) {
+              setZkSyncLogsState(freshLogs);
+              saveCache('zk_sync_logs', freshLogs);
+            }
+            if (freshUnmapped) {
+              setZkUnmappedPunchesState(freshUnmapped);
+              saveCache('zk_unmapped_punches', freshUnmapped);
+            }
+            if (freshMappings && freshMappings.length > 0) {
+              setZkUserMappingsState(freshMappings);
+              saveCache('zk_user_mappings', freshMappings);
+            }
+          } catch {
+            // ignore poll error
+          }
+        }, 15000);
+        unsubs.push(() => clearInterval(sqlitePollInterval));
+
+        if (!user) return;
 
         unsubs.push(
           onSnapshot(query(collection(db, 'punches'), limit(10000)), 
@@ -1029,12 +1107,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                     model: 'MB2000/ID',
                     serialNumber: 'BRC7233360063',
                     deviceNumber: 1,
+                    commType: 'Ethernet',
                     enabled: true,
                     status: 'online',
                     lastConnection: new Date().toISOString(),
                     lastSync: new Date().toISOString(),
                     userCount: 0,
                     logCount: 0,
+                    deviceCapacityUsers: 369,
+                    adminCount: 2,
+                    fpCount: 697,
+                    faceCount: 149,
+                    passwordCount: 0,
+                    opLogCount: 1,
+                    deviceCapacityLogs: 50049,
                     autoSyncMinutes: 15
                   },
                   {
@@ -1044,13 +1130,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                     port: 4370,
                     model: 'MB2000/ID',
                     serialNumber: 'BRC7233360027',
-                    deviceNumber: 2,
+                    deviceNumber: 1,
+                    commType: 'Ethernet',
                     enabled: true,
                     status: 'online',
                     lastConnection: new Date().toISOString(),
                     lastSync: new Date().toISOString(),
                     userCount: 0,
                     logCount: 0,
+                    deviceCapacityUsers: 362,
+                    adminCount: 3,
+                    fpCount: 687,
+                    faceCount: 209,
+                    passwordCount: 0,
+                    opLogCount: 2,
+                    deviceCapacityLogs: 32870,
                     autoSyncMinutes: 15
                   },
                   {
@@ -1060,13 +1154,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                     port: 4370,
                     model: 'MB2000',
                     serialNumber: 'MFP3241900135',
-                    deviceNumber: 3,
+                    deviceNumber: 1,
+                    commType: 'Ethernet',
                     enabled: true,
                     status: 'online',
                     lastConnection: new Date().toISOString(),
                     lastSync: new Date().toISOString(),
                     userCount: 0,
                     logCount: 0,
+                    deviceCapacityUsers: 103,
+                    adminCount: 3,
+                    fpCount: 204,
+                    faceCount: 67,
+                    passwordCount: 0,
+                    opLogCount: 2,
+                    deviceCapacityLogs: 67961,
                     autoSyncMinutes: 15
                   }
                 ];
@@ -1117,47 +1219,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             (error) => handleFirestoreError(error, OperationType.LIST, 'zkUnmappedPunches')
           ),
         );
-        
-        // Periodic 100% Read-Only SQLite poll to reflect external biometric software updates in real time
-        const sqlitePollInterval = setInterval(async () => {
-          if (!active) return;
-          try {
-            const [freshPunches, freshDevs, freshLogs, freshUnmapped, freshMappings] = await Promise.all([
-              fetchLocalTable<RawPunch>('punches'),
-              fetchLocalTable<ZkDevice>('zk_devices'),
-              fetchLocalTable<ZkSyncLog>('zk_sync_logs'),
-              fetchLocalTable<ZkUnmappedPunch>('zk_unmapped_punches'),
-              fetchLocalTable<ZkUserMapping>('zk_user_mappings')
-            ]);
-            if (Array.isArray(freshPunches)) {
-              const nextDigest = computePunchesDigest(freshPunches);
-              if (nextDigest !== lastPunchDigestRef.current) {
-                lastPunchDigestRef.current = nextDigest;
-                setPunchesState(freshPunches);
-              }
-            }
-            if (freshDevs && freshDevs.length > 0) {
-              setZkDevicesState(freshDevs);
-              saveCache('zk_devices', freshDevs);
-            }
-            if (freshLogs && freshLogs.length > 0) {
-              setZkSyncLogsState(freshLogs);
-              saveCache('zk_sync_logs', freshLogs);
-            }
-            if (freshUnmapped) {
-              setZkUnmappedPunchesState(freshUnmapped);
-              saveCache('zk_unmapped_punches', freshUnmapped);
-            }
-            if (freshMappings && freshMappings.length > 0) {
-              setZkUserMappingsState(freshMappings);
-              saveCache('zk_user_mappings', freshMappings);
-            }
-          } catch {
-            // ignore poll error
-          }
-        }, 15000);
-        unsubs.push(() => clearInterval(sqlitePollInterval));
-        
         await new Promise(resolve => setTimeout(resolve, 300));
       } catch (e) {
         console.error("Initialization error:", e);
@@ -1169,7 +1230,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
 
     const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
-      setUser(u);
+      try {
+        const savedLocal = sessionStorage.getItem('local_session_user');
+        if (savedLocal) {
+          const parsed = JSON.parse(savedLocal);
+          if (parsed && parsed.email) {
+            setUser((prev: any) => (prev && prev.email === parsed.email ? prev : parsed));
+            startSync();
+            return;
+          }
+        }
+      } catch {}
+
+      if (u) {
+        setUser(u);
+      }
       startSync();
     });
 
@@ -1178,7 +1253,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       unsubscribeAuth();
       unsubs.forEach(u => u());
     };
-  }, [user?.uid]);
+  }, []);
 
   const updateEmployee = useCallback(async (id: string, data: Partial<Employee>) => {
     setEmployeesState(prev => {
@@ -1455,7 +1530,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const setSettings = useCallback(async (data: Settings) => {
     setSettingsState(data);
     saveCache('settings', data);
-    saveLocalTable('settings', [data]);
+    await saveLocalTable('settings', [data]);
     if (checkQuota()) {
       try {
         await setDoc(doc(db, 'settings', 'config'), data);
@@ -1540,12 +1615,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [settings.shifts, handleFirestoreError, checkQuota]);
 
   const addAuditLog = useCallback(async (log: Omit<AuditLog, 'id' | 'timestamp'>) => {
-    const newLog: AuditLog = {
+    const newLog: AuditLog = normalizeAuditLog({
       ...log,
-      id: Math.random().toString(36).substr(2, 9),
+      id: `audit_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       timestamp: new Date().toISOString()
-    };
-    setAuditLogsState(prev => [newLog, ...prev]);
+    });
+    setAuditLogsState(prev => {
+      const updated = [newLog, ...prev];
+      saveCache('audit_logs', updated);
+      return updated;
+    });
     saveLocalTable('audit_logs', [newLog]);
     if (checkQuota()) {
       try {

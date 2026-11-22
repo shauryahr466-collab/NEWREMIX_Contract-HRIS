@@ -43,7 +43,7 @@ export function DepartmentInsights() {
   const departments = useMemo(() => ['All', ...new Set(employees.map(e => e.department).filter(Boolean))], [employees]);
   const contractors = useMemo(() => ['All', ...new Set(employees.map(e => e.contractorName).filter(Boolean))], [employees]);
   const shifts = useMemo(() => ['All', ...(settings.shifts?.map(s => s.name) || [])], [settings.shifts]);
-  const statuses = ['All', 'Present', 'Absent', 'Late', 'PWO', 'SPF', 'Early', 'On Time'];
+  const statuses = ['All', 'Present', 'Absent', 'Late', 'PWO', 'PPH', 'Public Holiday', 'SPF', 'Early', 'On Time'];
 
   const getRecordShift = (d: any, emp: any) => {
     const assignment = shiftAssignments.find(a => a.employeeId === d.employeeId && a.date === d.date);
@@ -158,7 +158,7 @@ export function DepartmentInsights() {
 
       const stat = statsMap.get(deptName);
       
-      const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status);
+      const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO', 'PPH'].includes(d.status);
       const isAbsent = d.status === 'Absent';
       const isWO = d.status === 'Weekly Off';
       const isPWO = d.status === 'PWO';
@@ -235,7 +235,7 @@ export function DepartmentInsights() {
     } else if (isShift) {
       const presentIds = new Set<string>();
       deptPData.forEach(d => {
-        const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO'].includes(d.status);
+        const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO', 'PPH'].includes(d.status);
         if (!isPresent) return;
 
         const emp = employees.find(e => e.id === d.employeeId);

@@ -40,7 +40,7 @@ export function Layout() {
     openEmployeeProfile, closeEmployeeProfile, 
     theme, setTheme, globalSearchTerm, setGlobalSearchTerm, 
     recalculate, isInitializing, quotaExceeded, resetError,
-    setIsOtpVerified, user, setUser,
+    setIsOtpVerified, user, setUser, setIsAdmin,
     isSuperAdmin, effectiveUserProfile, previewUserProfile, setPreviewUserProfile,
     setCurrentUserProfile, canAccessModule
   } = useAppStore();
@@ -51,15 +51,16 @@ export function Layout() {
   const currentUserEmail = effectiveUserProfile?.email || user?.email || auth.currentUser?.email || '';
   const isAdmin = isSuperAdmin || ADMIN_EMAILS.some(email => currentUserEmail.toLowerCase() === email.toLowerCase());
 
-  const handleSignOut = () => {
-    setIsOtpVerified(false);
-    setPreviewUserProfile(null);
-    setCurrentUserProfile(null);
+  const handleSignOut = async () => {
     sessionStorage.removeItem('local_session_user');
     sessionStorage.removeItem('local_user_profile');
     sessionStorage.removeItem('is_otp_verified');
+    setIsOtpVerified(false);
+    setPreviewUserProfile(null);
+    setCurrentUserProfile(null);
+    setIsAdmin(false);
     setUser(null);
-    signOut(auth).catch(() => {});
+    await signOut(auth).catch(() => {});
   };
 
   const selectedEmployee = employees.find(e => e.id === selectedEmployeeId) || null;

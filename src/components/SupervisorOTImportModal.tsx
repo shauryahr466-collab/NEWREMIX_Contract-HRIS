@@ -801,6 +801,7 @@ export function SupervisorOTImportModal({
         const auditLogEntry = {
           id: `audit_import_ot_${Date.now()}`,
           employeeId: 'ALL',
+          employeeName: 'All Employees (Supervisor OT Import)',
           date: new Date().toISOString().substring(0, 10),
           action: 'SUPERVISOR_OT_IMPORT',
           field: 'supervisorOtHours,remarks',

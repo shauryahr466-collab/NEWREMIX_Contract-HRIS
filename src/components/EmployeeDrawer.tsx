@@ -568,22 +568,34 @@ export function EmployeeDrawer({ employee, isOpen, onClose, onEdit, onDeactivate
                   <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200/80 dark:border-slate-800 overflow-hidden shadow-sm">
                     {empAuditLogs.length > 0 ? (
                       <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-96 overflow-y-auto custom-scrollbar-light text-xs">
-                        {empAuditLogs.map(log => (
-                          <div key={log.id} className="p-3.5 space-y-1 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
-                            <div className="flex items-center justify-between">
-                              <span className="font-bold text-indigo-600 dark:text-indigo-400 uppercase text-[10px]">
-                                Field: {log.field}
-                              </span>
-                              <span className="font-mono text-[10px] text-slate-400">{log.timestamp ? format(parseISO(log.timestamp), 'dd MMM yyyy HH:mm') : ''}</span>
+                        {empAuditLogs.map(log => {
+                          const tsStr = log.timestamp || log.changedAt || log.date || '';
+                          let formattedTs = tsStr;
+                          try {
+                            if (tsStr) {
+                              const parsed = parseISO(String(tsStr).replace(' ', 'T'));
+                              if (!isNaN(parsed.getTime())) {
+                                formattedTs = format(parsed, 'yyyy-MM-dd HH:mm');
+                              }
+                            }
+                          } catch {}
+                          return (
+                            <div key={log.id} className="p-3.5 space-y-1 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors">
+                              <div className="flex items-center justify-between">
+                                <span className="font-bold text-indigo-600 dark:text-indigo-400 uppercase text-[10px]">
+                                  Field: {log.field || 'Update'}
+                                </span>
+                                <span className="font-mono text-[10px] text-slate-400">{formattedTs}</span>
+                              </div>
+                              <p className="text-slate-600 dark:text-slate-300 font-mono text-[11px]">
+                                <span className="line-through text-slate-400">{log.oldValue || 'null'}</span> → <strong className="text-slate-900 dark:text-white">{log.newValue || 'null'}</strong>
+                              </p>
+                              {(log.remarks || log.reason) && (
+                                <p className="text-[10px] text-slate-400 italic">{log.remarks || log.reason}</p>
+                              )}
                             </div>
-                            <p className="text-slate-600 dark:text-slate-300 font-mono text-[11px]">
-                              <span className="line-through text-slate-400">{log.oldValue || 'null'}</span> → <strong className="text-slate-900 dark:text-white">{log.newValue || 'null'}</strong>
-                            </p>
-                            {log.remarks && (
-                              <p className="text-[10px] text-slate-400 italic">{log.remarks}</p>
-                            )}
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     ) : (
                       <div className="p-8 text-center text-slate-400 text-xs font-medium">

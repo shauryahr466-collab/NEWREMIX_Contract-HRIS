@@ -22,6 +22,8 @@ export function SettingsPage() {
   const [diagData, setDiagData] = useState<any>(null);
   const [isRunningDiag, setIsRunningDiag] = useState(false);
   const [showDiagModal, setShowDiagModal] = useState(false);
+  const [newHolidayDate, setNewHolidayDate] = useState('');
+  const [newHolidayName, setNewHolidayName] = useState('');
 
   const handleRunDiagnostics = async () => {
     setIsRunningDiag(true);
@@ -273,6 +275,55 @@ export function SettingsPage() {
       ...localSettings,
       shifts: localSettings.shifts.map(s => s.id === id ? { ...s, ...updates } : s)
     });
+  };
+
+  const sortedHolidays = useMemo(() => {
+    return [...(localSettings.holidays || [])].sort((a, b) => a.date.localeCompare(b.date));
+  }, [localSettings.holidays]);
+
+  const handleAddHoliday = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (quotaExceeded) {
+      toast.error('Database write limit reached.');
+      return;
+    }
+    const cleanDate = newHolidayDate.trim();
+    const cleanName = newHolidayName.trim();
+    if (!cleanDate || !cleanName) {
+      toast.error('Please enter both holiday date and holiday name.');
+      return;
+    }
+
+    const existing = localSettings.holidays || [];
+    const nextHolidays = [
+      ...existing.filter(h => h.date !== cleanDate),
+      { date: cleanDate, name: cleanName }
+    ].sort((a, b) => a.date.localeCompare(b.date));
+
+    const updatedSettings = {
+      ...localSettings,
+      holidays: nextHolidays
+    };
+    setLocalSettings(updatedSettings);
+    await setSettings(updatedSettings);
+    setNewHolidayDate('');
+    setNewHolidayName('');
+    toast.success(`Public Holiday "${cleanName}" (${cleanDate}) saved and reflected in Attendance.`);
+  };
+
+  const handleRemoveHoliday = async (dateToRemove: string) => {
+    if (quotaExceeded) {
+      toast.error('Database write limit reached.');
+      return;
+    }
+    const nextHolidays = (localSettings.holidays || []).filter(h => h.date !== dateToRemove);
+    const updatedSettings = {
+      ...localSettings,
+      holidays: nextHolidays
+    };
+    setLocalSettings(updatedSettings);
+    await setSettings(updatedSettings);
+    toast.success(`Removed Public Holiday on ${dateToRemove}. Attendance updated.`);
   };
 
   const shiftWarnings = useMemo(() => {
@@ -535,6 +586,94 @@ export function SettingsPage() {
                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Punch Cleanup (Mins)</label>
                    <Input type="number" value={localSettings.duplicateMergeTime} onChange={e => setLocalSettings({...localSettings, duplicateMergeTime: Number(e.target.value)})} />
                 </div>
+             </div>
+          </Card>
+
+          <Card className="p-0 overflow-hidden">
+             <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+               <div className="flex items-center gap-2">
+                 <Calendar size={16} className="text-sky-500" />
+                 <div>
+                   <h3 className="text-[11px] font-bold text-slate-900 dark:text-white uppercase tracking-widest">Public Holidays Calendar</h3>
+                   <p className="text-[10px] text-slate-500">Holidays automatically reflect across Attendance Logs, Monthly Muster, Overtime, and Payroll</p>
+                 </div>
+               </div>
+               <span className="text-[11px] font-semibold text-slate-500 tabular-nums">{sortedHolidays.length} configured</span>
+             </div>
+             <div className="p-6 space-y-4">
+               <form onSubmit={handleAddHoliday} className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+                 <div className="sm:col-span-4 space-y-1.5">
+                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Holiday Date</label>
+                   <Input
+                     type="date"
+                     value={newHolidayDate}
+                     onChange={e => setNewHolidayDate(e.target.value)}
+                     className="text-[12px]"
+                     required
+                   />
+                 </div>
+                 <div className="sm:col-span-5 space-y-1.5">
+                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Holiday Name</label>
+                   <Input
+                     type="text"
+                     value={newHolidayName}
+                     onChange={e => setNewHolidayName(e.target.value)}
+                     placeholder="e.g., Dashain / May Day / Republic Day"
+                     required
+                   />
+                 </div>
+                 <div className="sm:col-span-3">
+                   <Button type="submit" className="w-full gap-1.5" disabled={quotaExceeded}>
+                     <Plus size={14} /> Add Holiday
+                   </Button>
+                 </div>
+               </form>
+
+               {sortedHolidays.length > 0 ? (
+                 <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+                   <table className="w-full text-left border-collapse text-xs">
+                     <thead className="bg-slate-50 dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-800 text-[10px] uppercase tracking-wider text-slate-500">
+                       <tr>
+                         <th className="px-4 py-2.5">Date</th>
+                         <th className="px-4 py-2.5">Day</th>
+                         <th className="px-4 py-2.5">Holiday Name</th>
+                         <th className="px-4 py-2.5 text-right">Action</th>
+                       </tr>
+                     </thead>
+                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                       {sortedHolidays.map(h => {
+                         let dayLabel = '-';
+                         try {
+                           dayLabel = format(new Date(`${h.date}T00:00:00`), 'EEE');
+                         } catch {}
+                         return (
+                           <tr key={h.date} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
+                             <td className="px-4 py-2.5 font-mono font-semibold text-slate-900 dark:text-white tabular-nums">{h.date}</td>
+                             <td className="px-4 py-2.5 text-slate-500">{dayLabel}</td>
+                             <td className="px-4 py-2.5 font-medium text-slate-800 dark:text-slate-200">{h.name}</td>
+                             <td className="px-4 py-2.5 text-right">
+                               <Button
+                                 type="button"
+                                 variant="ghost"
+                                 size="sm"
+                                 onClick={() => handleRemoveHoliday(h.date)}
+                                 disabled={quotaExceeded}
+                                 className="h-7 px-2 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                               >
+                                 <Trash2 size={13} />
+                               </Button>
+                             </td>
+                           </tr>
+                         );
+                       })}
+                     </tbody>
+                   </table>
+                 </div>
+               ) : (
+                 <div className="p-6 text-center border border-dashed border-slate-200 dark:border-slate-800 rounded-xl text-xs text-slate-400">
+                   No public holidays configured yet. Add dates above to reflect Public Holiday (PH) and Worked Holiday (PPH) in Attendance.
+                 </div>
+               )}
              </div>
           </Card>
         </div>

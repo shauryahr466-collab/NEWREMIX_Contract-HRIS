@@ -81,6 +81,7 @@ export const DeviceSetup: React.FC = () => {
     model: string;
     serialNumber: string;
     deviceNumber: number;
+    commType: 'Ethernet' | 'USB' | 'Serial' | 'WiFi';
     enabled: boolean;
     autoSyncMinutes: number;
     protocolMode: ZkProtocolMode;
@@ -92,6 +93,7 @@ export const DeviceSetup: React.FC = () => {
     model: 'MB2000/ID',
     serialNumber: '',
     deviceNumber: 1,
+    commType: 'Ethernet',
     enabled: true,
     autoSyncMinutes: 15,
     protocolMode: 'Auto',
@@ -407,9 +409,9 @@ export const DeviceSetup: React.FC = () => {
     const currentOrigin = window.location.origin;
 
     const activeDevs = (zkDevices && zkDevices.length > 0) ? zkDevices : [
-      { id: 'dev_time_office_1', name: 'Time Office 1', ip: '192.168.117.201', port: 4370 },
-      { id: 'dev_time_office_2', name: 'Time Office 2', ip: '192.168.117.200', port: 4370 },
-      { id: 'dev_ists_office', name: 'ISTS Office', ip: '192.168.13.103', port: 4370 }
+      { id: 'dev_main_192_168_117_200', name: 'Time Office 2', ip: '192.168.117.200', port: 4370, model: 'MB2000/ID', commType: 'Ethernet', deviceNumber: 1 },
+      { id: 'dev_factory_192_168_117_201', name: 'Time Office 1', ip: '192.168.117.201', port: 4370, model: 'MB2000/ID', commType: 'Ethernet', deviceNumber: 1 },
+      { id: 'dev_office_192_168_13_7', name: 'ISTS Office', ip: '192.168.13.103', port: 4370, model: 'MB2000', commType: 'Ethernet', deviceNumber: 1 }
     ];
 
     // Embed current Active Employees from Directory & Mappings so the PC Agent knows all active employees immediately
@@ -753,20 +755,30 @@ async function writePunchesDirectToDiskSqlite(devId, devName, devIP, punches) {
       }
     } catch (e) {}
 
-    // Update zk_devices status in SQLite with matched userCount & logCount
+    // Update zk_devices status in SQLite while preserving existing hardware metadata
+    let existingDevObj = {};
+    try {
+      const exRes = db.exec("SELECT data FROM zk_devices WHERE id = '" + devId.replace(/'/g, "''") + "'");
+      if (exRes.length > 0 && exRes[0].values.length > 0) {
+        existingDevObj = JSON.parse(String(exRes[0].values[0][0] || '{}'));
+      }
+    } catch (e) {}
     const devObj = {
+      ...existingDevObj,
       id: devId,
       name: devName,
       ip: devIP,
-      port: 4370,
-      model: 'MB2000/ID',
+      port: existingDevObj.port || 4370,
+      model: existingDevObj.model || 'MB2000/ID',
+      commType: existingDevObj.commType || 'Ethernet',
+      deviceNumber: existingDevObj.deviceNumber || 1,
       enabled: true,
       status: 'online',
       lastConnection: now,
       lastSync: now,
       userCount: devUserCnt,
       logCount: devLogCnt,
-      autoSyncMinutes: 5
+      autoSyncMinutes: existingDevObj.autoSyncMinutes ?? 15
     };
     const devStmt = db.prepare("INSERT INTO zk_devices (id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at");
     devStmt.run([devId, JSON.stringify(devObj), now]);
@@ -1150,7 +1162,8 @@ pause
       port: 4370,
       model: 'MB2000/ID',
       serialNumber: `MB2000-${Math.floor(1000 + Math.random() * 9000)}`,
-      deviceNumber: (zkDevices.length || 0) + 1,
+      deviceNumber: 1,
+      commType: 'Ethernet',
       enabled: true,
       autoSyncMinutes: 15,
       protocolMode: 'Auto',
@@ -1169,6 +1182,7 @@ pause
       model: dev.model || 'MB2000/ID',
       serialNumber: dev.serialNumber || '',
       deviceNumber: dev.deviceNumber || 1,
+      commType: dev.commType || 'Ethernet',
       enabled: dev.enabled,
       autoSyncMinutes: dev.autoSyncMinutes ?? 15,
       protocolMode: dev.protocolMode || 'Auto',
@@ -1625,6 +1639,66 @@ pause
             />
           </div>
 
+          {/* Hardware Terminal Registry Table */}
+          {filteredDevices.length > 0 && (
+            <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                  Biometric Terminal Hardware Matrix
+                </span>
+                <span className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  {filteredDevices.filter(d => d.status === 'online').length} / {filteredDevices.length} Connected · Ethernet TCP/IP 4370
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 text-slate-600 dark:text-slate-400 font-semibold">
+                      <th className="py-2.5 px-3 whitespace-nowrap">Device Name</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap">Status</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Machine No</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap">Comm Type</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap">IP Address</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Port</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap">Product</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Users</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Admin</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">FP</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Face</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Pass</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">OpLog</th>
+                      <th className="py-2.5 px-3 whitespace-nowrap text-right">Attendance</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
+                    {filteredDevices.map((dev) => (
+                      <tr key={`row_${dev.id}`} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/30 transition-colors">
+                        <td className="py-2.5 px-3 font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">{dev.name}</td>
+                        <td className="py-2.5 px-3 whitespace-nowrap">
+                          <span className={`font-medium ${dev.status === 'online' ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                            {dev.status === 'online' ? 'Connected' : 'Offline'}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{dev.deviceNumber ?? 1}</td>
+                        <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300 whitespace-nowrap">{dev.commType || 'Ethernet'}</td>
+                        <td className="py-2.5 px-3 font-mono font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">{dev.ip}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{dev.port || 4370}</td>
+                        <td className="py-2.5 px-3 font-mono text-slate-800 dark:text-slate-200 whitespace-nowrap">{dev.model}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-800 dark:text-slate-200">{(dev.deviceCapacityUsers ?? dev.userCount ?? 0).toLocaleString()}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{dev.adminCount ?? 0}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{(dev.fpCount ?? 0).toLocaleString()}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{(dev.faceCount ?? 0).toLocaleString()}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{dev.passwordCount ?? 0}</td>
+                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">{dev.opLogCount ?? 0}</td>
+                        <td className="py-2.5 px-3 text-right font-mono font-bold tabular-nums text-indigo-600 dark:text-indigo-400">{(dev.deviceCapacityLogs ?? 0).toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {filteredDevices.map((dev) => (
               <div 
@@ -1642,32 +1716,28 @@ pause
                       <div className="flex items-center gap-2">
                         <span className="font-bold text-slate-900 dark:text-slate-100 text-base">{dev.name}</span>
                         {!dev.enabled && (
-                          <span className="px-2 py-0.5 text-xs font-semibold bg-slate-100 dark:bg-slate-800 text-slate-500 rounded-md">Disabled</span>
+                          <span className="text-xs font-medium text-slate-500">· Disabled</span>
                         )}
                       </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Model: <span className="font-mono font-medium text-slate-700 dark:text-slate-300">{dev.model}</span></p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                        Product: <span className="font-mono font-medium text-slate-700 dark:text-slate-300">{dev.model}</span>
+                        <span className="mx-1.5 text-slate-300 dark:text-slate-700">·</span>
+                        <span>Machine #{dev.deviceNumber ?? 1}</span>
+                      </p>
                     </div>
 
                     {/* Status Indicator */}
-                    <div className="flex items-center gap-1.5 text-xs font-semibold">
-                      {dev.status === 'online' ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-emerald-700 dark:text-emerald-400 border border-emerald-200/70 dark:border-emerald-800/70 rounded-lg">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                          Online
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-rose-700 dark:text-rose-400 border border-rose-200/70 dark:border-rose-800/70 rounded-lg">
-                          <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
-                          Offline
-                        </span>
-                      )}
+                    <div className="flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap shrink-0">
+                      <span className={dev.status === 'online' ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-700 dark:text-rose-400'}>
+                        {dev.status === 'online' ? 'Connected' : 'Offline'}
+                      </span>
                     </div>
                   </div>
 
                   {/* Config Details */}
                   <div className="mt-4 pt-3 border-t border-slate-100 dark:border-slate-800/60 space-y-2 text-xs">
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                      <span>IP &amp; Port:</span>
+                      <span>IP &amp; Port ({dev.commType || 'Ethernet'}):</span>
                       <span className="font-mono font-bold text-slate-900 dark:text-slate-100">{dev.ip}:{dev.port}</span>
                     </div>
 
@@ -1681,6 +1751,20 @@ pause
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
                       <span>Serial Number:</span>
                       <span className="font-mono text-slate-800 dark:text-slate-200">{dev.serialNumber || 'N/A'}</span>
+                    </div>
+
+                    <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                      <span>Hardware Enrolled:</span>
+                      <span className="font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
+                        {(dev.deviceCapacityUsers ?? 0).toLocaleString()} users · {dev.adminCount ?? 0} admin
+                      </span>
+                    </div>
+
+                    <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                      <span>Biometrics (FP / Face / Pwd):</span>
+                      <span className="font-mono text-slate-800 dark:text-slate-200 tabular-nums">
+                        {(dev.fpCount ?? 0).toLocaleString()} FP / {(dev.faceCount ?? 0).toLocaleString()} FC / {dev.passwordCount ?? 0} Pwd
+                      </span>
                     </div>
 
                     <div className="flex justify-between text-slate-600 dark:text-slate-400">
@@ -1708,9 +1792,9 @@ pause
 
                     {typeof dev.deviceCapacityLogs === 'number' && dev.deviceCapacityLogs > 0 && (
                       <div className="flex justify-between text-slate-600 dark:text-slate-400">
-                        <span>Hardware Buffer Logs:</span>
+                        <span>Device Attendance Logs:</span>
                         <span className="font-semibold text-emerald-600 dark:text-emerald-400 tabular-nums">
-                          {dev.deviceCapacityLogs.toLocaleString()} on device
+                          {dev.deviceCapacityLogs.toLocaleString()} records (OpLog: {dev.opLogCount ?? 0})
                         </span>
                       </div>
                     )}
@@ -2286,9 +2370,9 @@ const ZKLib = require('node-zklib'); // npm install node-zklib axios
 
 const HRIS_ENDPOINT = '${window.location.origin}/api/zk/agent/sync';
 const DEVICES = [
-  { id: 'dev_main_192_168_117_200', name: 'Main Device', ip: '192.168.117.200', port: 4370 },
-  { id: 'dev_factory_192_168_117_201', name: 'Factory Device', ip: '192.168.117.201', port: 4370 },
-  { id: 'dev_office_192_168_13_7', name: 'Office Device', ip: '192.168.13.7', port: 4370 }
+  { id: 'dev_main_192_168_117_200', name: 'Time Office 2', ip: '192.168.117.200', port: 4370, model: 'MB2000/ID', commType: 'Ethernet', machineNo: 1 },
+  { id: 'dev_factory_192_168_117_201', name: 'Time Office 1', ip: '192.168.117.201', port: 4370, model: 'MB2000/ID', commType: 'Ethernet', machineNo: 1 },
+  { id: 'dev_office_192_168_13_7', name: 'ISTS Office', ip: '192.168.13.103', port: 4370, model: 'MB2000', commType: 'Ethernet', machineNo: 1 }
 ];
 
 async function pollDevice(dev) {
@@ -2356,7 +2440,7 @@ DEVICES.forEach(pollDevice);`}</pre>
                 <input
                   type="text"
                   required
-                  placeholder="e.g. Main Device / Factory Gate"
+                  placeholder="e.g. Time Office 2 / ISTS Office"
                   value={formData.name}
                   onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                   className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
@@ -2395,7 +2479,7 @@ DEVICES.forEach(pollDevice);`}</pre>
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                    Model
+                    Product / Model
                   </label>
                   <input
                     type="text"
@@ -2412,11 +2496,42 @@ DEVICES.forEach(pollDevice);`}</pre>
                   </label>
                   <input
                     type="text"
-                    placeholder="MB2000-MAIN-8392"
+                    placeholder="BRC7233360063"
                     value={formData.serialNumber}
                     onChange={(e) => setFormData({ ...formData, serialNumber: e.target.value })}
                     className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
                   />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Machine No
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={formData.deviceNumber}
+                    onChange={(e) => setFormData({ ...formData, deviceNumber: parseInt(e.target.value, 10) || 1 })}
+                    className="w-full px-3 py-2 font-mono bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
+                  />
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Comm Type
+                  </label>
+                  <select
+                    value={formData.commType}
+                    onChange={(e) => setFormData({ ...formData, commType: e.target.value as 'Ethernet' | 'USB' | 'Serial' | 'WiFi' })}
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
+                  >
+                    <option value="Ethernet">Ethernet</option>
+                    <option value="USB">USB</option>
+                    <option value="Serial">Serial</option>
+                    <option value="WiFi">WiFi</option>
+                  </select>
                 </div>
               </div>
 

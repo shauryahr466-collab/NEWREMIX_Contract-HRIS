@@ -1,21 +1,22 @@
 import React, { useState } from 'react';
-import { LogIn, Shield, CheckCircle2, ArrowRight, Github, Mail, Lock, Key, Loader2, Info } from 'lucide-react';
-import { signInWithGoogle as googleSignInFn, emailSignIn } from '../lib/firebase';
+import { Shield, CheckCircle2, Mail, Lock, Key, Loader2, Info, Eye, EyeOff } from 'lucide-react';
+import { signInWithGoogle as googleSignInFn, emailSignIn, resetPassword } from '../lib/firebase';
 import { motion, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAppStore } from '../store';
-import { Button, Input, Card, Badge } from '../components/ui';
+import { Button, Input } from '../components/ui';
 
 type LoginStep = 'credentials' | 'otp';
 
 const ADMIN_EMAILS = ['hr.sandiprajak466@gmail.com', 'shauryahr466@gmail.com'];
 
 export function Login() {
-  const { setIsOtpVerified, setUser, setIsAdmin, setCurrentUserProfile } = useAppStore();
+  const { setIsOtpVerified, setUser, setIsAdmin, setCurrentUserProfile, refreshCurrentUserProfile } = useAppStore();
   const [step, setStep] = useState<LoginStep>('credentials');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [otp, setOtp] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [unauthorizedDomain, setUnauthorizedDomain] = useState<string | null>(null);
@@ -25,19 +26,41 @@ export function Login() {
     return ADMIN_EMAILS.some(adminEmail => emailAddress.toLowerCase() === adminEmail.toLowerCase());
   };
 
-  const handleInstantBypass = (targetEmail = email || 'hr.sandiprajak466@gmail.com') => {
-    const activeEmail = targetEmail || 'hr.sandiprajak466@gmail.com';
+  const handleInstantBypass = async (targetEmail = email || 'hr.sandiprajak466@gmail.com') => {
+    const cleanInput = String(targetEmail || 'hr.sandiprajak466@gmail.com').trim().toLowerCase();
+    const activeEmail = cleanInput.includes('@') ? cleanInput : 'hr.sandiprajak466@gmail.com';
     const mockUser = {
       uid: 'local_admin_' + Date.now(),
       email: activeEmail,
       displayName: activeEmail.split('@')[0] || 'Admin User',
+      role: isUserAdmin(activeEmail) ? 'Super Admin' : undefined
     };
     sessionStorage.setItem('local_session_user', JSON.stringify(mockUser));
+    sessionStorage.setItem('is_otp_verified', 'true');
     setUser(mockUser);
     setIsAdmin(isUserAdmin(activeEmail));
     setIsOtpVerified(true);
+    await refreshCurrentUserProfile(activeEmail).catch(() => {});
     toast.success('Signed in successfully (Local Access)');
-    navigate('/');
+    navigate('/', { replace: true });
+  };
+
+  const handleForgotPassword = async () => {
+    const target = email.trim();
+    if (!target) {
+      toast.info('Enter your Work Email or Login ID above, then click Forgot?.');
+      return;
+    }
+    if (!target.includes('@')) {
+      toast.info('Local user passwords can be reset by your Super Admin in User & Role Config.');
+      return;
+    }
+    try {
+      await resetPassword(target);
+      toast.success(`Password reset link sent to ${target}`);
+    } catch {
+      toast.info('For local SQLite accounts, ask your Super Admin to reset your password in User & Role Config.');
+    }
   };
 
   const handleGoogleLogin = async () => {
@@ -46,9 +69,15 @@ export function Login() {
     try {
       const result = await googleSignInFn();
       if (result) {
+        sessionStorage.removeItem('local_session_user');
+        setUser(result.user);
         if (isUserAdmin(result.user.email || '')) {
+          sessionStorage.setItem('is_otp_verified', 'true');
+          setIsAdmin(true);
           setIsOtpVerified(true);
+          await refreshCurrentUserProfile(result.user.email || '').catch(() => {});
           toast.success('Admin access granted');
+          navigate('/', { replace: true });
           return;
         }
         await sendOtp(result.user.email!);
@@ -75,6 +104,12 @@ export function Login() {
 
   const handleCredentialsLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    const cleanIdentifier = email.trim();
+    if (!cleanIdentifier || !password) {
+      toast.error('Please enter your Work Email / Login ID and Password.');
+      return;
+    }
+
     setIsLoading(true);
     setUnauthorizedDomain(null);
     try {
@@ -82,7 +117,7 @@ export function Login() {
       const localRes = await fetch('/api/auth/local-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim(), password })
+        body: JSON.stringify({ email: cleanIdentifier, password })
       });
       const localData = await localRes.json().catch(() => ({}));
 
@@ -95,36 +130,53 @@ export function Login() {
           role: u.role
         };
         sessionStorage.setItem('local_session_user', JSON.stringify(sessionUser));
+        sessionStorage.setItem('is_otp_verified', 'true');
         setUser(sessionUser);
         setCurrentUserProfile(u);
         setIsAdmin(u.role === 'Super Admin');
         setIsOtpVerified(true);
         toast.success(`Signed in as ${u.username} (${u.role})`);
-        navigate('/');
+        navigate('/', { replace: true });
         return;
       }
 
-      if (localRes.status === 401 || localRes.status === 403) {
+      if (localRes.status === 403 || (localRes.status === 401 && !localData?.noLocalPassword)) {
         toast.error(localData?.error || 'Invalid credentials or suspended account');
         return;
       }
 
-      // 2. Fallback to Firebase Auth for cloud-registered accounts
-      await emailSignIn(email, password);
-      if (isUserAdmin(email)) {
-        setIsOtpVerified(true);
-        toast.success('Admin access granted');
+      if (!cleanIdentifier.includes('@')) {
+        toast.error(localData?.error || 'User ID not found in local user directory.');
         return;
       }
-      await sendOtp(email);
+
+      // 2. Fallback to Firebase Auth for cloud-registered email accounts
+      const signedInUser = await emailSignIn(cleanIdentifier, password);
+      if (signedInUser) {
+        sessionStorage.removeItem('local_session_user');
+        setUser(signedInUser);
+      }
+      if (isUserAdmin(cleanIdentifier)) {
+        sessionStorage.setItem('is_otp_verified', 'true');
+        setIsAdmin(true);
+        setIsOtpVerified(true);
+        await refreshCurrentUserProfile(cleanIdentifier).catch(() => {});
+        toast.success('Admin access granted');
+        navigate('/', { replace: true });
+        return;
+      }
+      await sendOtp(cleanIdentifier);
     } catch (error: any) {
       console.error("Login failed:", error);
       if (error.code === 'auth/unauthorized-domain' || String(error?.message).includes('unauthorized-domain')) {
         const domain = window.location.hostname;
         setUnauthorizedDomain(domain);
-        toast.info(`Authorized domain notice for ${domain}. Logging in with Instant Access...`);
-        handleInstantBypass(email || 'hr.sandiprajak466@gmail.com');
-        return;
+        if (isUserAdmin(cleanIdentifier)) {
+          toast.info(`Authorized domain notice for ${domain}. Logging in with Local Admin Access...`);
+          await handleInstantBypass(cleanIdentifier);
+          return;
+        }
+        toast.error(`Domain '${domain}' is not authorized in Firebase Auth. Use your local user credentials or contact Super Admin.`);
       } else if (error.code === 'auth/operation-not-allowed') {
         toast.error('Email login not enabled in Firebase.');
       } else {
@@ -171,8 +223,11 @@ export function Login() {
         body: JSON.stringify({ email, code: otp }),
       });
       if (response.ok) {
+        sessionStorage.setItem('is_otp_verified', 'true');
         setIsOtpVerified(true);
+        await refreshCurrentUserProfile(email).catch(() => {});
         toast.success('Access granted');
+        navigate('/', { replace: true });
       } else {
         const data = await response.json();
         throw new Error(data.error);
@@ -271,18 +326,26 @@ export function Login() {
                   <div className="space-y-2">
                     <div className="flex justify-between items-center px-1">
                       <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Password</label>
-                      <button type="button" className="text-[10px] font-bold text-primary hover:underline uppercase">Forgot?</button>
+                      <button type="button" onClick={handleForgotPassword} className="text-[10px] font-bold text-primary hover:underline uppercase">Forgot?</button>
                     </div>
                     <div className="relative">
                       <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                       <Input 
-                        type="password"
+                        type={showPassword ? 'text' : 'password'}
                         value={password}
                         onChange={(e) => setPassword(e.target.value)}
-                        className="pl-10 h-11"
+                        className="pl-10 pr-10 h-11"
                         placeholder="••••••••"
                         required
                       />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(prev => !prev)}
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors"
+                      >
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
                     </div>
                   </div>
 

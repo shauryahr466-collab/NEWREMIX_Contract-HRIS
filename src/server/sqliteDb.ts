@@ -218,18 +218,8 @@ export async function getSqliteDb(): Promise<Database> {
         throw new Error('Database quick_check failed');
       }
 
-      // Automatic verified startup safety backup
-      try {
-        const backupPath = _createDatabaseBackupUnlocked('startup');
-        sqliteHealthMeta.lastBackupPath = backupPath;
-        sqliteHealthMeta.lastBackupVerifiedAt = new Date().toISOString();
-        sqliteHealthMeta.lastBackupStatus = 'VERIFIED';
-        sqliteHealthMeta.lastBackupError = null;
-      } catch (bErr: any) {
-        sqliteHealthMeta.lastBackupStatus = 'FAILED';
-        sqliteHealthMeta.lastBackupError = bErr?.message || String(bErr);
-        recordSystemError('backup', `Automatic startup backup notice: ${sqliteHealthMeta.lastBackupError}`);
-      }
+      // Automatic verified startup safety backup disabled per user request
+      sqliteHealthMeta.lastBackupStatus = 'NONE';
     } catch (e: any) {
       recordSystemError('sqliteDb', `Database integrity recovery triggered: ${e?.message || e}`);
       console.warn(`[SQLite] Database file at ${dbPath} needed recovery (${e?.message || e}), searching backups...`);

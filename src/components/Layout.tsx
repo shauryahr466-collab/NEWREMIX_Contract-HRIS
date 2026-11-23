@@ -155,7 +155,7 @@ export function Layout() {
                   {isActive && (
                     <motion.div
                       layoutId="sidebarActiveIndicator"
-                      className="absolute inset-0 bg-primary rounded-lg shadow-md shadow-primary/30 z-0"
+                      className="absolute inset-0 bg-white rounded-lg shadow-md z-0"
                       transition={{ type: 'spring', stiffness: 350, damping: 30 }}
                     />
                   )}
@@ -166,7 +166,7 @@ export function Layout() {
                       cn(
                         'flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-semibold transition-all duration-200 relative z-10',
                         isActive 
-                          ? 'text-white' 
+                          ? 'text-slate-900 font-bold' 
                           : 'text-slate-400 hover:bg-slate-800/60 hover:text-white'
                       )
                     }

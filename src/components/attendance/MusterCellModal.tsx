@@ -29,7 +29,7 @@ export function MusterCellModal({
   shift,
   rawPunches
 }: MusterCellModalProps) {
-  const { settings, shiftAssignments, setShiftAssignments, addAssignmentLog, quotaExceeded } = useAppStore();
+  const { settings, shiftAssignments, setShiftAssignments, addAssignmentLog } = useAppStore();
 
   if (!isOpen || !employee) return null;
 
@@ -46,7 +46,6 @@ export function MusterCellModal({
   ) : 'DS';
 
   const handleShiftChangeInModal = async (newShiftId: string) => {
-    if (quotaExceeded) return;
 
     const existingIndex = shiftAssignments.findIndex(
       s => s.employeeId === employee.id && s.date === adDateStr

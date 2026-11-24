@@ -39,7 +39,6 @@ function AttendanceReconciliation() {
     assignmentLogs, 
     addAssignmentLog, 
     isInitializing, 
-    quotaExceeded,
     globalSearchTerm,
     openEmployeeProfile
   } = useAppStore();
@@ -205,7 +204,7 @@ function AttendanceReconciliation() {
   };
 
   const handleReconcileHolidays = async () => {
-    if (quotaExceeded || isReconcilingHolidays) return;
+    if (isReconcilingHolidays) return;
     setIsReconcilingHolidays(true);
     try {
       const res = await reconcileHolidaysAndOverlaps();
@@ -227,7 +226,6 @@ function AttendanceReconciliation() {
   };
 
   const handleBulkAssign = async () => {
-    if (quotaExceeded) return;
     if (selectedEmployees.length === 0) return;
     
     const shiftObj = settings.shifts?.find(s => s.id === bulkModal.shiftId);
@@ -307,7 +305,6 @@ function AttendanceReconciliation() {
   };
 
   const handleDeleteSelectedRecords = async () => {
-    if (quotaExceeded) return;
     if (selectedEmployees.length === 0) return;
     
     const punchesToDelete = punches.filter(p => {
@@ -613,7 +610,6 @@ function AttendanceReconciliation() {
   };
 
   const handleDirectShiftChange = async (empId: string, date: string, shiftId: string) => {
-    if (quotaExceeded) return;
     const existingIndex = shiftAssignments.findIndex(
       s => s.employeeId === empId && s.date === date
     );
@@ -788,7 +784,6 @@ function AttendanceReconciliation() {
 
             <Button 
               onClick={() => {
-                if (quotaExceeded) return;
                 if (selectedEmployees.length === 0) {
                   setSelectedEmployees(uniqueEmployeesInFilter);
                 }
@@ -800,7 +795,6 @@ function AttendanceReconciliation() {
                   endDate: endDate
                 });
               }}
-              disabled={quotaExceeded}
               variant="outline"
               size="sm"
               className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800 font-bold hover:bg-indigo-100"
@@ -811,7 +805,6 @@ function AttendanceReconciliation() {
             {selectedEmployees.length > 0 && (
               <Button 
                 onClick={handleDeleteSelectedRecords}
-                disabled={quotaExceeded}
                 variant="danger"
                 size="sm"
               >
@@ -1694,7 +1687,7 @@ function AttendanceReconciliation() {
                 <Button
                   size="sm"
                   onClick={handleReconcileHolidays}
-                  disabled={quotaExceeded || isReconcilingHolidays || isLoadingHolidayReport}
+                  disabled={isReconcilingHolidays || isLoadingHolidayReport}
                   className="bg-sky-600 hover:bg-sky-700 text-white font-semibold gap-1.5 whitespace-nowrap"
                 >
                   <ShieldCheck size={14} />

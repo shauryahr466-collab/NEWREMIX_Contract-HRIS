@@ -12,7 +12,7 @@ import { authFetch } from '../lib/authSession';
 import { fetchSystemHealth, verifyBackupFile, testRestoreBackup } from '../lib/localClient';
 
 export function SettingsPage() {
-  const { settings, setSettings, employees, setEmployees, punches, setPunches, shiftAssignments, setShiftAssignments, clearAllData, quotaExceeded } = useAppStore();
+  const { settings, setSettings, employees, setEmployees, punches, setPunches, shiftAssignments, setShiftAssignments, clearAllData } = useAppStore();
   const { executeWithStatus } = useActionStatus();
   const [localSettings, setLocalSettings] = useState(settings);
   const [isWiping, setIsWiping] = useState(false);
@@ -58,10 +58,6 @@ export function SettingsPage() {
   }, [settings]);
 
   const handleSave = async () => {
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
     
     await executeWithStatus(
       {
@@ -96,7 +92,6 @@ export function SettingsPage() {
   const [purgeProgressMessage, setPurgeProgressMessage] = useState('');
 
   const handleClearAllData = async () => {
-    if (quotaExceeded) return;
     if (purgeConfirmationInput.trim().toUpperCase() !== 'DELETE' || isWiping) return;
     
     setIsConfirmingPurge(false);
@@ -143,10 +138,6 @@ export function SettingsPage() {
   };
 
   const handleLoadSampleData = async () => {
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
 
     await executeWithStatus(
       {
@@ -232,10 +223,6 @@ export function SettingsPage() {
   };
 
   const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -296,10 +283,6 @@ export function SettingsPage() {
 
   const handleAddHoliday = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
     const cleanDate = newHolidayDate.trim();
     const cleanName = newHolidayName.trim();
     if (!cleanDate || !cleanName) {
@@ -333,10 +316,6 @@ export function SettingsPage() {
   };
 
   const handleToggleHolidayLock = async (dateToToggle: string) => {
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
     const nextHolidays = (localSettings.holidays || []).map(h =>
       h.date === dateToToggle ? { ...h, preventPunches: !h.preventPunches } : h
     );
@@ -350,10 +329,6 @@ export function SettingsPage() {
   };
 
   const handleHolidayPolicyChange = async (policy: HolidayPunchPolicy) => {
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
     const updatedSettings = {
       ...localSettings,
       holidayPunchPolicy: policy
@@ -364,10 +339,6 @@ export function SettingsPage() {
   };
 
   const handleRemoveHoliday = async (dateToRemove: string) => {
-    if (quotaExceeded) {
-      toast.error('Database write limit reached.');
-      return;
-    }
     const nextHolidays = (localSettings.holidays || []).filter(h => h.date !== dateToRemove);
     const updatedSettings = {
       ...localSettings,
@@ -662,7 +633,6 @@ export function SettingsPage() {
                    <select
                      value={localSettings.holidayPunchPolicy || 'prevent_overlaps'}
                      onChange={e => handleHolidayPolicyChange(e.target.value as HolidayPunchPolicy)}
-                     disabled={quotaExceeded}
                      className="w-full h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-xs font-semibold text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500/30"
                    >
                      <option value="prevent_overlaps">Prevent Punch Overlaps & Cross-Source Collisions (Auto-Mark PH / Worked PPH)</option>
@@ -705,7 +675,7 @@ export function SettingsPage() {
                    </label>
                  </div>
                  <div className="sm:col-span-3">
-                   <Button type="submit" className="w-full gap-1.5 whitespace-nowrap" disabled={quotaExceeded}>
+                   <Button type="submit" className="w-full gap-1.5 whitespace-nowrap">
                      <Plus size={14} /> Add Holiday
                    </Button>
                  </div>
@@ -740,7 +710,7 @@ export function SettingsPage() {
                                  <input
                                    type="checkbox"
                                    checked={isLocked}
-                                   disabled={quotaExceeded || localSettings.holidayPunchPolicy === 'block_all'}
+                                   disabled={localSettings.holidayPunchPolicy === 'block_all'}
                                    onChange={() => handleToggleHolidayLock(h.date)}
                                    className="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
                                  />
@@ -755,7 +725,6 @@ export function SettingsPage() {
                                  variant="ghost"
                                  size="sm"
                                  onClick={() => handleRemoveHoliday(h.date)}
-                                 disabled={quotaExceeded}
                                  className="h-7 px-2 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
                                >
                                  <Trash2 size={13} />
@@ -811,15 +780,10 @@ export function SettingsPage() {
                    variant="danger" 
                    className="w-full gap-2" 
                    onClick={() => setIsConfirmingPurge(true)}
-                   disabled={quotaExceeded || isWiping}
+                   disabled={isWiping}
                  >
                    <Trash2 size={14} /> {isWiping ? 'Wiping...' : 'Purge All Data'}
                  </Button>
-                 {quotaExceeded && (
-                   <div className="p-2 bg-red-50 dark:bg-red-900/10 rounded-lg text-[9px] text-red-600 font-bold uppercase tracking-wider text-center">
-                     Database Write-Locked
-                   </div>
-                 )}
               </div>
            </Card>
 

@@ -11,14 +11,10 @@ import {
   Filter,
   Info,
   LayoutDashboard,
-  Loader2,
-  ShieldCheck,
-  TrendingUp
+  ShieldCheck
 } from 'lucide-react';
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { toast } from 'sonner';
-import { googleSignIn, getAccessToken } from '../lib/firebase';
-import { appendDataToSheet, createSpreadsheet, formatSpreadsheet } from '../lib/sheets';
 import { MultiSelect } from '../components/MultiSelect';
 import { Button, Card, Input, PageHeader } from '../components/ui';
 import { cn } from '../lib/utils';
@@ -574,54 +570,6 @@ export function Reports() {
     }
   };
 
-  const [isSyncing, setIsSyncing] = useState(false);
-  const handleSyncToSheets = async () => {
-    const rawObjects = reportType === 'zk_biodata'
-      ? zkBioRows.map(r => ({
-          'Employee No.': r.employeeNo,
-          'Name': r.name,
-          'Department': r.department,
-          'Section': r.section,
-          'BS Date': r.bsDate,
-          'Date': r.formattedDate,
-          'Time Sequence': r.timeString
-        }))
-      : getExportObjects();
-
-    if (rawObjects.length === 0) {
-      toast.error('No data available for the selected filters.');
-      return;
-    }
-
-    setIsSyncing(true);
-    try {
-      let token = await getAccessToken();
-      if (!token) {
-        const result = await googleSignIn();
-        if (!result) return;
-        token = result.accessToken;
-      }
-
-      const ss = await createSpreadsheet(token, `${settings.companyName} - ${docMeta.reportTitle} (${startDate} to ${endDate})`);
-      const spreadsheetId = ss.spreadsheetId;
-      const headers = Object.keys(rawObjects[0]);
-      const rows = rawObjects.map(obj => headers.map(h => obj[h] ?? ''));
-      await appendDataToSheet(token, spreadsheetId, 'Sheet1!A1', [headers, ...rows]);
-      const sheetId = ss.sheets[0].properties.sheetId;
-      await formatSpreadsheet(token, spreadsheetId, sheetId, rows.length + 1, headers.length);
-      toast.success('ISO Report synced to Google Sheets.', {
-        action: {
-          label: 'Open',
-          onClick: () => window.open(`https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`, '_blank')
-        }
-      });
-    } catch (error: any) {
-      toast.error(`Sync failed: ${error.message}`);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
   return (
     <div className="space-y-5">
       <PageHeader
@@ -889,10 +837,6 @@ export function Reports() {
               </div>
               <Button variant="outline" onClick={handlePrintPDF} className="w-full gap-1.5 h-9 text-xs">
                 <FileText size={14} /> Export ISO 216 A4 PDF
-              </Button>
-              <Button onClick={handleSyncToSheets} disabled={isSyncing} variant="success" className="w-full gap-1.5 h-9 text-xs">
-                {isSyncing ? <Loader2 size={14} className="animate-spin" /> : <TrendingUp size={14} />}
-                Sync to Google Sheets
               </Button>
             </div>
           </Card>

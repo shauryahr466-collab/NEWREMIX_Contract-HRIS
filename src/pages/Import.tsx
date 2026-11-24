@@ -18,7 +18,7 @@ export function Import() {
   const { 
     punches, setPunches, deletePunch, deletePunchBatch, clearPunches, 
     employees, setEmployees, settings, shiftAssignments, setShiftAssignments, 
-    calculationSource, setCalculationSource, quotaExceeded, recalculate 
+    calculationSource, setCalculationSource, recalculate 
   } = useAppStore();
 
   const { executeWithStatus } = useActionStatus();
@@ -976,28 +976,16 @@ export function Import() {
                </Button>
              </div>
 
-             {quotaExceeded && (
-               <div className="mb-6 p-4 bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/20 rounded-xl flex gap-3 items-start">
-                 <AlertCircle size={18} className="text-red-600 mt-0.5" />
-                 <div>
-                   <p className="text-xs font-bold text-red-900 dark:text-red-400">Database Write-Lock Active</p>
-                   <p className="text-[10px] text-red-700 dark:text-red-500 mt-1">You have reached the daily write limit. Importing new records is disabled.</p>
-                 </div>
-               </div>
-             )}
-
              <div 
                className={cn(
                  "border-2 border-dashed rounded-xl p-12 text-center transition-all",
-                 isDragging ? "border-primary bg-primary/5" : "border-slate-200 dark:border-slate-800 hover:border-primary/50 bg-slate-50/50 dark:bg-slate-900/50",
-                 quotaExceeded && "opacity-50 grayscale cursor-not-allowed"
+                 isDragging ? "border-primary bg-primary/5" : "border-slate-200 dark:border-slate-800 hover:border-primary/50 bg-slate-50/50 dark:bg-slate-900/50"
                )}
-               onDragOver={(e) => { e.preventDefault(); if (!quotaExceeded) setIsDragging(true); }}
+               onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
                onDragLeave={() => setIsDragging(false)}
                onDrop={(e) => {
                  e.preventDefault();
                  setIsDragging(false);
-                 if (quotaExceeded) return;
                  if (e.dataTransfer.files && e.dataTransfer.files[0]) {
                    setFile(e.dataTransfer.files[0]);
                    setStatus('idle');
@@ -1020,14 +1008,10 @@ export function Import() {
                   className="hidden" 
                   accept=".xlsx, .xls, .csv" 
                   onChange={handleFileChange}
-                  disabled={quotaExceeded}
                 />
                 <label 
                   htmlFor="file-upload" 
-                  className={cn(
-                    "inline-flex items-center px-6 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all cursor-pointer",
-                    quotaExceeded ? "bg-slate-100 text-slate-400" : "bg-primary text-white hover:bg-primary-dark shadow-lg shadow-primary/20"
-                  )}
+                  className="inline-flex items-center px-6 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all cursor-pointer bg-primary text-white hover:bg-primary-dark shadow-lg shadow-primary/20"
                 >
                   {file ? 'Change File' : 'Select File'}
                 </label>
@@ -1052,7 +1036,7 @@ export function Import() {
                 </Button>
                 <Button 
                   onClick={processFile} 
-                  disabled={!file || status === 'processing' || status === 'success' || quotaExceeded}
+                  disabled={!file || status === 'processing' || status === 'success'}
                   className="px-8"
                 >
                   {status === 'processing' ? 'Processing...' : 'Upload & Process'}

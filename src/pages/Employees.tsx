@@ -29,7 +29,6 @@ export function Employees() {
     updateEmployee, 
     addEmployee, 
     settings, 
-    quotaExceeded,
     globalSearchTerm,
     openEmployeeProfile,
     recalculate,
@@ -439,10 +438,6 @@ export function Employees() {
   // Form Submit with Master Data Confirmation
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (quotaExceeded) {
-      toast.error('Cannot save: Database write limit reached.');
-      return;
-    }
 
     const newErrors: { [key: string]: string } = {};
     if (!formData.id?.trim()) newErrors.id = 'Employee ID is required';
@@ -922,7 +917,7 @@ export function Employees() {
 
   // Bulk Operations
   const handleBulkShiftUpdate = async () => {
-    if (quotaExceeded || !bulkShiftId || selectedEmployees.length === 0) return;
+    if (!bulkShiftId || selectedEmployees.length === 0) return;
     const shift = settings.shifts?.find(s => s.id === bulkShiftId);
     const updatedEmployees = employees.map(emp => 
       selectedEmployees.includes(emp.id) ? { ...emp, shiftId: bulkShiftId } : emp
@@ -935,7 +930,7 @@ export function Employees() {
   };
 
   const handleBulkStatusToggle = async () => {
-    if (quotaExceeded || selectedEmployees.length === 0) return;
+    if (selectedEmployees.length === 0) return;
     const updatedEmployees = employees.map(emp => {
       if (selectedEmployees.includes(emp.id)) {
         return { 
@@ -952,7 +947,7 @@ export function Employees() {
   };
 
   const handleBulkOtToggle = async () => {
-    if (quotaExceeded || selectedEmployees.length === 0) return;
+    if (selectedEmployees.length === 0) return;
     const updatedEmployees = employees.map(emp => {
       if (selectedEmployees.includes(emp.id)) {
         const nextOt = !(emp.otEligible !== false);
@@ -1297,11 +1292,6 @@ export function Employees() {
   const handleExecuteImport = async () => {
     if (!importPreview || importPreview.parsedEmps.length === 0) {
       toast.error("No valid employee records to import");
-      return;
-    }
-
-    if (quotaExceeded) {
-      toast.error('Cannot import: Database write limit reached.');
       return;
     }
 

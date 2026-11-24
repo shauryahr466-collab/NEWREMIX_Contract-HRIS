@@ -39,7 +39,7 @@ export function Layout() {
     settings, selectedEmployeeId, employees, 
     openEmployeeProfile, closeEmployeeProfile, 
     theme, setTheme, globalSearchTerm, setGlobalSearchTerm, 
-    recalculate, refreshZkTablesFromSqlite, isInitializing, quotaExceeded, resetError,
+    recalculate, refreshZkTablesFromSqlite, isInitializing,
     setIsOtpVerified, user, setUser, setIsAdmin,
     isSuperAdmin, effectiveUserProfile, previewUserProfile, setPreviewUserProfile,
     setCurrentUserProfile, canAccessModule
@@ -93,27 +93,6 @@ export function Layout() {
 
   return (
     <div className="flex h-screen bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 font-sans overflow-hidden transition-colors duration-300">
-      <AnimatePresence>
-        {quotaExceeded && (
-          <motion.div 
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            className="fixed top-0 left-0 right-0 z-[100] bg-rose-600 text-white py-2 px-4 flex items-center justify-center gap-3 shadow-lg"
-          >
-            <ShieldAlert size={16} className="shrink-0" />
-            <p className="text-[10px] font-black uppercase tracking-widest text-center">
-              Write Quota Exceeded - System in Read-Only Mode. Please wait for daily reset.
-            </p>
-            <button 
-              onClick={resetError}
-              className="ml-4 p-1 hover:bg-white/10 rounded transition-colors"
-            >
-              <Search size={12} className="rotate-45" />
-            </button>
-          </motion.div>
-        )}
-      </AnimatePresence>
       {/* Desktop Sidebar */}
       <aside 
         className={cn(

@@ -3,7 +3,6 @@ import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment
 import type { FieldAttendanceRecord } from '../types/attendanceAudit';
 import { processPunches, detectExceptions } from '../lib/engine';
 import { generatePayrollRun, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
-import { db, auth } from '../lib/firebase';
 import { logAdminOverride, normalizeAuditLog } from '../lib/audit';
 import { normalizeEmployeeId } from '../lib/utils';
 import { isEmployeeInUserScope, normalizeSystemUser } from '../lib/accessControl';
@@ -11,43 +10,6 @@ import { saveLocalTable, saveLocalTableDetailed, fetchLocalTable, fetchLocalBoot
 import { authFetch, clearInMemorySession, registerUnauthorizedHandler } from '../lib/authSession';
 import { buildHolidayMasterMap, validatePunchesAgainstHolidays, validateForceAttendanceAgainstHolidays } from '../lib/holidayValidation';
 import { toast } from 'sonner';
-// Local SQLite-only no-op shims replacing firebase/firestore so zero gRPC Listen/Write streams are opened
-const collection = (_db: any, path: string) => ({ path });
-const doc = (_db: any, path: string, id?: string) => ({ path: id ? `${path}/${id}` : path, id: id || path });
-const query = (ref: any, ..._args: any[]) => ref;
-const limit = (_n: number) => ({});
-const orderBy = (_f: string, _d?: string) => ({});
-const where = (_f: string, _op: string, _v: any) => ({});
-const onSnapshot = (_ref: any, _onNext?: any, _onError?: any) => () => {};
-const setDoc = async (_ref: any, _data: any, _opts?: any) => {};
-const getDoc = async (_ref: any) => ({ exists: () => false, data: () => ({} as any) });
-const deleteDoc = async (_ref: any) => {};
-const getDocs = async (_ref: any) => ({ empty: true, docs: [] as any[], forEach: (_cb: any) => {} });
-const writeBatch = (_db: any) => ({
-  set: (_r: any, _d: any, _o?: any) => {},
-  update: (_r: any, _d: any) => {},
-  delete: (_r: any) => {},
-  commit: async () => {}
-});
-
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-  }
-}
 
 interface StoreState {
   employees: Employee[];
@@ -76,8 +38,6 @@ interface StoreState {
   previewUserProfile: SystemUser | null;
   effectiveUserProfile: SystemUser | null;
   selectedEmployeeId: string | null;
-  lastError: string | null;
-  quotaExceeded: boolean;
   theme: 'light' | 'dark';
   globalSearchTerm: string;
   isOtpVerified: boolean;
@@ -215,8 +175,6 @@ interface StoreState {
   setCalculationSource: (source: 'all' | 'standard' | 'multi-time') => void;
   recalculate: () => Promise<void>;
   clearAllData: (onProgress?: (msg: string) => void) => Promise<void>;
-  resetError: () => void;
-  reportError: (error: unknown, operationType?: OperationType, path?: string | null) => void;
 }
 
 const StoreContext = createContext<StoreState | undefined>(undefined);
@@ -293,7 +251,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [previewUserProfile, setPreviewUserProfile] = useState<SystemUser | null>(null);
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string | null>(null);
   const [isInitializing, setIsInitializing] = useState(false);
-  const [lastError, setLastError] = useState<string | null>(null);
   const [theme, setThemeState] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('theme');
     return (saved as 'light' | 'dark') || 'light';
@@ -398,56 +355,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [theme]);
 
-  const quotaExceeded = useMemo(() => 
-    lastError?.toLowerCase().includes('quota') || 
-    lastError?.toLowerCase().includes('resource-exhausted'), 
-  [lastError]);
-
-  const checkQuota = useCallback(() => {
-    return !quotaExceeded;
-  }, [quotaExceeded]);
-
-  const handleFirestoreError = useCallback((error: any, operationType: OperationType, path: string | null) => {
-    const code = error?.code || '';
-    const message = error instanceof Error ? error.message : String(error);
-    
-    // Explicitly check for Firestore resource-exhausted code
-    const isQuotaError = 
-      code === 'resource-exhausted' || 
-      message.toLowerCase().includes('quota') || 
-      message.toLowerCase().includes('resource-exhausted');
-
-    const isOfflineOrUnavailable = 
-      code === 'unavailable' || 
-      message.toLowerCase().includes('unavailable') || 
-      message.toLowerCase().includes('could not reach cloud firestore');
-
-    if (isOfflineOrUnavailable) {
-      // Local mode takes precedence; suppress alarming offline warnings
-      return new Error('Offline mode: Local SQLite database in use.');
-    }
-    
-    const displayMessage = isQuotaError 
-      ? "Firestore Quota Exceeded. Free daily write limit reached (20,000 writes/day). System is operating smoothly in Local Mode until midnight UTC reset."
-      : message;
-
-    const errInfo: FirestoreErrorInfo = {
-      error: displayMessage,
-      authInfo: {
-        userId: auth.currentUser?.uid,
-        email: auth.currentUser?.email,
-      },
-      operationType,
-      path
-    };
-    
-    console.warn('Firestore Note: ', JSON.stringify(errInfo));
-    if (isQuotaError) {
-      setLastError(displayMessage);
-    }
-    return new Error(displayMessage);
-  }, []);
-
   const refreshPunchesFromSqlite = useCallback(async (showToast = false): Promise<number> => {
     try {
       const freshPunches = await fetchLocalTable<RawPunch>('punches');
@@ -459,10 +366,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
       return normalized.length;
     } catch (e) {
-      handleFirestoreError(e, OperationType.LIST, 'punches');
+      console.warn('SQLite punches refresh note:', e);
       return 0;
     }
-  }, [computePunchesDigest, handleFirestoreError]);
+  }, [computePunchesDigest]);
 
   const fetchPunches = useCallback(async () => {
     await refreshPunchesFromSqlite(false);
@@ -771,66 +678,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (updatedDoc) saveLocalTable('employees', updatedDoc);
       return updatedList;
     });
-    if (checkQuota()) {
-      try {
-        const existing = employees.find(e => e.id === id);
-        if (existing) {
-          await setDoc(doc(db, 'employees', id), { ...existing, ...data });
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, `employees/${id}`);
-      }
-    }
-  }, [employees, handleFirestoreError, checkQuota]);
+  }, []);
 
   const addEmployee = useCallback(async (data: Employee) => {
     setEmployeesState(prev => [...prev.filter(e => e.id !== data.id), data]);
-    saveLocalTable('employees', data);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'employees', data.id), data);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, `employees/${data.id}`);
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    await saveLocalTable('employees', data);
+  }, []);
 
   const deleteEmployeesBatch = useCallback(async (ids: string[]) => {
     if (!ids || ids.length === 0) return;
     setEmployeesState(prev => prev.filter(emp => !ids.includes(emp.id)));
-
-    // Await primary local SQLite batch deletion
-    const localRes = await deleteLocalTableDetailed('employees', ids);
-
-    // Optional background cloud sync (guarded by checkQuota & timeout to prevent hangs)
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        const chunks = [];
-        for (let i = 0; i < ids.length; i += batchSize) {
-          chunks.push(ids.slice(i, i + batchSize));
-        }
-        const CONCURRENCY = 3;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            group.map(chunk =>
-              Promise.race([
-                (async () => {
-                  const batch = writeBatch(db);
-                  chunk.forEach(id => batch.delete(doc(db, 'employees', id)));
-                  await batch.commit();
-                })(),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 1000))
-              ])
-            )
-          );
-        }
-      } catch (e) {
-        console.warn('deleteEmployeesBatch cloud sync note:', e);
-      }
-    }
-  }, [checkQuota]);
+    await deleteLocalTableDetailed('employees', ids);
+  }, []);
 
   const addPunch = useCallback(async (data: Omit<RawPunch, 'id'>) => {
     const id = `${data.employeeId}_${data.punchDatetime.replace(/[:.-]/g, '')}`;
@@ -955,41 +814,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       await purgeLocalTable(tbl).catch(() => {});
     }
 
-    const collectionsList = ['employees', 'punches', 'shiftAssignments', 'assignmentLogs', 'exceptions', 'overtime', 'sbl', 'forceAttendance', 'payrollRuns', 'zkDevices', 'zkUserMappings'];
-    for (const coll of collectionsList) {
-      if (onProgress) onProgress(`Purging cloud collection ${coll}...`);
-      try {
-        const q = collection(db, coll);
-        const snapshot = await getDocs(q);
-        const docs = snapshot.docs;
-        const total = docs.length;
-        if (total > 0) {
-          const batchSize = 300;
-          const chunks = [];
-          for (let i = 0; i < total; i += batchSize) {
-            chunks.push(docs.slice(i, i + batchSize));
-          }
-          const CONCURRENCY = 5;
-          for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-            const group = chunks.slice(i, i + CONCURRENCY);
-            await Promise.allSettled(
-              group.map(async (chunk) => {
-                const batch = writeBatch(db);
-                chunk.forEach(d => batch.delete(d.ref));
-                await batch.commit();
-              })
-            );
-          }
-        }
-      } catch (collErr) {
-        console.warn(`Purge coll ${coll} note:`, collErr);
-      }
-    }
-    try {
-      await deleteDoc(doc(db, 'settings', 'config'));
-    } catch (e) {
-      console.warn('Config delete note:', e);
-    }
     window.location.reload();
   }, []);
 
@@ -1004,40 +828,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
     // Save to local SQLite database asynchronously
     saveLocalTable('employees', data).catch(err => console.warn('SQLite employee save note:', err));
-
-    try {
-      const existingMap = new Map(employees.map(e => [e.id, e]));
-      const recordsToWrite = data.filter(newE => {
-        const existing = existingMap.get(newE.id);
-        return !existing || JSON.stringify(existing) !== JSON.stringify(newE);
-      });
-
-      if (recordsToWrite.length === 0) return;
-
-      const total = recordsToWrite.length;
-      const batchSize = 300;
-      const chunks: typeof recordsToWrite[] = [];
-      for (let i = 0; i < total; i += batchSize) {
-        chunks.push(recordsToWrite.slice(i, i + batchSize));
-      }
-
-      const CONCURRENCY = 5;
-      for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const group = chunks.slice(i, i + CONCURRENCY);
-        await Promise.allSettled(
-          group.map(async chunk => {
-            const batch = writeBatch(db);
-            chunk.forEach(emp => {
-              batch.set(doc(db, 'employees', emp.id), emp);
-            });
-            await batch.commit();
-          })
-        );
-      }
-    } catch (e) {
-      console.warn('setEmployees note:', e);
-    }
-  }, [employees]);
+  }, []);
 
   const setPunches = useCallback(async (data: RawPunch[], onProgress?: (msg: string) => void) => {
     const incomingIds = new Set(data.map(p => p.id).filter(Boolean));
@@ -1097,14 +888,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setSettingsState(data);
     saveCache('settings', data);
     await saveLocalTable('settings', [data]);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'settings', 'config'), data);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'settings/config');
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+  }, []);
 
   const setShiftAssignments = useCallback(async (data: ShiftAssignment[]) => {
     let finalList = data;
@@ -1120,44 +904,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
     setShiftAssignmentsState(finalList);
     saveCache('shift_assignments', finalList);
-    saveLocalTable('shift_assignments', data);
-    if (checkQuota()) {
-      try {
-        const existingMap = new Map(shiftAssignments.map(a => [`${a.employeeId}_${a.date}`, a]));
-        const recordsToWrite = data.filter(newA => {
-          const id = `${newA.employeeId}_${newA.date}`;
-          const existing = existingMap.get(id);
-          return !existing || JSON.stringify(existing) !== JSON.stringify(newA);
-        });
-
-        if (recordsToWrite.length === 0) return;
-
-        const total = recordsToWrite.length;
-        const batchSize = 500;
-        const chunks: typeof recordsToWrite[] = [];
-        for (let i = 0; i < total; i += batchSize) {
-          chunks.push(recordsToWrite.slice(i, i + batchSize));
-        }
-
-        const CONCURRENCY = 4;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.all(
-            group.map(chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(a => {
-                const id = `${a.employeeId}_${a.date}`;
-                batch.set(doc(db, 'shiftAssignments', id), a);
-              });
-              return batch.commit();
-            })
-          );
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'shiftAssignments');
-      }
-    }
-  }, [shiftAssignments, handleFirestoreError, checkQuota]);
+    await saveLocalTable('shift_assignments', data);
+  }, [shiftAssignments, effectiveUserProfile, employees]);
 
   const addAssignmentLog = useCallback(async (employeeId: string, date: string, shiftId: string, action: AssignmentLog['action']) => {
     const shift = settings.shifts?.find(s => s.id === shiftId);
@@ -1171,14 +919,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       action
     };
     setAssignmentLogsState(prev => [newLog, ...prev]);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'assignmentLogs', newLog.id), newLog);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'assignmentLogs');
-      }
-    }
-  }, [settings.shifts, handleFirestoreError, checkQuota]);
+    saveLocalTable('assignment_logs', [newLog]).catch(err => console.warn('SQLite assignment log save note:', err));
+  }, [settings.shifts]);
 
   const addAuditLog = useCallback(async (log: Omit<AuditLog, 'id' | 'timestamp'>) => {
     const newLog: AuditLog = normalizeAuditLog({
@@ -1192,14 +934,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return updated;
     });
     saveLocalTable('audit_logs', [newLog]);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'auditLogs', newLog.id), newLog);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'auditLogs');
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+  }, []);
 
   const updateException = useCallback(async (id: string, data: Partial<AttendanceException>) => {
     setExceptionsState(prev => {
@@ -1208,33 +943,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (target) saveLocalTable('exceptions', [target]);
       return updated;
     });
-    if (checkQuota()) {
-      try {
-        const existing = exceptions.find(ex => ex.id === id);
-        if (existing) {
-          await setDoc(doc(db, 'exceptions', id), { ...existing, ...data });
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, `exceptions/${id}`);
-      }
-    }
-  }, [exceptions, handleFirestoreError, checkQuota]);
+  }, []);
 
   const setExceptionsBatch = useCallback(async (data: AttendanceException[]) => {
     setExceptionsState(data);
-    saveLocalTable('exceptions', data);
-    if (checkQuota()) {
-      try {
-        const batch = writeBatch(db);
-        data.forEach(ex => {
-          batch.set(doc(db, 'exceptions', ex.id), ex);
-        });
-        await batch.commit();
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'exceptions/batch');
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    await saveLocalTable('exceptions', data);
+  }, []);
 
   const updateOvertime = useCallback(async (id: string, data: Partial<OvertimeRecord>) => {
     setOvertimeRecordsState(prev => {
@@ -1243,31 +957,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (target) saveLocalTable('overtime', [target]);
       return updated;
     });
-    if (checkQuota()) {
-      try {
-        const existing = overtimeRecords.find(r => r.id === id);
-        if (existing) {
-          await setDoc(doc(db, 'overtime', id), { ...existing, ...data });
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, `overtime/${id}`);
-      }
-    }
-  }, [overtimeRecords, handleFirestoreError, checkQuota]);
+  }, []);
 
   const addOvertime = useCallback(async (data: Omit<OvertimeRecord, 'id'>) => {
     const id = `ot_${Math.random().toString(36).substr(2, 9)}`;
     const newRecord = { ...data, id };
     setOvertimeRecordsState(prev => [newRecord, ...prev]);
-    saveLocalTable('overtime', [newRecord]);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'overtime', id), newRecord);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'overtime');
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    await saveLocalTable('overtime', [newRecord]);
+  }, []);
 
   const setOvertimeBatch = useCallback(async (records: OvertimeRecord[]) => {
     if (records.length === 0) return;
@@ -1281,32 +978,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     saveLocalTable('overtime', records).catch(err => console.warn('SQLite overtime batch save note:', err));
-
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        const chunks: OvertimeRecord[][] = [];
-        for (let i = 0; i < records.length; i += batchSize) {
-          chunks.push(records.slice(i, i + batchSize));
-        }
-        const CONCURRENCY = 5;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            group.map(async chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(r => {
-                batch.set(doc(db, 'overtime', r.id), r);
-              });
-              await batch.commit();
-            })
-          );
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'overtime/batch');
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+  }, []);
 
   const deleteOvertimeBatch = useCallback(async (ids: string[]) => {
     if (ids.length === 0) return;
@@ -1318,32 +990,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     deleteLocalTableRecords('overtime', ids).catch(err => console.warn('SQLite overtime delete note:', err));
-
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        const chunks: string[][] = [];
-        for (let i = 0; i < ids.length; i += batchSize) {
-          chunks.push(ids.slice(i, i + batchSize));
-        }
-        const CONCURRENCY = 5;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            group.map(async chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(id => {
-                batch.delete(doc(db, 'overtime', id));
-              });
-              await batch.commit();
-            })
-          );
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, 'overtime/batch_delete');
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+  }, []);
 
   const updateSBL = useCallback(async (id: string, data: Partial<SBLRecord>) => {
     setSblRecordsState(prev => {
@@ -1352,31 +999,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (target) saveLocalTable('sbl', [target]);
       return updated;
     });
-    if (checkQuota()) {
-      try {
-        const existing = sblRecords.find(r => r.id === id);
-        if (existing) {
-          await setDoc(doc(db, 'sbl', id), { ...existing, ...data });
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, `sbl/${id}`);
-      }
-    }
-  }, [sblRecords, handleFirestoreError, checkQuota]);
+  }, []);
 
   const addSBL = useCallback(async (data: Omit<SBLRecord, 'id'>) => {
     const id = `sbl_${Math.random().toString(36).substr(2, 9)}`;
     const newRecord = { ...data, id };
     setSblRecordsState(prev => [newRecord, ...prev]);
-    saveLocalTable('sbl', [newRecord]);
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'sbl', id), newRecord);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'sbl');
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    await saveLocalTable('sbl', [newRecord]);
+  }, []);
 
   const setSBLBatch = useCallback(async (records: SBLRecord[]) => {
     if (records.length === 0) return;
@@ -1390,32 +1020,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     saveLocalTable('sbl', records).catch(err => console.warn('SQLite sbl batch save note:', err));
-
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        const chunks: SBLRecord[][] = [];
-        for (let i = 0; i < records.length; i += batchSize) {
-          chunks.push(records.slice(i, i + batchSize));
-        }
-        const CONCURRENCY = 5;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            group.map(async chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(r => {
-                batch.set(doc(db, 'sbl', r.id), r);
-              });
-              await batch.commit();
-            })
-          );
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, 'sbl/batch');
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+  }, []);
 
   const deleteSBLBatch = useCallback(async (ids: string[]) => {
     if (ids.length === 0) return;
@@ -1427,32 +1032,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     deleteLocalTableRecords('sbl', ids).catch(err => console.warn('SQLite sbl delete note:', err));
-
-    if (checkQuota()) {
-      try {
-        const batchSize = 300;
-        const chunks: string[][] = [];
-        for (let i = 0; i < ids.length; i += batchSize) {
-          chunks.push(ids.slice(i, i + batchSize));
-        }
-        const CONCURRENCY = 5;
-        for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-          const group = chunks.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            group.map(async chunk => {
-              const batch = writeBatch(db);
-              chunk.forEach(id => {
-                batch.delete(doc(db, 'sbl', id));
-              });
-              await batch.commit();
-            })
-          );
-        }
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, 'sbl/batch_delete');
-      }
-    }
-  }, [checkQuota, handleFirestoreError]);
+  }, []);
 
   const deleteOvertime = useCallback(async (id: string) => {
     setOvertimeRecordsState(prev => {
@@ -1460,15 +1040,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       saveCache('overtime', filtered);
       return filtered;
     });
-    deleteLocalTableRecords('overtime', [id]);
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'overtime', id));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `overtime/${id}`);
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    await deleteLocalTableRecords('overtime', [id]);
+  }, []);
 
   const deleteSBL = useCallback(async (id: string) => {
     setSblRecordsState(prev => {
@@ -1476,15 +1049,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       saveCache('sbl', filtered);
       return filtered;
     });
-    deleteLocalTableRecords('sbl', [id]);
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'sbl', id));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `sbl/${id}`);
-      }
-    }
-  }, [handleFirestoreError, checkQuota]);
+    await deleteLocalTableRecords('sbl', [id]);
+  }, []);
 
   // Movement Handlers
   const recordSeparation = useCallback(async (data: {
@@ -1769,14 +1335,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const updated = { ...existing, ...updates };
       saveLocalTable('employee_movements', [updated]).catch(err => console.warn('SQLite movement update note:', err));
     }
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'employee_movements', id), updates, { merge: true });
-      } catch (e) {
-        handleFirestoreError(e, OperationType.UPDATE, `employee_movements/${id}`);
-      }
-    }
-  }, [movements, checkQuota, handleFirestoreError]);
+  }, [movements]);
 
   const deleteMovement = useCallback(async (id: string) => {
     const existing = movements.find(m => m.id === id);
@@ -1811,14 +1370,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return updated;
     });
     deleteLocalTableRecords('employee_movements', [id]).catch(err => console.warn('SQLite movement delete note:', err));
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'employee_movements', id));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `employee_movements/${id}`);
-      }
-    }
-  }, [movements, employees, checkQuota, handleFirestoreError]);
+  }, [movements, employees]);
 
   const setMovementsBatch = useCallback(async (newMovements: EmployeeMovement[]) => {
     setMovementsState(newMovements);
@@ -1858,23 +1410,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       field: 'Attendance Override',
       oldValue: 'Calculated',
       newValue: `${data.inTime} - ${data.outTime}`,
-      changedBy: data.approvedBy || auth.currentUser?.email?.split('@')[0] || 'Admin',
+      changedBy: data.approvedBy || user?.email?.split('@')[0] || 'Admin',
       remarks: data.remarks || data.reason
     });
 
-    if (checkQuota()) {
-      try {
-        await setDoc(doc(db, 'forceAttendance', id), newRecord);
-        await logAdminOverride(
-          auth.currentUser?.email || 'unknown@admin.com',
-          { status: 'Calculated' },
-          { status: 'Forced', inTime: data.inTime, outTime: data.outTime, reason: data.reason }
-        );
-      } catch (e) {
-        handleFirestoreError(e, OperationType.CREATE, 'forceAttendance');
-      }
-    }
-  }, [handleFirestoreError, checkQuota, employees, addAuditLog, settings.holidays, settings.holidayPunchPolicy, punches]);
+    await logAdminOverride(
+      user?.email || 'Admin',
+      { status: 'Calculated' },
+      { status: 'Forced', inTime: data.inTime, outTime: data.outTime, reason: data.reason }
+    );
+  }, [user, employees, addAuditLog, settings.holidays, settings.holidayPunchPolicy, punches]);
 
   const createPayrollRun = useCallback(async (
     month: string, 
@@ -1887,7 +1432,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       throw new Error(`Payroll run for ${existingForMonth.monthName} is ${existingForMonth.status} and cannot be recalculated.`);
     }
 
-    const createdBy = user?.email || auth.currentUser?.email || 'System Admin';
+    const createdBy = user?.email || 'System Admin';
     const activeConfig = settings.payrollConfig || DEFAULT_PAYROLL_CONFIG;
     const run = generatePayrollRun(month, employees, processedData, overtimeRecords, createdBy, bsMonthDetails, activeConfig, customDateRange, existingForMonth?.id);
     
@@ -1905,17 +1450,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
     saveLocalTable('payroll_runs', [run]);
 
-    if (checkQuota()) {
-      // Non-blocking firestore sync with safety timeout so local UX never hangs
-      Promise.race([
-        setDoc(doc(db, 'payrollRuns', run.id), run),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
-      ]).catch(e => {
-        handleFirestoreError(e, OperationType.CREATE, `payrollRuns/${month}`);
-      });
-    }
     return run;
-  }, [checkQuota, user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig, handleFirestoreError]);
+  }, [user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig]);
 
   const recalculatePayrollRun = useCallback(async (runId: string) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -1925,7 +1461,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       throw new Error(`Payroll run for ${existingRun.monthName} is ${existingRun.status} and cannot be recalculated.`);
     }
 
-    const createdBy = existingRun.createdBy || user?.email || auth.currentUser?.email || 'System Admin';
+    const createdBy = existingRun.createdBy || user?.email || 'System Admin';
     const activeConfig = settings.payrollConfig || DEFAULT_PAYROLL_CONFIG;
     const customDateRange = (existingRun.startDate && existingRun.endDate) ? { startDate: existingRun.startDate, endDate: existingRun.endDate } : undefined;
     
@@ -1947,16 +1483,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
     saveLocalTable('payroll_runs', [updatedRun]);
 
-    if (checkQuota()) {
-      Promise.race([
-        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
-      ]).catch(e => {
-        handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      });
-    }
     return updatedRun;
-  }, [checkQuota, user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig, handleFirestoreError]);
+  }, [user, employees, processedData, overtimeRecords, payrollRuns, settings.payrollConfig]);
 
   const updatePayrollRecord = useCallback(async (runId: string, recordId: string, updates: Partial<PayrollRecord>) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -2045,16 +1573,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
     setPayrollRunsState(prev => prev.map(r => r.id === runId ? updatedRun : r));
     saveLocalTable('payroll_runs', [updatedRun]);
-
-    if (checkQuota()) {
-      Promise.race([
-        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
-      ]).catch(e => {
-        handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      });
-    }
-  }, [checkQuota, employees, payrollRuns, settings.payrollConfig, handleFirestoreError]);
+  }, [employees, payrollRuns, settings.payrollConfig]);
 
   const approvePayrollRun = useCallback(async (runId: string) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -2064,7 +1583,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       ...existingRun,
       status: 'Approved',
       approvedAt: new Date().toISOString(),
-      approvedBy: user?.email || auth.currentUser?.email || 'Admin'
+      approvedBy: user?.email || 'Admin'
     };
 
     setPayrollRunsState(prev => prev.map(r => r.id === runId ? updatedRun : r));
@@ -2080,16 +1599,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       changedBy: user?.email || 'Admin',
       remarks: `Approved payroll run for ${existingRun.monthName} (Total Net: NPR ${existingRun.totalNetSalary.toLocaleString()})`
     });
-
-    if (checkQuota()) {
-      Promise.race([
-        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
-      ]).catch(e => {
-        handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      });
-    }
-  }, [checkQuota, payrollRuns, user, handleFirestoreError, addAuditLog]);
+  }, [payrollRuns, user, addAuditLog]);
 
   const disbursePayrollRun = useCallback(async (runId: string, method: DisbursementMethod) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -2108,7 +1618,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       ...existingRun,
       status: 'Disbursed',
       disbursedAt: now,
-      disbursedBy: user?.email || auth.currentUser?.email || 'HR Admin',
+      disbursedBy: user?.email || 'HR Admin',
       disbursementMethod: method,
       records: disbursedRecords
     };
@@ -2126,16 +1636,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       changedBy: user?.email || 'HR Admin',
       remarks: `Disbursed ${existingRun.records.length} salaries via ${method} for ${existingRun.monthName}`
     });
-
-    if (checkQuota()) {
-      Promise.race([
-        setDoc(doc(db, 'payrollRuns', runId), updatedRun),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 600))
-      ]).catch(e => {
-        handleFirestoreError(e, OperationType.UPDATE, `payrollRuns/${runId}`);
-      });
-    }
-  }, [checkQuota, payrollRuns, user, handleFirestoreError, addAuditLog]);
+  }, [payrollRuns, user, addAuditLog]);
 
   const deletePayrollRun = useCallback(async (runId: string) => {
     const existingRun = payrollRuns.find(r => r.id === runId);
@@ -2143,7 +1644,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       throw new Error(`Payroll run for ${existingRun.monthName} is ${existingRun.status} and cannot be deleted.`);
     }
     
-    // Register deleted ID marker so onSnapshot never resurrects it
     const deletedRunIds: string[] = JSON.parse(localStorage.getItem('deleted_payroll_run_ids') || '[]');
     if (!deletedRunIds.includes(runId)) {
       deletedRunIds.push(runId);
@@ -2175,15 +1675,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       changedBy: user?.email || 'HR Admin',
       remarks: `Permanently deleted draft payroll run ${existingRun?.monthName || runId}`
     });
-
-    if (checkQuota()) {
-      try {
-        await deleteDoc(doc(db, 'payrollRuns', runId));
-      } catch (e) {
-        handleFirestoreError(e, OperationType.DELETE, `payrollRuns/${runId}`);
-      }
-    }
-  }, [checkQuota, handleFirestoreError, payrollRuns, user, addAuditLog]);
+  }, [payrollRuns, user, addAuditLog]);
 
   // ZKTeco Biometric Device Actions (100% SQLite)
   const addZkDevice = useCallback(async (deviceData: Omit<ZkDevice, 'id'>) => {
@@ -2509,7 +2001,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // Auto-resolve pending unmapped punches ONLY against Active Employees in Directory
   useEffect(() => {
-    if (!isAdmin || employees.length === 0 || zkUnmappedPunches.length === 0 || quotaExceeded) return;
+    if (!isAdmin || employees.length === 0 || zkUnmappedPunches.length === 0) return;
 
     const pending = zkUnmappedPunches.filter(p => !p.status || p.status === 'pending');
     if (pending.length === 0) return;
@@ -2632,7 +2124,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
 
     runAutoResolve();
-  }, [isAdmin, employees, zkUserMappings, zkUnmappedPunches, punches, quotaExceeded, checkQuota, computePunchesDigest]);
+  }, [isAdmin, employees, zkUserMappings, zkUnmappedPunches, punches, computePunchesDigest]);
 
   const clearZkSyncLogs = useCallback(async () => {
     setZkSyncLogsState([]);
@@ -2642,9 +2134,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const recalculate = useCallback(async () => {
-    const tId = toast.loading('Synchronizing system state with local database...');
+    const tId = toast.loading('Synchronizing system state with local SQLite database...');
     try {
-      // 1. Fetch local SQLite database records first to protect local disk state
+      // Fetch local SQLite database records directly
       const [localPunches, localEmps, localSettings, localShifts, localEx, localOt, localSbl, localForce, localPayroll] = await Promise.all([
         fetchLocalTable<RawPunch>('punches'),
         fetchLocalTable<Employee>('employees'),
@@ -2657,44 +2149,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         fetchLocalTable<PayrollRun>('payroll_runs')
       ]);
 
-      // 2. Query Firestore (if available)
-      let fsPunches: RawPunch[] = [];
-      let fsEmps: Employee[] = [];
-      let fsSettings: Settings | null = null;
-      let fsShifts: ShiftAssignment[] = [];
-      let fsEx: AttendanceException[] = [];
-      let fsOt: OvertimeRecord[] = [];
-      let fsSbl: SBLRecord[] = [];
-      let fsForce: ForceAttendanceRecord[] = [];
-      let fsPayroll: PayrollRun[] = [];
-
-      try {
-        const results = await Promise.allSettled([
-          getDocs(collection(db, 'punches')),
-          getDocs(collection(db, 'employees')),
-          getDoc(doc(db, 'settings', 'config')),
-          getDocs(collection(db, 'shiftAssignments')),
-          getDocs(collection(db, 'exceptions')),
-          getDocs(collection(db, 'overtime')),
-          getDocs(collection(db, 'sbl')),
-          getDocs(collection(db, 'forceAttendance')),
-          getDocs(collection(db, 'payrollRuns'))
-        ]);
-
-        if (results[0].status === 'fulfilled') fsPunches = results[0].value.docs.map(d => d.data() as RawPunch);
-        if (results[1].status === 'fulfilled') fsEmps = results[1].value.docs.map(d => d.data() as Employee);
-        if (results[2].status === 'fulfilled' && results[2].value.exists()) fsSettings = results[2].value.data() as Settings;
-        if (results[3].status === 'fulfilled') fsShifts = results[3].value.docs.map(d => d.data() as ShiftAssignment);
-        if (results[4].status === 'fulfilled') fsEx = results[4].value.docs.map(d => d.data() as AttendanceException);
-        if (results[5].status === 'fulfilled') fsOt = results[5].value.docs.map(d => d.data() as OvertimeRecord);
-        if (results[6].status === 'fulfilled') fsSbl = results[6].value.docs.map(d => d.data() as SBLRecord);
-        if (results[7].status === 'fulfilled') fsForce = results[7].value.docs.map(d => d.data() as ForceAttendanceRecord);
-        if (results[8].status === 'fulfilled') fsPayroll = results[8].value.docs.map(d => d.data() as PayrollRun);
-      } catch (fsErr) {
-        console.warn('Firestore optional query note:', fsErr);
-      }
-
-      // 3. Refresh SQLite punches directly
+      // Refresh SQLite punches directly
       const safeLocalPunches = Array.isArray(localPunches) ? localPunches : [];
       lastPunchDigestRef.current = computePunchesDigest(safeLocalPunches);
       setPunchesState(safeLocalPunches);
@@ -2703,16 +2158,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const eMap = new Map<string, Employee>();
         prev.forEach(e => eMap.set(e.id, e));
         (localEmps || []).forEach(e => eMap.set(e.id, e));
-        fsEmps.forEach(e => eMap.set(e.id, e));
         const merged = Array.from(eMap.values());
         saveCache('employees', merged);
         return merged;
       });
 
-      if (fsSettings) {
-        setSettingsState(fsSettings);
-        saveCache('settings', fsSettings);
-      } else if (localSettings && localSettings.length > 0) {
+      if (localSettings && localSettings.length > 0) {
         setSettingsState(localSettings[0]);
         saveCache('settings', localSettings[0]);
       }
@@ -2721,7 +2172,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const map = new Map<string, ShiftAssignment>();
         prev.forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
         (localShifts || []).forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
-        fsShifts.forEach(a => map.set(`${a.employeeId}_${a.date}`, a));
         const merged = Array.from(map.values());
         saveCache('shift_assignments', merged);
         return merged;
@@ -2731,7 +2181,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const map = new Map<string, AttendanceException>();
         prev.forEach(x => map.set(x.id, x));
         (localEx || []).forEach(x => map.set(x.id, x));
-        fsEx.forEach(x => map.set(x.id, x));
         const merged = Array.from(map.values());
         saveCache('exceptions', merged);
         return merged;
@@ -2741,7 +2190,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const map = new Map<string, OvertimeRecord>();
         prev.forEach(r => map.set(r.id, r));
         (localOt || []).forEach(r => map.set(r.id, r));
-        fsOt.forEach(r => map.set(r.id, r));
         const merged = Array.from(map.values());
         saveCache('overtime', merged);
         return merged;
@@ -2751,7 +2199,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const map = new Map<string, SBLRecord>();
         prev.forEach(r => map.set(r.id, r));
         (localSbl || []).forEach(r => map.set(r.id, r));
-        fsSbl.forEach(r => map.set(r.id, r));
         const merged = Array.from(map.values());
         saveCache('sbl', merged);
         return merged;
@@ -2761,7 +2208,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const map = new Map<string, ForceAttendanceRecord>();
         prev.forEach(r => map.set(r.id, r));
         (localForce || []).forEach(r => map.set(r.id, r));
-        fsForce.forEach(r => map.set(r.id, r));
         const merged = Array.from(map.values());
         saveCache('force_attendance', merged);
         return merged;
@@ -2771,7 +2217,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         const map = new Map<string, PayrollRun>();
         prev.forEach(r => map.set(r.id, r));
         (localPayroll || []).forEach(r => map.set(r.id, r));
-        fsPayroll.forEach(r => map.set(r.id, r));
         const merged = Array.from(map.values());
         saveCache('payroll_runs', merged);
         return merged;
@@ -2782,7 +2227,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       toast.error('Sync failed: ' + (e?.message || 'Error syncing data'), { id: tId });
     }
   }, [computePunchesDigest]);
-  const resetError = useCallback(() => setLastError(null), []);
 
   const openEmployeeProfile = useCallback((id: string) => setSelectedEmployeeId(id), []);
   const closeEmployeeProfile = useCallback(() => setSelectedEmployeeId(null), []);
@@ -2839,10 +2283,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setAuditDateRangeState(range);
     saveCache('audit_date_range', range);
   }, []);
-
-  const reportError = useCallback((error: unknown, operationType: OperationType = OperationType.WRITE, path: string | null = null) => {
-    handleFirestoreError(error, operationType, path);
-  }, [handleFirestoreError]);
 
   const allowedEmployeeIds = useMemo(() => {
     if (!effectiveUserProfile || effectiveUserProfile.role === 'Super Admin') return null;
@@ -3014,12 +2454,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     openEmployeeProfile,
     closeEmployeeProfile,
     isInitializing,
-    lastError,
-    quotaExceeded,
     recalculate,
-    clearAllData,
-    resetError,
-    reportError
+    clearAllData
   };
 
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;

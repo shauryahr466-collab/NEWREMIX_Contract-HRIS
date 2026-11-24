@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect, useDeferredValue } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useAppStore } from '../store';
 import { format, parseISO, startOfMonth, endOfMonth, eachDayOfInterval, isSameMonth, isToday, startOfWeek, endOfWeek, addMonths, subMonths, isSameDay, subDays, startOfYesterday, endOfYesterday, subWeeks } from 'date-fns';
-import { Calendar as CalendarIcon, Search, Filter, LayoutList, CalendarDays, ChevronLeft, ChevronRight, UserPlus, RefreshCw, X, Archive, Download, MoreVertical, Clock, Printer, ChevronDown, Wand2, FileText, History, Calculator, Trash2, AlertCircle, Info, Users, UserCheck, UserX, TrendingUp, Upload, ShieldCheck, CheckCircle2 } from 'lucide-react';
+import { Calendar as CalendarIcon, Search, Filter, LayoutList, CalendarDays, ChevronLeft, ChevronRight, UserPlus, RefreshCw, X, Archive, Download, MoreVertical, Clock, ChevronDown, Wand2, FileText, History, Calculator, Trash2, AlertCircle, Info, Users, UserCheck, UserX, TrendingUp, Upload, ShieldCheck, CheckCircle2, ListChecks } from 'lucide-react';
 import { cn, formatAMPM, formatDuration, formatMinutes, normalizeEmployeeId } from '../lib/utils';
 import { getNepaliDate } from '../utils/dateHelper';
 import { toast } from 'sonner';
@@ -22,6 +22,7 @@ import { useActionStatus } from '../context/ActionStatusContext';
 import { saveLocalTableDetailed, fetchHolidayValidationReport, reconcileHolidaysAndOverlaps } from '../lib/localClient';
 import type { HolidayValidationReport } from '../types';
 import { ManualAttendanceImportModal } from '../components/ManualAttendanceImportModal';
+import { exportToCSV } from '../lib/csvExport';
 
 function AttendanceReconciliation() {
   const { 
@@ -417,8 +418,52 @@ function AttendanceReconciliation() {
     setShowDatePresets(false);
   };
 
-  const handlePrint = () => {
-    window.print();
+  const handleExportCSV = () => {
+    if (filteredData.length === 0) {
+      toast.error('No filtered attendance records to export.');
+      return;
+    }
+
+    const sortedData = [...filteredData].sort((a, b) => a.date.localeCompare(b.date));
+    const count = exportToCSV(sortedData, {
+      filename: `Attendance_Filtered_${startDate}_to_${endDate}.csv`,
+      columns: [
+        { header: 'S.No', accessor: (_r, idx) => idx + 1 },
+        { header: 'Date (AD)', accessor: (d) => format(parseISO(d.date), 'yyyy-MM-dd') },
+        { header: 'Date (BS)', accessor: (d) => getNepaliDate(d.date) },
+        { header: 'Day', accessor: (d) => format(parseISO(d.date), 'EEE') },
+        { header: 'Employee ID', accessor: (d) => d.employeeId },
+        {
+          header: 'Employee Name',
+          accessor: (d) => employees.find((e) => e.id === d.employeeId)?.name || '-',
+        },
+        {
+          header: 'Department',
+          accessor: (d) => employees.find((e) => e.id === d.employeeId)?.department || '-',
+        },
+        {
+          header: 'Shift',
+          accessor: (d) => {
+            const emp = employees.find((e) => e.id === d.employeeId);
+            const assigned = shiftAssignments.find((a) => a.employeeId === d.employeeId && a.date === d.date);
+            const shift = settings.shifts?.find((s) => s.id === (assigned?.shiftId || emp?.shiftId));
+            return shift?.name || (d.shiftId === 'DS' ? 'DS' : '-');
+          },
+        },
+        { header: 'In Time', accessor: (d) => (d.firstPunch ? formatAMPM(d.firstPunch) : '-') },
+        {
+          header: 'Out Time',
+          accessor: (d) => (d.lastPunch && d.lastPunch !== d.firstPunch ? formatAMPM(d.lastPunch) : '-'),
+        },
+        { header: 'Late By', accessor: (d) => (d.lateMinutes > 0 ? formatMinutes(d.lateMinutes) : '-') },
+        { header: 'Early Out', accessor: (d) => (d.earlyMinutes > 0 ? formatMinutes(d.earlyMinutes) : '-') },
+        { header: 'Duration', accessor: (d) => formatDuration(d.workingHours) },
+        { header: 'Overtime', accessor: (d) => (d.overtime > 0 ? formatDuration(d.overtime) : '-') },
+        { header: 'Status', accessor: (d) => d.status },
+        { header: 'Remarks', accessor: (d) => d.remarks || '' },
+      ],
+    });
+    toast.success(`Exported ${count} filtered attendance records to CSV.`);
   };
 
   const handleExportPDF = () => {
@@ -751,8 +796,9 @@ function AttendanceReconciliation() {
   return (
     <div className="space-y-6">
       <PageHeader 
-        title="Attendance Tracking" 
+        title="Attendance Reconciliation" 
         description="Monitor daily workforce presence, shift compliance, and biometric synchronization"
+        icon={ListChecks}
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Button 
@@ -812,12 +858,9 @@ function AttendanceReconciliation() {
               </Button>
             )}
             
-            <Button variant="outline" onClick={handlePrint} className="hidden sm:flex">
-              <Printer size={14} /> Print
-            </Button>
-            
             <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
               <Button variant="ghost" size="sm" onClick={handleExportExcel} className="h-8 px-2 text-[11px] font-bold">EXCEL</Button>
+              <Button variant="ghost" size="sm" onClick={handleExportCSV} className="h-8 px-2 text-[11px] font-bold">CSV</Button>
               <Button variant="ghost" size="sm" onClick={handleExportPDF} className="h-8 px-2 text-[11px] font-bold">PDF</Button>
               <Button 
                 variant="ghost" 
@@ -999,6 +1042,22 @@ function AttendanceReconciliation() {
       })()}
 
       <Card className="overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 bg-slate-50/60 dark:bg-slate-900/40 print:hidden">
+          <div className="text-xs font-bold text-slate-600 dark:text-slate-300 flex items-center gap-2">
+            <Clock size={14} className="text-primary" />
+            <span>
+              Filtered Logs: {filteredData.length} records ({startDate} to {endDate})
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="outline" onClick={handleExportCSV} className="gap-1.5">
+              <Download size={13} /> Export to CSV
+            </Button>
+            <Button size="sm" variant="outline" onClick={handleExportExcel} className="gap-1.5">
+              <FileText size={13} /> Export Excel
+            </Button>
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse min-w-[1100px]">
             <thead className="bg-slate-50 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-800">
@@ -1707,74 +1766,11 @@ function AttendanceReconciliation() {
 }
 
 export function Attendance() {
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const currentTab = searchParams.get('tab') || 'reconciliation';
-
-  const handleTabChange = (tab: string) => {
-    setSearchParams({ tab });
-  };
 
   return (
     <div className="space-y-6">
-      <div className="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200/80 dark:border-slate-800 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-black text-slate-900 dark:text-slate-100 flex items-center gap-2">
-            Attendance Management & Muster System
-          </h1>
-          <p className="text-xs text-slate-500 mt-0.5">
-            System-generated attendance reconciliation, Nepali monthly muster, visual calendar & audit verification
-          </p>
-        </div>
-
-        {/* Sub-navigation tabs */}
-        <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800/80 p-1 rounded-xl flex-wrap">
-          <button
-            onClick={() => handleTabChange('reconciliation')}
-            className={cn(
-              "px-3.5 py-2 text-xs font-bold rounded-lg transition-all",
-              currentTab === 'reconciliation'
-                ? "bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-sm"
-                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
-            )}
-          >
-            Attendance Reconciliation
-          </button>
-          <button
-            onClick={() => handleTabChange('muster')}
-            className={cn(
-              "px-3.5 py-2 text-xs font-bold rounded-lg transition-all",
-              currentTab === 'muster'
-                ? "bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-sm"
-                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
-            )}
-          >
-            Monthly Muster
-          </button>
-          <button
-            onClick={() => handleTabChange('calendar')}
-            className={cn(
-              "px-3.5 py-2 text-xs font-bold rounded-lg transition-all",
-              currentTab === 'calendar'
-                ? "bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-sm"
-                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
-            )}
-          >
-            Attendance Calendar
-          </button>
-          <button
-            onClick={() => handleTabChange('audit')}
-            className={cn(
-              "px-3.5 py-2 text-xs font-bold rounded-lg transition-all",
-              currentTab === 'audit'
-                ? "bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-sm"
-                : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
-            )}
-          >
-            Fresh Attendance Audit
-          </button>
-        </div>
-      </div>
-
       {currentTab === 'reconciliation' && <AttendanceReconciliation />}
       {currentTab === 'muster' && <MonthlyMuster />}
       {currentTab === 'calendar' && <AttendanceCalendar />}

@@ -12,7 +12,7 @@ import {
   UserCheck, ShieldCheck, Flag, AlertTriangle, Calendar, Grid, List, Edit3, Save, Layers,
   Trash2, CheckCheck
 } from 'lucide-react';
-import { Card, Button, Input, Modal } from '../ui';
+import { PageHeader, Card, Button, Input, Modal } from '../ui';
 import { 
   formatADToBS, 
   NEPALI_MONTHS, 
@@ -21,6 +21,7 @@ import {
   getNepaliMonthEnglishEquivalent 
 } from '../../utils/nepaliCalendar';
 import { formatAMPM, cn } from '../../lib/utils';
+import { exportToCSV } from '../../lib/csvExport';
 import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 
@@ -850,18 +851,69 @@ export function FreshAttendanceAudit() {
     toast.success(`Bulk approved & reconciled ${validPending.length} valid attendance records!`);
   };
 
+  const handleExportAuditCSV = () => {
+    const count = exportToCSV(auditComparisons, {
+      filename: `Fresh_Attendance_Audit_${new Date().toISOString().slice(0, 10)}.csv`,
+      columns: [
+        { header: 'S.No', accessor: (_r, idx) => idx + 1 },
+        { header: 'Emp ID', accessor: (r) => r.employeeId },
+        { header: 'Employee Name', accessor: (r) => r.employeeName },
+        { header: 'Department', accessor: (r) => r.department },
+        { header: 'Designation', accessor: (r) => r.designation || '-' },
+        { header: 'Date (AD)', accessor: (r) => r.date },
+        { header: 'Date (BS)', accessor: (r) => r.bsDate },
+        { header: 'Day Name', accessor: (r) => r.dayName || new Date(r.date).toLocaleDateString('en-US', { weekday: 'long' }) },
+        { header: 'Shift', accessor: (r) => r.shiftDetails || r.shiftName || 'General Shift' },
+        { header: 'Muster Status', accessor: (r) => r.fieldStatus || 'N/A' },
+        { header: 'Bio Status', accessor: (r) => r.bioStatus || 'N/A' },
+        { header: 'Bio In', accessor: (r) => r.bioInTime || '-' },
+        { header: 'Bio Out', accessor: (r) => r.bioOutTime || '-' },
+        { header: 'Working Hours', accessor: (r) => (r.workingHours !== undefined ? Number(r.workingHours).toFixed(2) : '0.00') },
+        { header: 'Late (Mins)', accessor: (r) => r.lateMinutes || 0 },
+        { header: 'Early (Mins)', accessor: (r) => r.earlyMinutes || 0 },
+        { header: 'Audit Classification', accessor: (r) => r.auditResult },
+        { header: 'Issue Reason', accessor: (r) => r.issueReason },
+        { header: 'HR Decision', accessor: (r) => r.decision },
+        { header: 'HR Remarks', accessor: (r) => r.hrRemarks || '-' },
+      ],
+    });
+    if (count === 0) {
+      toast.error('No audit comparison records to export.');
+      return;
+    }
+    toast.success(`Exported ${count} attendance audit records to CSV.`);
+  };
+
   return (
     <div className="space-y-6">
+      <PageHeader
+        title="Fresh Attendance Audit"
+        description="Cross-check field muster sheets against ZKTeco biometric punches and approve HR reconciliations"
+        icon={ShieldCheck}
+        actions={
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button variant="outline" size="sm" onClick={handleDownloadSampleMatrix} className="gap-1.5 text-indigo-600 dark:text-indigo-400 border-indigo-200 dark:border-indigo-900/50 font-bold">
+              <Download size={14} /> Sample Matrix
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleExportAuditCSV} disabled={auditComparisons.length === 0} className="gap-1.5">
+              <Download size={14} /> Export to CSV
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleExportAuditExcel} disabled={auditComparisons.length === 0} className="gap-1.5">
+              <FileSpreadsheet size={14} className="text-emerald-600" /> Export Audit Excel
+            </Button>
+          </div>
+        }
+      />
 
       {/* Header & File Upload Panel */}
       <Card className="p-6 bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-sm">
-        <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 pb-5 border-b border-slate-100 dark:border-slate-800">
+        <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 pb-5 border-b border-slate-100 dark:border-slate-800 print:hidden">
           <div>
             <h3 className="text-base font-bold text-slate-800 dark:text-slate-100 flex items-center gap-2">
-              <ShieldCheck className="text-indigo-600" size={20} /> Fresh Attendance Audit & Matrix Cross-Check
+              <ShieldCheck className="text-indigo-600" size={20} /> Matrix Upload & Cross-Check Controls
             </h3>
             <p className="text-xs text-slate-500 mt-1">
-              Upload Muster in Matrix/List format, cross-check against Biometric logs vice-versa, inspect flags, edit fields and auto-save directly into Attendance.
+              Upload Muster in Matrix/List format, cross-check against Biometric logs, inspect flags & reconcile directly into Attendance.
             </p>
           </div>
 

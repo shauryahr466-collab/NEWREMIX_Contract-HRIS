@@ -20,6 +20,7 @@ import { PageHeader, Card, Button, Badge, Input } from '../components/ui';
 import { MultiSelect } from '../components/MultiSelect';
 import { ErrorBoundary } from '../components/ErrorBoundary';
 import { EmployeeDrawer } from '../components/EmployeeDrawer';
+import { exportToCSV } from '../lib/csvExport';
 
 export function Employees() {
   const { 
@@ -1022,7 +1023,52 @@ export function Employees() {
   };
 
   const handleExportCSV = () => {
-    handleExportExcel();
+    const count = exportToCSV(filteredEmployees, {
+      filename: `HRIS_Employees_Filtered_${format(new Date(), 'yyyy-MM-dd')}.csv`,
+      columns: [
+        { header: 'S.No', accessor: (_row, i) => i + 1 },
+        { header: 'Employee ID / Bio ID', accessor: (e) => e.id },
+        { header: 'Employee Name', accessor: (e) => e.name },
+        { header: 'Department', accessor: (e) => e.department || '' },
+        { header: 'Section', accessor: (e) => e.section || '' },
+        { header: 'Designation', accessor: (e) => e.designation || '' },
+        { header: 'Grade', accessor: (e) => e.grade || '' },
+        { header: 'Employment Type', accessor: (e) => e.employmentType || 'Permanent' },
+        { header: 'Joining Date (AD)', accessor: (e) => e.joiningDate || '' },
+        { header: 'Joining Date (BS)', accessor: (e) => (e.joiningDate ? getNepaliDate(e.joiningDate) : '') },
+        { header: 'Shift', accessor: (e) => settings.shifts?.find((s) => s.id === e.shiftId)?.name || 'Day Shift' },
+        { header: 'Weekly Off', accessor: (e) => e.weeklyOff || 'Sunday' },
+        { header: 'Status', accessor: (e) => e.status || 'Active' },
+        { header: 'Basic Salary', accessor: (e) => e.basicSalary || 0 },
+        { header: 'Dearness Allowance', accessor: (e) => e.dearnessAllowance || 0 },
+        { header: 'Other Allowance', accessor: (e) => e.otherAllowance || e.allowances || 0 },
+        {
+          header: 'Gross Salary',
+          accessor: (e) =>
+            e.grossSalary || (e.basicSalary || 0) + (e.dearnessAllowance || 0) + (e.otherAllowance || e.allowances || 0),
+        },
+        { header: 'Employee SSF (11%)', accessor: (e) => e.employeeSSF ?? Math.round((e.basicSalary || 0) * 0.11) },
+        { header: 'Employer SSF (20%)', accessor: (e) => e.employerSSF ?? Math.round((e.basicSalary || 0) * 0.2) },
+        {
+          header: 'Monthly CTC',
+          accessor: (e) => {
+            const basic = e.basicSalary || 0;
+            const gross = e.grossSalary || basic + (e.dearnessAllowance || 0) + (e.otherAllowance || e.allowances || 0);
+            return e.monthlyCTC ?? gross + (e.employerSSF ?? Math.round(basic * 0.2));
+          },
+        },
+        { header: 'OT Eligible', accessor: (e) => (e.otEligible !== false ? 'Yes' : 'No') },
+        { header: 'PAN Number', accessor: (e) => e.panNumber || '' },
+        { header: 'SSF Number', accessor: (e) => e.ssfNumber || '' },
+        { header: 'Phone', accessor: (e) => e.phone || e.contactNumber || '' },
+        { header: 'Email', accessor: (e) => e.email || '' },
+      ],
+    });
+    if (count === 0) {
+      toast.error('No filtered employee records to export.');
+      return;
+    }
+    toast.success(`Exported ${count} filtered employee records to CSV.`);
   };
 
   // Two-Sheet Download Template
@@ -1400,6 +1446,9 @@ export function Employees() {
               <Button variant="outline" onClick={handleExportExcel}>
                 <Download size={14} /> Export Excel
               </Button>
+              <Button variant="outline" onClick={handleExportCSV}>
+                <FileText size={14} /> Export CSV
+              </Button>
               <Button variant="outline" onClick={() => setIsImportModalOpen(true)}>
                 <FileUp size={14} /> Bulk Import
               </Button>
@@ -1627,6 +1676,20 @@ export function Employees() {
 
         {/* Master Employee Table */}
         <Card className="overflow-hidden border-slate-200 dark:border-slate-800 shadow-sm">
+          <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 bg-slate-50/60 dark:bg-slate-900/40 print:hidden">
+            <div className="text-xs font-bold text-slate-600 dark:text-slate-300 flex items-center gap-2">
+              <Users size={14} className="text-primary" />
+              <span>Showing {filteredEmployees.length} of {employees.length} Employees</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={handleExportCSV} className="gap-1.5">
+                <Download size={13} /> Export to CSV
+              </Button>
+              <Button size="sm" variant="outline" onClick={handleExportExcel} className="gap-1.5">
+                <FileSpreadsheet size={13} /> Export Excel
+              </Button>
+            </div>
+          </div>
           <div className="overflow-x-auto custom-scrollbar-light">
             <table className="w-full text-left border-collapse min-w-[1200px]">
               <thead className="bg-slate-100/80 dark:bg-slate-900/80 sticky top-0 z-10 backdrop-blur-sm border-b border-slate-200 dark:border-slate-800">

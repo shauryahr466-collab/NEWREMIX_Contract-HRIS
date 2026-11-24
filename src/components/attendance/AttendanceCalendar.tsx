@@ -8,11 +8,11 @@ import {
   toNepaliDigits 
 } from '../../utils/nepaliCalendar';
 import { 
-  Calendar as CalendarIcon, ChevronLeft, ChevronRight, User, Filter, 
+  Calendar as CalendarIcon, CalendarDays, ChevronLeft, ChevronRight, User, Filter, 
   Clock, CheckCircle2, XCircle, AlertTriangle, Info, Search, Pin, X, Settings as SettingsIcon,
   CalendarRange
 } from 'lucide-react';
-import { Card, Button, Input } from '../ui';
+import { PageHeader, Card, Button, Input } from '../ui';
 import { MusterCellModal } from './MusterCellModal';
 import { Employee, ProcessedAttendance, ShiftMaster, RawPunch } from '../../types';
 import { formatAMPM, cn, toDeviceWallClockIso } from '../../lib/utils';
@@ -390,6 +390,11 @@ export function AttendanceCalendar() {
 
   return (
     <div className="space-y-4">
+      <PageHeader
+        title="Attendance Calendar"
+        description="Interactive Nepali BS & AD visual calendar with shift overrides and daily punch logs"
+        icon={CalendarDays}
+      />
       
       {/* Top Filter & Toolbar matching screenshot template */}
       <div className="bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs space-y-3">

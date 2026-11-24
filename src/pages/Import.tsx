@@ -13,6 +13,7 @@ import { PageHeader, Card, Button, Input, Badge } from '../components/ui';
 import { fetchLocalTable, saveLocalTable, saveLocalTableDetailed, deleteLocalTableDetailed } from '../lib/localClient';
 import { validatePunchesAgainstHolidays } from '../lib/holidayValidation';
 import { useActionStatus } from '../context/ActionStatusContext';
+import { MasterDataImporter } from '../components/MasterDataImporter';
 
 export function Import() {
   const { 
@@ -22,7 +23,7 @@ export function Import() {
   } = useAppStore();
 
   const { executeWithStatus } = useActionStatus();
-  const [importType, setImportType] = useState<'punch' | 'roster'>('punch');
+  const [importType, setImportType] = useState<'punch' | 'roster' | 'master'>('punch');
   const [isDragging, setIsDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
@@ -941,16 +942,16 @@ export function Import() {
   return (
     <div className="space-y-6">
       <PageHeader 
-        title="External Data Import" 
-        description="Synchronize biometric logs or shift rosters"
+        title="Master Data & Punch Import" 
+        description="Synchronize biometric logs, shift rosters, employees, leave balances, assets, and salary structures"
         icon={UploadCloud}
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-6">
           <Card className="p-6">
-             <div className="flex items-center justify-between mb-8">
-               <div className="flex bg-slate-100 dark:bg-slate-900 p-1 rounded-lg">
+             <div className="flex flex-wrap items-center justify-between gap-3 mb-8">
+               <div className="flex bg-slate-100 dark:bg-slate-900 p-1 rounded-lg flex-wrap">
                   <button 
                     onClick={() => { setImportType('punch'); setFile(null); setStatus('idle'); }}
                     className={cn(
@@ -969,12 +970,28 @@ export function Import() {
                   >
                     <ClipboardList size={14} /> Shift Roster
                   </button>
+                  <button 
+                    onClick={() => { setImportType('master'); setFile(null); setStatus('idle'); }}
+                    className={cn(
+                      "flex items-center gap-2 px-4 py-2 rounded-md text-[10px] font-bold uppercase tracking-wider transition-all",
+                      importType === 'master' ? "bg-white dark:bg-slate-800 text-primary shadow-sm" : "text-slate-500"
+                    )}
+                  >
+                    <Database size={14} /> Master Data
+                  </button>
                </div>
 
-               <Button variant="outline" size="sm" onClick={downloadSample} className="gap-2">
-                 <Download size={14} /> Sample {importType === 'punch' ? 'Punch' : 'Roster'}
-               </Button>
+               {importType !== 'master' && (
+                 <Button variant="outline" size="sm" onClick={downloadSample} className="gap-2">
+                   <Download size={14} /> Sample {importType === 'punch' ? 'Punch' : 'Roster'}
+                 </Button>
+               )}
              </div>
+
+             {importType === 'master' ? (
+               <MasterDataImporter />
+             ) : (
+             <>
 
              <div 
                className={cn(
@@ -1042,6 +1059,8 @@ export function Import() {
                   {status === 'processing' ? 'Processing...' : 'Upload & Process'}
                 </Button>
              </div>
+             </>
+             )}
           </Card>
 
           {importType === 'punch' && (

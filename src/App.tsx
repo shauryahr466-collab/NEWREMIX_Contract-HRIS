@@ -22,6 +22,15 @@ import { SettingsPage } from './pages/Settings';
 import { SalaryAnalysisPage } from './pages/SalaryAnalysisPage';
 import { MovementAttritionPage } from './pages/MovementAttritionPage';
 import { UserAccess } from './pages/UserAccess';
+import Recruitment from './pages/Recruitment';
+import Onboarding from './pages/Onboarding';
+import Performance from './pages/Performance';
+import Assets from './pages/Assets';
+import Helpdesk from './pages/Helpdesk';
+import Projects from './pages/Projects';
+import DocumentRequests from './pages/DocumentRequests';
+import Automations from './pages/Automations';
+import Integrations from './pages/Integrations';
 import { Login } from './pages/Login';
 import { StoreProvider, useAppStore } from './store';
 import { ActionStatusProvider } from './context/ActionStatusContext';
@@ -50,18 +59,27 @@ function AppContent() {
           <Route path="/" element={<Layout />}>
             <Route index element={canAccessModule('dashboard') ? <ErrorBoundary moduleName="Dashboard"><Dashboard /></ErrorBoundary> : <Navigate to="/attendance" replace />} />
             <Route path="employees" element={guard('employees', <ErrorBoundary moduleName="Employee Directory"><Employees /></ErrorBoundary>)} />
+            <Route path="recruitment" element={guard('recruitment', <ErrorBoundary moduleName="Recruitment"><Recruitment /></ErrorBoundary>)} />
+            <Route path="onboarding" element={guard('onboarding', <ErrorBoundary moduleName="Onboarding & Offboarding"><Onboarding /></ErrorBoundary>)} />
             <Route path="salary-analysis" element={guard('salaryAnalysis', <ErrorBoundary moduleName="Salary Analysis"><SalaryAnalysisPage /></ErrorBoundary>)} />
             <Route path="movement-attrition" element={guard('movementAttrition', <ErrorBoundary moduleName="Movement & Attrition"><MovementAttritionPage /></ErrorBoundary>)} />
             <Route path="devices" element={guard('devices', <ErrorBoundary moduleName="Device Setup"><DeviceSetup /></ErrorBoundary>)} />
-            <Route path="import" element={guard('import', <ErrorBoundary moduleName="Punch Import"><Import /></ErrorBoundary>)} />
+            <Route path="import" element={guard('import', <ErrorBoundary moduleName="Master Data Import"><Import /></ErrorBoundary>)} />
             <Route path="attendance" element={guard('attendance', <ErrorBoundary moduleName="Attendance Logs"><Attendance /></ErrorBoundary>)} />
             <Route path="auditor" element={guard('auditor', <ErrorBoundary moduleName="Attendance Auditor"><AttendanceAuditor /></ErrorBoundary>)} />
             <Route path="overtime" element={guard('overtime', <ErrorBoundary moduleName="Overtime"><Overtime /></ErrorBoundary>)} />
             <Route path="audit-logs" element={guard('auditLogs', <ErrorBoundary moduleName="Audit Logs"><AuditLogs /></ErrorBoundary>)} />
             <Route path="sbl" element={guard('sbl', <ErrorBoundary moduleName="SBL Management"><SBL /></ErrorBoundary>)} />
             <Route path="force-attendance" element={guard('forceAttendance', <ErrorBoundary moduleName="Manual Corrections"><ForceAttendance /></ErrorBoundary>)} />
+            <Route path="performance" element={guard('performance', <ErrorBoundary moduleName="Performance Management"><Performance /></ErrorBoundary>)} />
+            <Route path="assets" element={guard('assets', <ErrorBoundary moduleName="Asset Management"><Assets /></ErrorBoundary>)} />
+            <Route path="projects" element={guard('projects', <ErrorBoundary moduleName="Projects & Timesheets"><Projects /></ErrorBoundary>)} />
+            <Route path="helpdesk" element={guard('helpdesk', <ErrorBoundary moduleName="HR Helpdesk"><Helpdesk /></ErrorBoundary>)} />
+            <Route path="document-requests" element={guard('documentRequests', <ErrorBoundary moduleName="Document Requests"><DocumentRequests /></ErrorBoundary>)} />
             <Route path="payroll" element={guard('payroll', <ErrorBoundary moduleName="Payroll & Disburse"><Payroll /></ErrorBoundary>)} />
             <Route path="reports" element={guard('reports', <ErrorBoundary moduleName="Analytic Reports"><Reports /></ErrorBoundary>)} />
+            <Route path="automations" element={guard('automations', <ErrorBoundary moduleName="Automations & Alerts"><Automations /></ErrorBoundary>)} />
+            <Route path="integrations" element={guard('integrations', <ErrorBoundary moduleName="Integrations & API"><Integrations /></ErrorBoundary>)} />
             <Route path="settings" element={guard('settings', <ErrorBoundary moduleName="Configuration"><SettingsPage /></ErrorBoundary>)} />
             {isSuperAdmin && <Route path="user-access" element={<ErrorBoundary moduleName="User & Role Config"><UserAccess /></ErrorBoundary>} />}
             {isSuperAdmin && <Route path="admin" element={<Navigate to="/user-access" replace />} />}
@@ -82,5 +100,3 @@ export default function App() {
     </StoreProvider>
   );
 }
-
-

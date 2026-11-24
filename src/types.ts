@@ -10,6 +10,8 @@ export type Role = SystemRole | 'Admin' | 'Editor' | 'HR';
 export type ModuleKey =
   | 'dashboard'
   | 'employees'
+  | 'recruitment'
+  | 'onboarding'
   | 'movementAttrition'
   | 'salaryAnalysis'
   | 'devices'
@@ -20,8 +22,15 @@ export type ModuleKey =
   | 'overtime'
   | 'sbl'
   | 'forceAttendance'
+  | 'performance'
+  | 'assets'
+  | 'helpdesk'
+  | 'projects'
+  | 'documentRequests'
   | 'payroll'
   | 'reports'
+  | 'automations'
+  | 'integrations'
   | 'settings'
   | 'userAccess'
   | 'admin';
@@ -811,12 +820,25 @@ export interface Settings {
   overtimeThreshold: number; // working hours after which OT starts
   companyName: string;
   reportTitle: string;
+  companyAddress?: string;
+  companyPhone?: string;
+  companyEmail?: string;
+  companyRegistrationNo?: string;
+  defaultWeeklyOff?: string;
+  trackLateCome?: boolean;
+  trackEarlyOut?: boolean;
+  autoApproveDeviceLogs?: boolean;
+  showNepaliDateEverywhere?: boolean;
+  ipRestrictionEnabled?: boolean;
+  allowedNetworkCidr?: string;
+  payslipPrefix?: string;
   shifts: ShiftMaster[];
   calculationStartDate?: string; // YYYY-MM-DD
   calculationEndDate?: string; // YYYY-MM-DD
   holidays?: HolidayMasterRecord[];
   holidayPunchPolicy?: HolidayPunchPolicy;
   payrollConfig?: PayrollConfig;
+  platformConfig?: PlatformIntegrationsConfig;
 }
 
 export type ActionState = 
@@ -873,3 +895,230 @@ export interface ActionStatusResult {
   operationId?: string;
   breakdown?: Record<string, any>;
 }
+
+// =====================================================
+// Horilla Core HR & Platform Domain Models
+// =====================================================
+
+export interface JobOpening {
+  id: string;
+  title: string;
+  department: string;
+  location: string;
+  employmentType: 'Full-Time' | 'Contract' | 'Part-Time' | 'Intern';
+  vacancies: number;
+  salaryRange?: string;
+  closingDate?: string;
+  status: 'Open' | 'On Hold' | 'Closed';
+  description?: string;
+  createdAt: string;
+}
+
+export type CandidateStage = 'Applied' | 'Screening' | 'Interview' | 'Offer' | 'Hired' | 'Rejected';
+
+export interface CandidateApplication {
+  id: string;
+  jobId: string;
+  jobTitle: string;
+  name: string;
+  email: string;
+  phone: string;
+  department: string;
+  experienceYears: number;
+  expectedSalary?: string;
+  source?: string;
+  stage: CandidateStage;
+  interviewDate?: string;
+  meetLink?: string;
+  notes?: string;
+  hiredEmployeeId?: string;
+  appliedAt: string;
+}
+
+export interface LifecycleChecklistItem {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  department: string;
+  workflowType: 'Onboarding' | 'Offboarding';
+  title: string;
+  ownerRole: 'HR' | 'IT' | 'Admin' | 'Manager' | 'Payroll';
+  dueDate?: string;
+  status: 'Pending' | 'In Progress' | 'Completed';
+  notes?: string;
+  completedAt?: string;
+  createdAt: string;
+}
+
+export interface PerformanceGoal {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  department: string;
+  title: string;
+  metricTarget: string;
+  cycle: string; // e.g., "FY 2083/84 Q2"
+  dueDate: string;
+  progressPct: number;
+  selfRating?: number;
+  managerRating?: number;
+  feedback?: string;
+  status: 'Not Started' | 'On Track' | 'At Risk' | 'Completed';
+  updatedAt: string;
+}
+
+export interface CompanyAsset {
+  id: string;
+  assetTag: string;
+  name: string;
+  category: 'Laptop' | 'Desktop' | 'Mobile' | 'Access Card' | 'Uniform & PPE' | 'Vehicle' | 'Tool / Equipment' | 'Other';
+  serialNumber: string;
+  purchaseDate?: string;
+  purchaseCost?: number;
+  condition: 'New' | 'Good' | 'Fair' | 'Needs Repair' | 'Retired';
+  status: 'Available' | 'Assigned' | 'Under Maintenance' | 'Retired';
+  assignedEmployeeId?: string;
+  assignedEmployeeName?: string;
+  assignedDate?: string;
+  notes?: string;
+  updatedAt: string;
+}
+
+export interface TicketComment {
+  id: string;
+  author: string;
+  message: string;
+  timestamp: string;
+}
+
+export interface HelpdeskTicket {
+  id: string;
+  ticketNumber: string;
+  employeeId?: string;
+  requesterName: string;
+  department?: string;
+  category: 'Payroll' | 'Attendance' | 'Leave' | 'IT & Biometrics' | 'Documents' | 'Workplace';
+  priority: 'Low' | 'Medium' | 'High' | 'Urgent';
+  status: 'Open' | 'In Progress' | 'Resolved' | 'Closed';
+  subject: string;
+  description: string;
+  assignedTo?: string;
+  comments: TicketComment[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectTask {
+  id: string;
+  title: string;
+  assigneeId?: string;
+  assigneeName?: string;
+  priority: 'Low' | 'Medium' | 'High';
+  status: 'To Do' | 'In Progress' | 'Done';
+  dueDate?: string;
+}
+
+export interface ProjectRecord {
+  id: string;
+  code: string;
+  name: string;
+  department: string;
+  managerName: string;
+  startDate: string;
+  endDate?: string;
+  status: 'Planning' | 'Active' | 'On Hold' | 'Completed';
+  budget?: number;
+  tasks: ProjectTask[];
+  createdAt: string;
+}
+
+export interface TimesheetEntry {
+  id: string;
+  projectId: string;
+  projectName: string;
+  taskTitle: string;
+  employeeId: string;
+  employeeName: string;
+  date: string;
+  hours: number;
+  billable: boolean;
+  notes?: string;
+  status: 'Submitted' | 'Approved';
+  createdAt: string;
+}
+
+export interface DocumentRequestRecord {
+  id: string;
+  requestNumber: string;
+  employeeId: string;
+  employeeName: string;
+  department: string;
+  designation?: string;
+  documentType:
+    | 'Experience Certificate'
+    | 'Salary Certificate'
+    | 'Employment Verification / NOC'
+    | 'Tax Clearance Summary'
+    | 'ID Card Reissue'
+    | 'Bank / PAN Letter';
+  purpose: string;
+  status: 'Pending' | 'Processing' | 'Approved' | 'Rejected';
+  reviewedBy?: string;
+  remarks?: string;
+  requestedAt: string;
+  updatedAt: string;
+}
+
+export interface AppNotification {
+  id: string;
+  title: string;
+  message: string;
+  category: 'Recruitment' | 'Attendance' | 'Leave' | 'Payroll' | 'Asset' | 'Helpdesk' | 'Document' | 'System';
+  severity: 'info' | 'success' | 'warning';
+  read: boolean;
+  link?: string;
+  createdAt: string;
+}
+
+export interface AutomationRule {
+  id: string;
+  eventKey: string;
+  label: string;
+  description: string;
+  inAppEnabled: boolean;
+  emailEnabled: boolean;
+  whatsappEnabled: boolean;
+  recipients: string;
+}
+
+export interface ApiTokenRecord {
+  id: string;
+  name: string;
+  prefix: string;
+  scope: 'Read-Only' | 'Mobile Check-In' | 'Full Admin';
+  createdAt: string;
+  lastUsedAt?: string;
+  active: boolean;
+}
+
+export interface PlatformIntegrationsConfig {
+  ldapEnabled?: boolean;
+  ldapHost?: string;
+  ldapPort?: number;
+  ldapBaseDn?: string;
+  ldapBindUser?: string;
+  smtpEnabled?: boolean;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpFromEmail?: string;
+  whatsappEnabled?: boolean;
+  whatsappBusinessNumber?: string;
+  googleMeetDefaultRoom?: string;
+  googleDriveBackupFolderUrl?: string;
+  scheduledReportEnabled?: boolean;
+  scheduledReportEmail?: string;
+  scheduledReportFrequency?: 'Daily' | 'Weekly' | 'Monthly';
+  automationRules?: AutomationRule[];
+  apiTokens?: ApiTokenRecord[];
+}
+

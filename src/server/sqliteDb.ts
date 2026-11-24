@@ -617,6 +617,66 @@ export async function getSqliteDb(): Promise<Database> {
       updated_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS hr_jobs (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_candidates (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_onboarding_tasks (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_performance_goals (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_assets (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_tickets (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_projects (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_timesheets (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_document_requests (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS hr_notifications (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_punch_dedup ON attendance_punches (employee_id, punch_datetime, device_id);
     CREATE INDEX IF NOT EXISTS idx_punch_emp_datetime ON attendance_punches (employee_id, punch_datetime);
     CREATE INDEX IF NOT EXISTS idx_emp_dept ON employees (department);

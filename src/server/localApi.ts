@@ -70,7 +70,17 @@ const SQL_TABLE_MAP: Record<string, string> = {
   tax_rules: 'tax_rules',
   deduction_rules: 'deduction_rules',
   salary_components: 'salary_components',
-  payroll_config_audit: 'payroll_config_audit'
+  payroll_config_audit: 'payroll_config_audit',
+  hr_jobs: 'hr_jobs',
+  hr_candidates: 'hr_candidates',
+  hr_onboarding_tasks: 'hr_onboarding_tasks',
+  hr_performance_goals: 'hr_performance_goals',
+  hr_assets: 'hr_assets',
+  hr_tickets: 'hr_tickets',
+  hr_projects: 'hr_projects',
+  hr_timesheets: 'hr_timesheets',
+  hr_document_requests: 'hr_document_requests',
+  hr_notifications: 'hr_notifications'
 };
 
 const CONFLICT_PROTECTED_TABLES = new Set([
@@ -324,6 +334,20 @@ function canWriteTable(user: SystemUser | null, table: string, items: any[]): { 
   }
   if (table === 'audit_logs') {
     return { allowed: true }; // any authenticated action can append its own audit log entry
+  }
+  if (
+    table === 'hr_jobs' ||
+    table === 'hr_candidates' ||
+    table === 'hr_onboarding_tasks' ||
+    table === 'hr_performance_goals' ||
+    table === 'hr_assets' ||
+    table === 'hr_tickets' ||
+    table === 'hr_projects' ||
+    table === 'hr_timesheets' ||
+    table === 'hr_document_requests' ||
+    table === 'hr_notifications'
+  ) {
+    return { allowed: true };
   }
   return { allowed: false, reason: 'Insufficient privileges for this resource.' };
 }

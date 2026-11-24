@@ -2,25 +2,25 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  --color-primary: #1D4ED8;
-  --color-primary-dark: #1E3A8A;
+  --color-primary: #E54F38;
+  --color-primary-dark: #C93E28;
   
   --color-success: #16A34A;
   --color-warning: #D97706;
   --color-danger: #DC2626;
   --color-info: #0284C7;
 
-  --color-slate-50: #F8FAFC;
-  --color-slate-100: #F1F5F9;
-  --color-slate-200: #E2E8F0;
-  --color-slate-300: #CBD5E1;
-  --color-slate-400: #94A3B8;
-  --color-slate-500: #64748B;
-  --color-slate-600: #475569;
-  --color-slate-700: #334155;
-  --color-slate-800: #1E293B;
-  --color-slate-900: #0F172A;
-  --color-slate-950: #020617;
+  --color-slate-50: #F4F5F7;
+  --color-slate-100: #ECEEF2;
+  --color-slate-200: #E2E5EB;
+  --color-slate-300: #CBD2DC;
+  --color-slate-400: #8D96A5;
+  --color-slate-500: #646E7D;
+  --color-slate-600: #475161;
+  --color-slate-700: #333C4A;
+  --color-slate-800: #1F2630;
+  --color-slate-900: #141920;
+  --color-slate-950: #0B0E14;
   
   --font-sans: "Cambria", Georgia, serif;
   --font-display: "Cambria", Georgia, serif;
@@ -30,8 +30,8 @@
   --radius-xl: 12px;
   --radius-2xl: 16px;
   
-  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
-  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.04);
+  --shadow-md: 0 4px 10px -2px rgb(0 0 0 / 0.07), 0 2px 4px -2px rgb(0 0 0 / 0.04);
 }
 
 @layer base {
@@ -44,11 +44,12 @@
   h1, h2, h3, h4, h5, h6 {
     font-family: "Cambria", Georgia, serif;
     @apply tracking-tight text-slate-900 font-bold dark:text-white;
+    text-wrap: balance;
   }
 }
 
 .enterprise-sidebar {
-  @apply bg-slate-900 border-r border-slate-800 transition-colors duration-200;
+  @apply bg-[#1E232B] border-r border-slate-800 transition-colors duration-200;
 }
 
 .glass-header {
@@ -129,25 +130,64 @@
     size: landscape;
     margin: 10mm;
   }
-  
+
   html, body {
-    width: 100%;
-    height: auto;
-    background: transparent;
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+    font-family: "Cambria", Georgia, serif !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .print-layout-root,
+  .print-layout-main,
+  .print-scroll-container,
+  .overflow-hidden,
+  .overflow-y-auto,
+  .overflow-x-auto {
+    display: block !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  aside,
+  header,
+  .enterprise-sidebar,
+  .glass-header,
+  .print\:hidden {
+    display: none !important;
   }
 
   table {
     border-collapse: collapse !important;
     width: 100% !important;
+    min-width: 0 !important;
+    page-break-inside: auto;
+  }
+
+  thead {
+    display: table-header-group;
+  }
+
+  tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
   }
 
   th, td {
     padding: 4px 6px !important;
     border: 1px solid #cbd5e1 !important;
-    font-size: 8pt !important;
+    font-size: 8.5pt !important;
+    color: #0f172a !important;
+    background: #ffffff !important;
   }
 
-  .print\:hidden {
-    display: none !important;
+  th {
+    background-color: #f1f5f9 !important;
+    font-weight: 700 !important;
   }
 }

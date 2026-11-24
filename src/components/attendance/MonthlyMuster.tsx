@@ -7,16 +7,18 @@ import {
   getNepaliMonthEnglishEquivalent 
 } from '../../utils/nepaliCalendar';
 import { 
-  Search, Download, Printer, Filter, Users, Calendar, 
-  CheckCircle2, XCircle, Clock, Award, ChevronLeft, ChevronRight, FileSpreadsheet, FileText, Upload 
+  Search, Download, Filter, Users, Calendar, 
+  CheckCircle2, XCircle, Clock, Award, ChevronLeft, ChevronRight, FileSpreadsheet, FileText, Upload, TableProperties 
 } from 'lucide-react';
-import { Card, Button, Input } from '../ui';
+import { PageHeader, Card, Button, Input } from '../ui';
 import { MultiSelect } from '../MultiSelect';
 import { MusterCellModal } from './MusterCellModal';
 import { ManualAttendanceImportModal } from '../ManualAttendanceImportModal';
 import { Employee, ProcessedAttendance, ShiftMaster, RawPunch } from '../../types';
 import { formatDuration, cn, formatAMPM, toDeviceWallClockIso } from '../../lib/utils';
+import { exportToCSV } from '../../lib/csvExport';
 import { parseISO, format } from 'date-fns';
+import { toast } from 'sonner';
 import * as XLSX from 'xlsx';
 
 // Standardized Code Legend Items matching exact specification
@@ -361,6 +363,43 @@ export function MonthlyMuster() {
     XLSX.writeFile(workbook, `Monthly_Muster_${selectedYear}_${nepaliMonthName}.xlsx`);
   };
 
+  const handleExportCSV = () => {
+    const nepaliMonthName = NEPALI_MONTHS[selectedMonthIndex].name;
+    const dayColumns = monthDays.map((d) => ({
+      header: `${d.dayNumber < 10 ? '0' + d.dayNumber : d.dayNumber} (${d.dayOfWeek})`,
+      accessor: (emp: Employee) => getCellStatus(emp, d).code,
+    }));
+
+    const count = exportToCSV(filteredEmployees, {
+      filename: `Monthly_Muster_${selectedYear}_${nepaliMonthName}.csv`,
+      columns: [
+        { header: 'S.No', accessor: (_e, idx) => idx + 1 },
+        { header: 'Emp ID', accessor: (e) => e.id },
+        { header: 'Employee Name', accessor: (e) => e.name },
+        { header: 'Department', accessor: (e) => e.department || '-' },
+        { header: 'Designation', accessor: (e) => e.designation || '-' },
+        ...dayColumns,
+        { header: 'P', accessor: (e) => employeeTotals.get(e.id)?.P ?? 0 },
+        { header: 'PWO', accessor: (e) => employeeTotals.get(e.id)?.PWO ?? 0 },
+        { header: 'P+OT', accessor: (e) => employeeTotals.get(e.id)?.POT ?? 0 },
+        { header: 'PPH', accessor: (e) => employeeTotals.get(e.id)?.PPH ?? 0 },
+        { header: 'A', accessor: (e) => employeeTotals.get(e.id)?.A ?? 0 },
+        { header: 'WO', accessor: (e) => employeeTotals.get(e.id)?.WO ?? 0 },
+        { header: 'PH', accessor: (e) => employeeTotals.get(e.id)?.PH ?? 0 },
+        { header: 'L', accessor: (e) => employeeTotals.get(e.id)?.L ?? 0 },
+        { header: 'MI', accessor: (e) => employeeTotals.get(e.id)?.MI ?? 0 },
+        { header: 'MO', accessor: (e) => employeeTotals.get(e.id)?.MO ?? 0 },
+        { header: 'SPF', accessor: (e) => employeeTotals.get(e.id)?.SPF ?? 0 },
+        { header: 'OT Hrs', accessor: (e) => (employeeTotals.get(e.id)?.OT ?? 0).toFixed(1) },
+      ],
+    });
+    if (count === 0) {
+      toast.error('No filtered employee records to export.');
+      return;
+    }
+    toast.success(`Exported Monthly Muster CSV for ${count} employees.`);
+  };
+
   // Navigation handlers
   const handlePrevMonth = () => {
     if (selectedMonthIndex === 0) {
@@ -382,7 +421,25 @@ export function MonthlyMuster() {
 
   return (
     <div className="space-y-6">
-      
+      <PageHeader
+        title="Monthly Muster"
+        description="Nepali BS 30/32-day attendance register, status code matrix & overtime totals"
+        icon={TableProperties}
+        actions={
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button size="sm" onClick={() => setIsManualImportOpen(true)} className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs">
+              <Upload size={14} /> Import Attendance
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleExportCSV} className="gap-1.5">
+              <Download size={14} /> Export to CSV
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleExportExcel} className="gap-1.5">
+              <FileSpreadsheet size={14} className="text-emerald-600" /> Export Excel
+            </Button>
+          </div>
+        }
+      />
+
       {/* Month Selection & Filters Bar */}
       <Card className="p-5 bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-sm">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4 pb-4 border-b border-slate-100 dark:border-slate-800">
@@ -436,15 +493,12 @@ export function MonthlyMuster() {
           </div>
 
           {/* Action Export Buttons */}
-          <div className="flex items-center gap-2 self-end lg:self-auto">
-            <Button size="sm" onClick={() => setIsManualImportOpen(true)} className="h-9 bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs">
-              <Upload size={14} /> Import Attendance
+          <div className="flex items-center gap-2 self-end lg:self-auto print:hidden">
+            <Button variant="outline" size="sm" onClick={handleExportCSV} className="h-9 gap-1.5">
+              <Download size={14} /> CSV
             </Button>
-            <Button variant="outline" size="sm" onClick={handleExportExcel} className="h-9">
-              <FileSpreadsheet size={14} className="text-emerald-600" /> Export Excel
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => window.print()} className="h-9 hidden sm:flex">
-              <Printer size={14} /> Print
+            <Button variant="outline" size="sm" onClick={handleExportExcel} className="h-9 gap-1.5">
+              <FileSpreadsheet size={14} className="text-emerald-600" /> Excel
             </Button>
           </div>
         </div>

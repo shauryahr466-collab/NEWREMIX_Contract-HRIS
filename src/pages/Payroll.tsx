@@ -23,6 +23,7 @@ import {
 } from '../lib/payslipPdfGenerator';
 import { PayrollSetupManager } from '../components/PayrollSetupManager';
 import { useActionStatus } from '../context/ActionStatusContext';
+import { exportToCSV } from '../lib/csvExport';
 
 export function Payroll() {
   const { 
@@ -762,6 +763,45 @@ export function Payroll() {
     );
   };
 
+  // Standardized Export to CSV for currently filtered Payroll records
+  const handleExportFilteredPayrollCSV = (run: PayrollRun) => {
+    const count = exportToCSV(filteredRecords, {
+      filename: `${settings?.companyName || 'Company'}_Payroll_Filtered_${run.month}.csv`,
+      columns: [
+        { header: 'S.No', accessor: (_r, idx) => idx + 1 },
+        { header: 'Payroll Period', accessor: () => run.monthName || run.month },
+        { header: 'Employee ID', accessor: (r) => r.employeeId },
+        { header: 'Employee Name', accessor: (r) => r.employeeName },
+        { header: 'Department', accessor: (r) => r.department || '' },
+        { header: 'PAN Number', accessor: (r) => r.panNumber || '' },
+        { header: 'Payable Days', accessor: (r) => r.payableDays },
+        { header: 'Total Days', accessor: (r) => r.totalDaysInMonth },
+        { header: 'Earned Basic (NPR)', accessor: (r) => r.earnedBasicSalary },
+        { header: 'Earned Allowances (NPR)', accessor: (r) => r.earnedAllowances },
+        { header: 'Overtime Hours', accessor: (r) => r.overtimeHours },
+        { header: 'Overtime Pay (NPR)', accessor: (r) => r.overtimePay },
+        { header: 'Gross Salary (NPR)', accessor: (r) => r.grossSalary },
+        { header: 'Taxable Income (NPR)', accessor: (r) => r.taxableIncome },
+        { header: 'Income Tax TDS (NPR)', accessor: (r) => r.incomeTaxTDS },
+        { header: 'Employee SSF 11% (NPR)', accessor: (r) => r.socialSecurity },
+        {
+          header: 'Employer SSF 20% (NPR)',
+          accessor: (r) => r.employerSSF ?? (r.ssfEnrolled !== false ? Math.round(r.earnedBasicSalary * 0.2) : 0),
+        },
+        { header: 'Total Deductions (NPR)', accessor: (r) => r.totalDeductions },
+        { header: 'Net Pay (NPR)', accessor: (r) => r.netSalary },
+        { header: 'Disbursement Status', accessor: (r) => r.disbursementStatus },
+        { header: 'Bank Name', accessor: (r) => r.bankName || '' },
+        { header: 'Account Number', accessor: (r) => r.accountNumber || '' },
+      ],
+    });
+    if (count === 0) {
+      toast.error('No filtered payroll records to export.');
+      return;
+    }
+    toast.success(`Exported ${count} filtered payroll records to CSV.`);
+  };
+
   // Handle Export Bank Transfer CSV / Excel
   const handleExportBankFile = (run: PayrollRun) => {
     const exportData = run.records.map((r, i) => ({
@@ -1233,6 +1273,21 @@ export function Payroll() {
 
               {/* Detailed Payroll Itemized Table */}
               <Card className="overflow-hidden border border-slate-200 dark:border-slate-800 shadow-sm">
+                <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2 bg-slate-50/60 dark:bg-slate-900/40 print:hidden">
+                  <div className="text-xs font-bold text-slate-600 dark:text-slate-300">
+                    Showing {filteredRecords.length} of {currentRun.records.length} Payroll Records ({currentRun.monthName})
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleExportFilteredPayrollCSV(currentRun)}
+                      className="gap-1.5"
+                    >
+                      <Download size={13} /> Export to CSV
+                    </Button>
+                  </div>
+                </div>
                 <div className="overflow-x-auto custom-scrollbar">
                   <table className="w-full text-left border-collapse min-w-[1000px]">
                     <thead>

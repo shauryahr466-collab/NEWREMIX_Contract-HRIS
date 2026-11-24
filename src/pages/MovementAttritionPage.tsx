@@ -22,7 +22,7 @@ import {
   Users, UserCheck, UserX, TrendingUp, TrendingDown, ArrowRightLeft, 
   Award, ShieldAlert, FileSpreadsheet, Download, RefreshCw, Filter, 
   Search, Plus, CheckCircle2, AlertTriangle, Info, Calendar, Building2, Briefcase,
-  UserMinus, ShieldCheck, Check, Clock, Shield
+  UserMinus, ShieldCheck, Check, Clock, Shield, Printer
 } from 'lucide-react';
 import { Modal } from '../components/ui';
 import { ErrorBoundary } from '../components/ErrorBoundary';
@@ -371,6 +371,15 @@ export function MovementAttritionPage() {
           >
             <Download size={16} className="text-indigo-600" />
             Export CSV
+          </button>
+
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className="px-3.5 py-2 text-xs font-bold text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl hover:bg-slate-50 dark:hover:bg-slate-700 transition-all shadow-sm flex items-center gap-2"
+          >
+            <Printer size={16} className="text-slate-600 dark:text-slate-400" />
+            Print
           </button>
         </div>
       </div>

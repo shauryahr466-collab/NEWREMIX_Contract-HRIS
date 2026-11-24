@@ -901,7 +901,10 @@ async function startServer() {
 
   // Vite middleware for development vs static build serving (optimized for Caddy reverse proxy)
   const distPath = path.join(process.cwd(), 'dist');
-  const isProduction = process.env.NODE_ENV === 'production' || (!process.env.VITE_DEV && fs.existsSync(path.join(distPath, 'index.html')) && fs.existsSync(path.join(distPath, 'server.cjs')));
+  const isBundledServer = String(process.argv[1] || '').endsWith('server.cjs');
+  const isProduction =
+    (process.env.NODE_ENV === 'production' || isBundledServer) &&
+    fs.existsSync(path.join(distPath, 'index.html'));
 
   if (isProduction) {
     app.use('/assets', express.static(path.join(distPath, 'assets'), { maxAge: '7d', immutable: true }));

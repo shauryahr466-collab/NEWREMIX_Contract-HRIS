@@ -18,7 +18,8 @@ import {
   AlertTriangle,
   HardDrive,
   FileUp,
-  Save
+  Save,
+  Printer
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { authFetch } from '../lib/authSession';
@@ -582,6 +583,16 @@ export const DeviceSetup: React.FC = () => {
               Add Device
             </button>
           )}
+
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className="print:hidden px-3.5 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-lg font-semibold text-xs flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            title="Print current module view"
+          >
+            <Printer className="w-3.5 h-3.5" />
+            Print
+          </button>
         </div>
       </div>
 

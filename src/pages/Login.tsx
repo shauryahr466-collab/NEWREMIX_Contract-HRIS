@@ -1,10 +1,27 @@
 import React, { useEffect, useState } from 'react';
-import { Shield, CheckCircle2, Mail, Lock, Loader2, Eye, EyeOff, KeyRound, AlertCircle } from 'lucide-react';
+import {
+  Shield, Mail, Lock, Loader2, Eye, EyeOff, KeyRound, AlertCircle,
+  Users, Fingerprint, Clock, CalendarCheck, Banknote, Wrench, HardHat, BarChart3
+} from 'lucide-react';
 import { toast } from 'sonner';
 import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '../store';
 import { setInMemorySession } from '../lib/authSession';
 import { Button, Input } from '../components/ui';
+
+const brandLogoUrl = new URL('../assets/images/hris_brand_logo_1795588532300.jpg', import.meta.url).href;
+const manpowerSceneUrl = new URL('../assets/images/hris_manpower_scene_1795588532417.jpg', import.meta.url).href;
+
+const HR_TOOL_TILES = [
+  { label: 'Workforce', icon: Users, tone: 'text-rose-400 bg-rose-500/10 border-rose-500/20' },
+  { label: 'Biometrics', icon: Fingerprint, tone: 'text-sky-400 bg-sky-500/10 border-sky-500/20' },
+  { label: 'Attendance', icon: Clock, tone: 'text-amber-400 bg-amber-500/10 border-amber-500/20' },
+  { label: 'Leave', icon: CalendarCheck, tone: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20' },
+  { label: 'Payroll', icon: Banknote, tone: 'text-green-400 bg-green-500/10 border-green-500/20' },
+  { label: 'Shifts', icon: Wrench, tone: 'text-indigo-400 bg-indigo-500/10 border-indigo-500/20' },
+  { label: 'Assets', icon: HardHat, tone: 'text-orange-400 bg-orange-500/10 border-orange-500/20' },
+  { label: 'Analytics', icon: BarChart3, tone: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/20' },
+] as const;
 
 type BootstrapStatus = {
   setupRequired: boolean;
@@ -155,46 +172,53 @@ export function Login() {
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center p-4 sm:p-6">
       <div className="max-w-4xl w-full grid grid-cols-1 md:grid-cols-2 bg-white dark:bg-slate-900 rounded-2xl shadow-xl overflow-hidden border border-slate-200 dark:border-slate-800">
-        {/* Left Side: Enterprise Branding */}
-        <div className="hidden md:flex flex-col justify-between p-10 lg:p-12 bg-slate-900 text-white border-r border-slate-800">
-          <div className="space-y-8">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-lg bg-primary flex items-center justify-center">
-                <Shield size={18} className="text-white" />
-              </div>
-              <div>
-                <span className="text-sm font-bold tracking-tight uppercase block">Contractor HRIS</span>
-                <span className="text-[11px] text-slate-400">Company Network Portal</span>
-              </div>
+        {/* Left Side: Enterprise Logo & Pictorial HR Manpower Operations */}
+        <div className="hidden md:flex flex-col items-center justify-between p-8 lg:p-10 bg-[#0F172A] text-white border-r border-slate-800">
+          <div className="w-full flex items-center gap-3">
+            <div className="w-12 h-12 rounded-xl overflow-hidden border border-white/10 bg-[#0F172A] shrink-0 shadow-md">
+              <img
+                src={brandLogoUrl}
+                alt="HRIS Enterprise Logo"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover"
+              />
             </div>
-
-            <div className="space-y-3">
-              <h1 className="text-2xl lg:text-3xl font-bold leading-tight tracking-tight text-white">
-                Enterprise Workforce &amp; Biometric Attendance
-              </h1>
-              <p className="text-slate-300 text-sm leading-relaxed">
-                Authorized company access only. Attendance logs, ZKTeco hardware sync, overtime approvals, and payroll run directly on your local server.
-              </p>
-            </div>
-
-            <div className="space-y-3 pt-2">
-              {[
-                'Role-scoped department & section visibility',
-                'Automated ZKTeco biometric punch sync',
-                'Public holiday validation & ISO reporting',
-                'Signed company network sessions'
-              ].map((feature, i) => (
-                <div key={i} className="flex items-center gap-2.5 text-sm text-slate-200">
-                  <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
-                  <span>{feature}</span>
-                </div>
-              ))}
+            <div className="min-w-0">
+              <span className="text-base font-bold tracking-tight uppercase block text-white">
+                Contractor HRIS
+              </span>
+              <span className="text-[11px] font-medium text-slate-400 tracking-wide uppercase">
+                Workforce Operations
+              </span>
             </div>
           </div>
 
-          <div className="pt-6 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
-            <span>Provisioned Accounts Only</span>
-            <span>SQLite Local Core</span>
+          <div className="w-full my-5 rounded-xl overflow-hidden border border-white/10 bg-[#0F172A] shadow-lg">
+            <img
+              src={manpowerSceneUrl}
+              alt="HR manpower, biometric attendance, shift roster, payroll, assets, and analytics visual diagram"
+              referrerPolicy="no-referrer"
+              className="w-full h-auto object-cover block"
+            />
+          </div>
+
+          <div className="w-full grid grid-cols-4 gap-2">
+            {HR_TOOL_TILES.map((tile) => {
+              const Icon = tile.icon;
+              return (
+                <div
+                  key={tile.label}
+                  className="flex flex-col items-center justify-center gap-1.5 py-2.5 px-1.5 rounded-lg bg-white/[0.03] border border-white/10"
+                >
+                  <div className={`w-7 h-7 rounded-md border flex items-center justify-center ${tile.tone}`}>
+                    <Icon size={14} />
+                  </div>
+                  <span className="text-[10px] font-semibold text-slate-300 tracking-tight truncate max-w-full">
+                    {tile.label}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
 

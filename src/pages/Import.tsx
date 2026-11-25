@@ -387,6 +387,7 @@ export function Import() {
           const isEmpIdKey = (k: string) => {
             const l = k.toLowerCase().trim();
             return l === 'employee no.' || l === 'emp id' || l === 'emp_id' || l === 'empid' ||
+                   l === 'empcode' || l === 'emp_code' || l === 'emp code' ||
                    l.includes('ac-no') || l.includes('ac_no') || l.includes('ac no') ||
                    l.includes('employee no') || l.includes('employee_no') || l.includes('employee') ||
                    l.includes('userid') || l.includes('user id') || l.includes('user_id') ||

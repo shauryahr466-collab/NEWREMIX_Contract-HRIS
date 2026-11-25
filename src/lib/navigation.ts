@@ -19,6 +19,7 @@ export interface NavItemConfig {
   to: string;
   icon: any;
   label: string;
+  employeeLabel?: string;
   moduleKey: ModuleKey;
   children?: NavSubItemConfig[];
 }
@@ -55,6 +56,7 @@ export const NAV_GROUPS: NavGroupConfig[] = [
         to: '/attendance',
         icon: Fingerprint,
         label: 'Attendance Logs',
+        employeeLabel: 'My Attendance',
         moduleKey: 'attendance',
         children: [
           { to: '/attendance?tab=reconciliation', tab: 'reconciliation', icon: ListChecks, label: 'Attendance Reconciliation' },
@@ -66,9 +68,9 @@ export const NAV_GROUPS: NavGroupConfig[] = [
       { to: '/devices', icon: Cpu, label: 'Device Setup', moduleKey: 'devices' },
       { to: '/import', icon: FileUp, label: 'Master Data Import', moduleKey: 'import' },
       { to: '/auditor', icon: ShieldAlert, label: 'Attendance Auditor', moduleKey: 'auditor' },
-      { to: '/overtime', icon: Clock, label: 'OT Audit Log', moduleKey: 'overtime' },
-      { to: '/sbl', icon: CalendarRange, label: 'Leave & SBL', moduleKey: 'sbl' },
-      { to: '/force-attendance', icon: UserCheck, label: 'Manual Corrections', moduleKey: 'forceAttendance' },
+      { to: '/overtime', icon: Clock, label: 'OT Audit Log', employeeLabel: 'OT Request', moduleKey: 'overtime' },
+      { to: '/sbl', icon: CalendarRange, label: 'Leave & SBL', employeeLabel: 'Leave & Substitute Leave', moduleKey: 'sbl' },
+      { to: '/force-attendance', icon: UserCheck, label: 'Manual Corrections', employeeLabel: 'Attendance Request', moduleKey: 'forceAttendance' },
     ],
   },
   {
@@ -99,7 +101,7 @@ export const NAV_GROUPS: NavGroupConfig[] = [
       { to: '/integrations', icon: Webhook, label: 'Integrations & API', moduleKey: 'integrations' },
       { to: '/settings', icon: Settings, label: 'Configuration', moduleKey: 'settings' },
       { to: '/user-access', icon: UserCog, label: 'User & Role Config', moduleKey: 'userAccess' },
-      { to: '/audit-logs', icon: Shield, label: 'System Audit Log', moduleKey: 'auditLogs' },
+      { to: '/audit-logs', icon: Shield, label: 'Approval & Audit Log', moduleKey: 'auditLogs' },
     ],
   },
 ];

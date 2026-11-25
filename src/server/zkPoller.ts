@@ -23,7 +23,7 @@ export interface ZkPollingStatus {
 
 export const zkPollingState: ZkPollingStatus = {
   enabled: true,
-  readOnlyMode: process.env.ZK_ALLOW_DIRECT_WRITE !== 'true',
+  readOnlyMode: process.env.ZK_READ_ONLY_OBSERVER === 'true',
   intervalSeconds: 900,
   intervalMinutes: 15,
   isPollingNow: false,
@@ -203,6 +203,19 @@ function normalizeEmpId(raw: string): string {
   return digits || s.toLowerCase();
 }
 
+function parseWallClockMs(dt: string): number {
+  const m = String(dt || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return NaN;
+  return Date.UTC(
+    parseInt(m[1], 10),
+    parseInt(m[2], 10) - 1,
+    parseInt(m[3], 10),
+    parseInt(m[4], 10),
+    parseInt(m[5], 10),
+    parseInt(m[6] || '0', 10)
+  );
+}
+
 export function normalizeZkDateTime(raw: unknown): string | null {
   if (!raw) return null;
   if (raw instanceof Date && !isNaN(raw.getTime())) {
@@ -378,7 +391,9 @@ interface SystemDirectoryContext {
   existingMappedEmpIds: Set<string>;
   existingPunchIds: Set<string>;
   existingPunchEmpTimes: Set<string>;
+  existingPunchMsByEmp: Map<string, number[]>;
   existingUnmappedKeys: Set<string>;
+  duplicateMergeMinutes: number;
 }
 
 function loadSystemContext(db: any): SystemDirectoryContext {
@@ -392,7 +407,20 @@ function loadSystemContext(db: any): SystemDirectoryContext {
   const existingMappedEmpIds = new Set<string>();
   const existingPunchIds = new Set<string>();
   const existingPunchEmpTimes = new Set<string>();
+  const existingPunchMsByEmp = new Map<string, number[]>();
   const existingUnmappedKeys = new Set<string>();
+  let duplicateMergeMinutes = 5;
+
+  try {
+    const sRes = db.exec("SELECT data FROM settings WHERE id = 'config' LIMIT 1");
+    if (sRes.length > 0 && sRes[0].values.length > 0 && sRes[0].values[0][0]) {
+      const cfg = JSON.parse(String(sRes[0].values[0][0]));
+      const m = Number(cfg?.duplicateMergeTime);
+      if (Number.isFinite(m) && m >= 0) {
+        duplicateMergeMinutes = m;
+      }
+    }
+  } catch {}
 
   try {
     const empRes = db.exec('SELECT id, name, department, joining_date, status, data FROM employees');
@@ -482,7 +510,18 @@ function loadSystemContext(db: any): SystemDirectoryContext {
         const eId = String(row[1] || '').trim();
         const pDt = String(row[2] || '').trim().replace(' ', 'T').slice(0, 19);
         if (pId) existingPunchIds.add(pId);
-        if (eId && pDt) existingPunchEmpTimes.add(`${eId}|${pDt}`);
+        if (eId && pDt) {
+          existingPunchEmpTimes.add(`${eId}|${pDt}`);
+          const tsMs = parseWallClockMs(pDt);
+          if (!isNaN(tsMs)) {
+            let list = existingPunchMsByEmp.get(eId);
+            if (!list) {
+              list = [];
+              existingPunchMsByEmp.set(eId, list);
+            }
+            list.push(tsMs);
+          }
+        }
       }
     }
   } catch (e) {
@@ -513,7 +552,9 @@ function loadSystemContext(db: any): SystemDirectoryContext {
     existingMappedEmpIds,
     existingPunchIds,
     existingPunchEmpTimes,
-    existingUnmappedKeys
+    existingPunchMsByEmp,
+    existingUnmappedKeys,
+    duplicateMergeMinutes
   };
 }
 
@@ -776,6 +817,7 @@ export interface IngestZkBatchParams {
   deviceIP?: string;
   serialNumber?: string;
   protocolUsed?: string;
+  direction?: 'AUTO' | 'IN' | 'OUT';
   punches: ZkRawPunch[];
   users?: ZkDeviceUser[];
   durationMs?: number;
@@ -784,7 +826,9 @@ export interface IngestZkBatchParams {
   status?: 'Success' | 'Failed';
   deviceStatus?: 'online' | 'offline';
   errorMessage?: string;
-  freeSizes?: { userCount: number; logCount: number };
+  skippedUnchangedCount?: boolean;
+  fullReadPerformed?: boolean;
+  freeSizes?: { userCount: number; logCount: number; fpCount?: number; faceCount?: number };
 }
 
 export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Promise<{
@@ -809,6 +853,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
     let resolvedDevId = String(params.deviceId || '').trim();
     let resolvedDevName = String(params.deviceName || '').trim();
     let resolvedDevIp = String(params.deviceIP || '').trim();
+    let resolvedDirection: 'AUTO' | 'IN' | 'OUT' = params.direction || 'AUTO';
 
     try {
       const devRes = db.exec('SELECT id, data FROM zk_devices');
@@ -824,6 +869,9 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
             resolvedDevId = id;
             resolvedDevName = resolvedDevName || d.name || id;
             resolvedDevIp = resolvedDevIp || d.ip || '';
+            if (!params.direction && (d.direction === 'IN' || d.direction === 'OUT' || d.direction === 'AUTO')) {
+              resolvedDirection = d.direction;
+            }
             break;
           }
         }
@@ -875,7 +923,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       mapStmt.free();
     }
 
-    // 2. Process & store incoming attendance punches cleanly against system directory
+    // 2. Process & store incoming attendance punches cleanly (sorted chronologically so first punch wins inside dedupe window)
     const punchStmt = db.prepare(`
       INSERT OR IGNORE INTO attendance_punches (id, employee_id, punch_datetime, device_id, source, data, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -885,12 +933,17 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       VALUES (?, ?, ?)
     `);
 
-    const candidatePunches: any[] = [];
+    const sortedIncoming = [...params.punches]
+      .map((raw) => ({ raw, dt: normalizeZkDateTime(raw.punchDateTime) }))
+      .filter((x): x is { raw: ZkRawPunch; dt: string } => Boolean(x.dt && String(x.raw.deviceUserId || '').trim()))
+      .sort((a, b) => a.dt.localeCompare(b.dt));
 
-    for (const raw of params.punches) {
+    const mergeWindowMs = Math.max(0, ctx.duplicateMergeMinutes) * 60 * 1000;
+    const candidatePunches: any[] = [];
+    const candidateMsByEmp = new Map<string, number[]>();
+
+    for (const { raw, dt } of sortedIncoming) {
       const rawUid = String(raw.deviceUserId || '').trim();
-      const dt = normalizeZkDateTime(raw.punchDateTime);
-      if (!rawUid || !dt) continue;
 
       const resolved = resolveEmployeeForDeviceUser(ctx, rawUid);
       if (resolved.isInactive) {
@@ -936,6 +989,28 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
         continue;
       }
 
+      // Collapse punches inside duplicate merge window to the first punch
+      const tsMs = parseWallClockMs(dt);
+      if (mergeWindowMs > 0 && !isNaN(tsMs)) {
+        const storedList = ctx.existingPunchMsByEmp.get(empId) || [];
+        const batchList = candidateMsByEmp.get(empId) || [];
+        const nearStored = storedList.some(prevMs => Math.abs(tsMs - prevMs) <= mergeWindowMs);
+        const nearBatch = batchList.some(prevMs => Math.abs(tsMs - prevMs) <= mergeWindowMs);
+        if (nearStored || nearBatch) {
+          duplicates++;
+          continue;
+        }
+        batchList.push(tsMs);
+        candidateMsByEmp.set(empId, batchList);
+      }
+
+      const resolvedInOut =
+        resolvedDirection === 'IN'
+          ? 0
+          : resolvedDirection === 'OUT'
+            ? 1
+            : raw.inOutMode;
+
       candidatePunches.push({
         id: pId,
         employeeId: empId,
@@ -944,6 +1019,8 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
         deviceName: resolvedDevName,
         deviceIP: resolvedDevIp,
         deviceUserId: rawUid,
+        ...(resolvedInOut !== undefined ? { inOutMode: resolvedInOut } : {}),
+        direction: resolvedDirection,
         source: 'ZKTeco',
         syncTime: now,
         transactionId: pId,
@@ -965,6 +1042,12 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       punchStmt.run([pObj.id, pObj.employeeId, pObj.punchDatetime, resolvedDevId, 'ZKTeco', JSON.stringify(pObj), now]);
       ctx.existingPunchIds.add(pObj.id);
       ctx.existingPunchEmpTimes.add(empTimeKey);
+      const tsMs = parseWallClockMs(pObj.punchDatetime);
+      if (!isNaN(tsMs)) {
+        const list = ctx.existingPunchMsByEmp.get(pObj.employeeId) || [];
+        list.push(tsMs);
+        ctx.existingPunchMsByEmp.set(pObj.employeeId, list);
+      }
       newRecords++;
     }
 
@@ -979,23 +1062,43 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
           : undefined;
 
     const devOverrides = new Map<string, Partial<any>>();
-    devOverrides.set(resolvedDevId, {
+    const overrideObj: Record<string, any> = {
       status: params.deviceStatus || 'online',
       lastProtocolUsed: params.protocolUsed || params.mode || undefined,
       lastConnection: params.deviceStatus === 'offline' ? undefined : now,
       lastSync: params.status === 'Failed' ? undefined : now,
       lastSuccessfulSync: params.status === 'Failed' ? undefined : now,
+      lastFullReadAt: params.fullReadPerformed && params.status !== 'Failed' ? now : undefined,
+      lastPollAttemptAt: now,
       lastLatencyMs: measuredLatency,
       lastProbeAt: now,
       lastError: params.errorMessage || '',
-      ...(params.freeSizes ? {
-        ...(params.freeSizes.userCount > 0 ? { deviceCapacityUsers: params.freeSizes.userCount } : {}),
-        ...(params.freeSizes.logCount > 0 ? { deviceCapacityLogs: params.freeSizes.logCount } : {})
-      } : {})
-    });
-    // Strip undefined override keys cleanly so old timestamps aren't wiped
-    const cleanOverride = devOverrides.get(resolvedDevId)!;
-    Object.keys(cleanOverride).forEach(k => cleanOverride[k] === undefined && delete cleanOverride[k]);
+      ...(params.status !== 'Failed'
+        ? {
+            lastReadRecords: params.skippedUnchangedCount ? 0 : params.punches.length,
+            lastNewRecords: newRecords
+          }
+        : {}),
+      ...(params.freeSizes
+        ? {
+            ...(typeof params.freeSizes.logCount === 'number' && params.freeSizes.logCount >= 0
+              ? {
+                  lastDeviceLogCount: params.freeSizes.logCount,
+                  deviceCapacityLogs: params.freeSizes.logCount
+                }
+              : {}),
+            ...(params.freeSizes.userCount > 0 ? { deviceCapacityUsers: params.freeSizes.userCount } : {}),
+            ...(typeof params.freeSizes.fpCount === 'number' && params.freeSizes.fpCount > 0
+              ? { fpCount: params.freeSizes.fpCount }
+              : {}),
+            ...(typeof params.freeSizes.faceCount === 'number' && params.freeSizes.faceCount > 0
+              ? { faceCount: params.freeSizes.faceCount, userFaceCount: params.freeSizes.faceCount }
+              : {})
+          }
+        : {})
+    };
+    Object.keys(overrideObj).forEach(k => overrideObj[k] === undefined && delete overrideObj[k]);
+    devOverrides.set(resolvedDevId, overrideObj);
 
     updateDeviceStatsFromSqlite(db, devOverrides);
 
@@ -1003,7 +1106,7 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       deviceId: resolvedDevId,
       deviceName: resolvedDevName,
       status: params.status || 'Success',
-      recordsRead: params.punches.length,
+      recordsRead: params.skippedUnchangedCount ? 0 : params.punches.length,
       newRecords,
       duplicates,
       errors: params.status === 'Failed' ? 1 : 0,
@@ -1012,7 +1115,11 @@ export async function ingestZkPunchesToSqlite(params: IngestZkBatchParams): Prom
       inactiveSkipped,
       holidayOverlapsSkipped,
       mode: params.mode || 'ZKT Sync',
-      message: params.errorMessage || `Processed ${params.punches.length} logs (${newRecords} new stored, ${duplicates} skipped${holidayOverlapsSkipped > 0 ? `, ${holidayOverlapsSkipped} holiday overlaps prevented` : ''})`
+      message:
+        params.errorMessage ||
+        (params.skippedUnchangedCount
+          ? `Count unchanged on terminal (${params.freeSizes?.logCount ?? 0} raw logs) — skipped bulk transfer`
+          : `Processed ${params.punches.length} logs (${newRecords} new stored, ${duplicates} skipped${holidayOverlapsSkipped > 0 ? `, ${holidayOverlapsSkipped} holiday overlaps prevented` : ''})`)
     });
 
     db.run('COMMIT');
@@ -1180,7 +1287,11 @@ export async function scanWatchFolderAndIngestToSqlite(deviceId?: string) {
   };
 }
 
-export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'Manual Poll') {
+export async function pollSingleZkDeviceToSqlite(
+  deviceIdOrIp: string,
+  mode = 'Manual Poll',
+  options?: { fullRead?: boolean }
+) {
   const startTime = Date.now();
   const db = await getSqliteDb();
   let targetDev: any = null;
@@ -1221,11 +1332,13 @@ export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'M
       deviceId: targetDev.id,
       deviceName: targetDev.name,
       deviceIP: targetDev.ip,
+      direction: targetDev.direction || 'AUTO',
       protocolUsed: 'USB/WatchFolder',
       punches: allPunches,
       durationMs: Date.now() - startTime,
       mode: `${mode} (Disk/Watch Scan)`,
       deviceStatus: 'online',
+      fullReadPerformed: true,
       status: 'Success'
     });
     return { ...res, message: `Scanned local disk/watch folder (${diskFiles.length} files) for ${targetDev.name}: ${res.newRecords} new punches saved to SQLite.` };
@@ -1244,36 +1357,53 @@ export async function pollSingleZkDeviceToSqlite(deviceIdOrIp: string, mode = 'M
     };
   }
 
+  const lastFullMs = targetDev.lastFullReadAt ? Date.parse(String(targetDev.lastFullReadAt)) : NaN;
+  const needsDailyFullRead = isNaN(lastFullMs) || Date.now() - lastFullMs >= 24 * 60 * 60 * 1000;
+  const forceFullRead = Boolean(options?.fullRead) || needsDailyFullRead;
+  const knownLogCount =
+    typeof targetDev.lastDeviceLogCount === 'number' && targetDev.lastDeviceLogCount >= 0
+      ? targetDev.lastDeviceLogCount
+      : undefined;
+
   const hw = await fetchZkHardwareData(
     targetDev.ip,
     Number(targetDev.port) || 4370,
     Number(targetDev.commKey) || 0,
     3500,
-    protocolMode
+    protocolMode,
+    { knownLogCount, forceFullRead }
   );
+
   if (hw.reachable) {
     const res = await ingestZkPunchesToSqlite({
       deviceId: targetDev.id,
       deviceName: targetDev.name,
       deviceIP: targetDev.ip,
       serialNumber: hw.serialNumber || targetDev.serialNumber,
+      direction: targetDev.direction || 'AUTO',
       protocolUsed: hw.protocol,
       punches: hw.punches,
       users: hw.users,
-      freeSizes: hw.freeSizes ? { userCount: hw.freeSizes.userCount, logCount: hw.freeSizes.logCount } : undefined,
+      freeSizes: hw.freeSizes,
       durationMs: Date.now() - startTime,
       latencyMs: hw.latencyMs,
-      mode: `${mode} (${hw.protocol})`,
+      skippedUnchangedCount: Boolean(hw.skippedUnchangedCount),
+      fullReadPerformed: !hw.skippedUnchangedCount,
+      mode: hw.skippedUnchangedCount ? `${mode} (Count Unchanged)` : `${mode} (${hw.protocol})`,
       deviceStatus: 'online',
       status: 'Success'
     });
     return {
       ...res,
       reachable: true,
+      skippedUnchangedCount: Boolean(hw.skippedUnchangedCount),
+      deviceLogCount: hw.freeSizes?.logCount ?? knownLogCount,
       protocol: hw.protocol,
       latencyMs: hw.latencyMs,
       attempts: hw.attempts,
-      message: `Polled ${targetDev.name} (${targetDev.ip}) via ${hw.protocol}: ${res.recordsRead} read, ${res.newRecords} new stored in SQLite, ${res.duplicates} duplicates skipped.`
+      message: hw.skippedUnchangedCount
+        ? `Checked ${targetDev.name} (${targetDev.ip}): log count unchanged (${hw.freeSizes?.logCount ?? 0} raw), skipped full transfer.`
+        : `Polled ${targetDev.name} (${targetDev.ip}) via ${hw.protocol}: ${res.recordsRead} read, ${res.newRecords} new stored in SQLite, ${res.duplicates} duplicates skipped.`
     };
   }
 
@@ -1486,7 +1616,9 @@ export async function probeAllZkDevicesHealth(timeoutMs = 1500) {
   };
 }
 
-export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mode?: string; forceDirectPoll?: boolean } = {}) {
+export async function pollAllZkDevicesToSqlite(
+  options: { dueOnly?: boolean; mode?: string; forceDirectPoll?: boolean; fullRead?: boolean } = {}
+) {
   if (zkPollingState.readOnlyMode && !options.forceDirectPoll) {
     const obs = await detectExternalPunchChangesReadOnly();
     return {
@@ -1533,21 +1665,44 @@ export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mod
     const targetDevices = options.dueOnly
       ? enabledDevices.filter(d => {
           if (d.autoSyncMinutes === 0) return false;
-          if (!d.lastSync) return true;
-          const lastMs = Date.parse(String(d.lastSync));
+          const refTs = d.lastPollAttemptAt || d.lastSync;
+          if (!refTs) return true;
+          const lastMs = Date.parse(String(refTs));
           return isNaN(lastMs) || nowMs - lastMs >= globalScheduleMins * 60 * 1000;
         })
       : enabledDevices;
 
-    const results: any[] = [];
+    if (options.dueOnly && targetDevices.length === 0) {
+      return {
+        success: true,
+        skippedBusy: false,
+        skippedNotDue: true,
+        mode: options.mode || 'Scheduled Auto-Poll',
+        polledAt: new Date().toISOString(),
+        durationMs: Date.now() - startTime,
+        devicesEnabled: enabledDevices.length,
+        devicesPolled: 0,
+        reachableDevices: 0,
+        totalRead: 0,
+        totalNew: 0,
+        totalDup: 0,
+        results: []
+      };
+    }
+
+    const pollLabel = options.mode || (options.dueOnly ? 'Scheduled Auto-Poll' : options.fullRead ? 'Manual Full Read' : 'Manual Sync');
+    const results = await Promise.all(
+      targetDevices.map(dev =>
+        pollSingleZkDeviceToSqlite(dev.id, pollLabel, { fullRead: Boolean(options.fullRead) })
+      )
+    );
+
     let totalRead = 0;
     let totalNew = 0;
     let totalDup = 0;
     let reachableDevices = 0;
 
-    for (const dev of targetDevices) {
-      const r = await pollSingleZkDeviceToSqlite(dev.id, options.mode || (options.dueOnly ? 'Scheduled Auto-Poll' : 'Manual Batch Poll'));
-      results.push(r);
+    for (const r of results) {
       totalRead += Number(r.recordsRead || 0);
       totalNew += Number(r.newRecords || 0);
       totalDup += Number(r.duplicates || 0);
@@ -1581,7 +1736,7 @@ export async function pollAllZkDevicesToSqlite(options: { dueOnly?: boolean; mod
     const summary = {
       success: true,
       skippedBusy: false,
-      mode: options.mode || (options.dueOnly ? 'Scheduled Auto-Poll' : 'Manual Poll'),
+      mode: pollLabel,
       polledAt: nowIso,
       durationMs: Date.now() - startTime,
       devicesEnabled: enabledDevices.length,
@@ -1723,13 +1878,14 @@ export async function getZkPollingSummaryFromSqlite() {
 export const VERIFIED_ZK_FLEET = [
   {
     id: 'dev_main_192_168_117_200',
-    name: 'Time Office 2',
+    name: 'Time Office 1',
     ip: '192.168.117.200',
     port: 4370,
     model: 'MB2000/ID',
     serialNumber: 'BRC7233360063',
     deviceNumber: 1,
     commType: 'Ethernet',
+    direction: 'AUTO' as const,
     enabled: true,
     protocolMode: 'Auto',
     commKey: 0,
@@ -1746,13 +1902,14 @@ export const VERIFIED_ZK_FLEET = [
   },
   {
     id: 'dev_factory_192_168_117_201',
-    name: 'Time Office 1',
+    name: 'Time Office 3',
     ip: '192.168.117.201',
     port: 4370,
     model: 'MB2000/ID',
     serialNumber: 'BRC7233360027',
     deviceNumber: 1,
     commType: 'Ethernet',
+    direction: 'AUTO' as const,
     enabled: true,
     protocolMode: 'Auto',
     commKey: 0,
@@ -1776,6 +1933,7 @@ export const VERIFIED_ZK_FLEET = [
     serialNumber: 'MFP3241900135',
     deviceNumber: 1,
     commType: 'Ethernet',
+    direction: 'AUTO' as const,
     enabled: true,
     protocolMode: 'Auto',
     commKey: 0,
@@ -2034,4 +2192,200 @@ export async function readStoredPunchesFromSqlite(options: { deviceId?: string; 
     latestPunchDatetime: punches[0]?.punchDatetime || null,
     punches
   };
+}
+
+export async function normalizeDefaultFleetNamesAndDirectionsInSqlite(): Promise<number> {
+  return withSqliteWriteLock(async () => {
+    const db = await getSqliteDb();
+    let updated = 0;
+    const now = new Date().toISOString();
+    try {
+      const devRes = db.exec('SELECT id, data FROM zk_devices');
+      if (devRes.length === 0) return 0;
+
+      try { db.run('ROLLBACK'); } catch {}
+      db.run('BEGIN TRANSACTION');
+      const upStmt = db.prepare('UPDATE zk_devices SET data = ?, updated_at = ? WHERE id = ?');
+
+      for (const r of devRes[0].values) {
+        const id = String(r[0]);
+        let d: any = {};
+        try { d = JSON.parse(String(r[1] || '{}')); } catch { continue; }
+        let dirty = false;
+
+        if (id === 'dev_main_192_168_117_200' && d.name === 'Time Office 2') {
+          d.name = 'Time Office 1';
+          dirty = true;
+        }
+        if (id === 'dev_factory_192_168_117_201' && d.name === 'Time Office 1') {
+          d.name = 'Time Office 3';
+          dirty = true;
+        }
+        if (!d.direction) {
+          d.direction = 'AUTO';
+          dirty = true;
+        }
+        if (dirty) {
+          upStmt.run([JSON.stringify(d), now, id]);
+          updated++;
+        }
+      }
+
+      upStmt.free();
+      db.run('COMMIT');
+      if (updated > 0) saveSqliteDb();
+    } catch {
+      try { db.run('ROLLBACK'); } catch {}
+    }
+    return updated;
+  });
+}
+
+export async function getAttendanceLogsForExportFromSqlite(options: {
+  startDate: string;
+  endDate: string;
+  onlyDatabaseEmployees?: boolean;
+}): Promise<{
+  success: boolean;
+  startDate: string;
+  endDate: string;
+  onlyDatabaseEmployees: boolean;
+  totalRows: number;
+  rows: Array<{ Department: string; Name: string; EmpCode: string; PunchDateTime: string }>;
+}> {
+  const start = String(options.startDate || '').trim().slice(0, 10);
+  const end = String(options.endDate || '').trim().slice(0, 10);
+  const onlyDb = options.onlyDatabaseEmployees !== false;
+
+  return withReadOnlySqliteSnapshot((db) => {
+    const empById = new Map<string, { id: string; name: string; department: string }>();
+    const empLookup = new Map<string, string>();
+    const mapByDevUser = new Map<string, string>();
+
+    try {
+      const eRes = db.exec('SELECT id, name, department, data FROM employees');
+      if (eRes.length > 0) {
+        for (const r of eRes[0].values) {
+          const eid = String(r[0] || '').trim();
+          if (!eid) continue;
+          let name = String(r[1] || eid).trim();
+          let dept = String(r[2] || 'General').trim();
+          let dataObj: any = {};
+          if (r[3]) {
+            try {
+              dataObj = JSON.parse(String(r[3]));
+              if (dataObj.name) name = String(dataObj.name).trim();
+              if (dataObj.department) dept = String(dataObj.department).trim();
+            } catch {}
+          }
+          empById.set(eid, { id: eid, name, department: dept });
+          empLookup.set(eid, eid);
+          empLookup.set(eid.toLowerCase(), eid);
+          const norm = normalizeEmpId(eid);
+          if (norm) empLookup.set(norm, eid);
+        }
+      }
+    } catch {}
+
+    try {
+      const mRes = db.exec('SELECT device_user_id, employee_id FROM zk_user_mappings');
+      if (mRes.length > 0) {
+        for (const r of mRes[0].values) {
+          const devUid = String(r[0] || '').trim();
+          const empId = String(r[1] || '').trim();
+          if (devUid && empId) {
+            mapByDevUser.set(devUid, empId);
+            mapByDevUser.set(devUid.toLowerCase(), empId);
+            const norm = normalizeEmpId(devUid);
+            if (norm) mapByDevUser.set(norm, empId);
+          }
+        }
+      }
+    } catch {}
+
+    const rows: Array<{ Department: string; Name: string; EmpCode: string; PunchDateTime: string }> = [];
+    const stmt = db.prepare(`
+      SELECT id, employee_id, punch_datetime, source, data
+      FROM attendance_punches
+      WHERE substr(punch_datetime, 1, 10) >= ? AND substr(punch_datetime, 1, 10) <= ?
+      ORDER BY punch_datetime ASC
+    `);
+    stmt.bind([start, end]);
+    while (stmt.step()) {
+      const row = stmt.get();
+      const id = String(row[0] || '').trim();
+      const rawEmpId = String(row[1] || '').trim();
+      const rawDt = String(row[2] || '').trim();
+      let source = String(row[3] || '').trim();
+      let pObj: any = {};
+      if (row[4]) {
+        try { pObj = JSON.parse(String(row[4])); } catch {}
+      }
+      source = String(pObj.source || source || '');
+
+      // Exclude manual attendance corrections / forced attendance; keep terminal & uploaded punch logs
+      if (
+        source === 'Manual' ||
+        id.startsWith('manual_') ||
+        id.startsWith('force_') ||
+        pObj.importFormat === 'manual'
+      ) {
+        continue;
+      }
+
+      const normRaw = normalizeEmpId(rawEmpId);
+      const matchedEmpId =
+        empLookup.get(rawEmpId) ||
+        empLookup.get(rawEmpId.toLowerCase()) ||
+        (normRaw ? empLookup.get(normRaw) : undefined) ||
+        mapByDevUser.get(rawEmpId) ||
+        (normRaw ? mapByDevUser.get(normRaw) : undefined);
+
+      const empInfo = matchedEmpId ? empById.get(matchedEmpId) : undefined;
+      if (onlyDb && !empInfo) {
+        continue;
+      }
+
+      const formattedDt = rawDt.replace('T', ' ').slice(0, 19);
+      rows.push({
+        Department: empInfo?.department || 'Unregistered',
+        Name: empInfo?.name || String(pObj.deviceUserId || rawEmpId),
+        EmpCode: empInfo?.id || rawEmpId,
+        PunchDateTime: formattedDt
+      });
+    }
+    stmt.free();
+
+    if (!onlyDb) {
+      try {
+        const uStmt = db.prepare('SELECT data FROM zk_unmapped_punches');
+        while (uStmt.step()) {
+          const row = uStmt.get();
+          let uObj: any = {};
+          try { uObj = JSON.parse(String(row[0] || '{}')); } catch { continue; }
+          if (uObj.status && uObj.status !== 'pending') continue;
+          const dt = String(uObj.punchDateTime || '').replace('T', ' ').slice(0, 19);
+          const datePart = dt.slice(0, 10);
+          if (!datePart || datePart < start || datePart > end) continue;
+          rows.push({
+            Department: 'Unmapped',
+            Name: String(uObj.deviceName || 'Biometric Terminal'),
+            EmpCode: String(uObj.deviceUserId || ''),
+            PunchDateTime: dt
+          });
+        }
+        uStmt.free();
+      } catch {}
+      rows.sort((a, b) => a.PunchDateTime.localeCompare(b.PunchDateTime));
+    }
+
+    return {
+      success: true,
+      startDate: start,
+      endDate: end,
+      onlyDatabaseEmployees: onlyDb,
+      totalRows: rows.length,
+      rows
+    };
+  });
 }

@@ -69,10 +69,16 @@ export default function DocumentRequests() {
   };
 
   const handleReview = async (rec: DocumentRequestRecord, nextStatus: DocumentRequestRecord['status']) => {
-    const updated: DocumentRequestRecord = {
+    const actorName = effectiveUserProfile?.username || 'HR Admin';
+    const actorRole = isSuperAdmin ? 'Super Admin' : effectiveUserProfile?.role || 'Department Head';
+    const wasProcessed = rec.status !== 'Pending';
+    const updated: DocumentRequestRecord & Record<string, any> = {
       ...rec,
       status: nextStatus,
-      reviewedBy: effectiveUserProfile?.username || 'HR Admin',
+      reviewedBy: actorName,
+      reviewedByRole: actorRole,
+      approvedBy: actorName,
+      approvedByRole: actorRole,
       updatedAt: new Date().toISOString(),
     };
     if (await saveLocalTable('hr_document_requests', [updated])) {
@@ -88,7 +94,9 @@ export default function DocumentRequests() {
         },
         settings
       );
-      toast.success(`Request ${rec.requestNumber} marked ${nextStatus}.`);
+      toast.success(`${wasProcessed && isSuperAdmin ? 'Super Admin Override → ' : ''}Request ${rec.requestNumber} marked ${nextStatus}.`);
+    } else {
+      toast.error('Unable to update document request (check permissions or Super Admin lock).');
     }
   };
 
@@ -96,6 +104,8 @@ export default function DocumentRequests() {
     if (await deleteLocalTableRecords('hr_document_requests', [id])) {
       setRequests((prev) => prev.filter((r) => r.id !== id));
       toast.success('Request deleted.');
+    } else {
+      toast.error('Unable to delete request (locked by Super Admin or insufficient permission).');
     }
   };
 
@@ -140,8 +150,20 @@ export default function DocumentRequests() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {requests.map((r) => {
+                {requests.map((r: any) => {
                   const datePart = r.requestedAt.slice(0, 10);
+                  const isLockedBySuperAdmin =
+                    !isSuperAdmin &&
+                    Boolean(
+                      r.superAdminOverride ||
+                        r.approvedByRole === 'Super Admin' ||
+                        r.reviewedByRole === 'Super Admin'
+                    );
+                  const canReview =
+                    isSuperAdmin ||
+                    effectiveUserProfile?.role === 'Department Head' ||
+                    effectiveUserProfile?.role === 'Supervisor' ||
+                    effectiveUserProfile?.role === 'Section Incharge';
                   return (
                     <tr key={r.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
                       <td className="px-5 py-3 font-mono font-bold text-primary">{r.requestNumber}</td>
@@ -158,39 +180,74 @@ export default function DocumentRequests() {
                         <span className="text-[10px] text-primary">BS {getNepaliDate(datePart)}</span>
                       </td>
                       <td className="px-4 py-3">
-                        <Badge
-                          variant={
-                            r.status === 'Approved'
-                              ? 'success'
-                              : r.status === 'Rejected'
-                                ? 'danger'
-                                : 'warning'
-                          }
-                        >
-                          {r.status}
-                        </Badge>
+                        <div className="flex flex-col gap-0.5 items-start">
+                          <Badge
+                            variant={
+                              r.status === 'Approved'
+                                ? 'success'
+                                : r.status === 'Rejected'
+                                  ? 'danger'
+                                  : 'warning'
+                            }
+                          >
+                            {r.status}
+                          </Badge>
+                          {r.reviewedBy && r.status !== 'Pending' && (
+                            <span className="text-[10px] text-slate-500">
+                              By {r.reviewedBy}{r.reviewedByRole ? ` (${r.reviewedByRole})` : ''}
+                            </span>
+                          )}
+                          {r.superAdminOverride && (
+                            <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 border border-indigo-200">
+                              Super Admin Override
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-5 py-3 text-right">
-                        <div className="flex items-center justify-end gap-1.5">
-                          {(isSuperAdmin || effectiveUserProfile?.role === 'Department Head') &&
-                            r.status === 'Pending' && (
-                              <>
-                                <Button size="sm" variant="success" onClick={() => handleReview(r, 'Approved')}>
-                                  <CheckCircle2 size={12} /> Approve
-                                </Button>
-                                <Button size="sm" variant="danger" onClick={() => handleReview(r, 'Rejected')}>
-                                  <XCircle size={12} /> Reject
-                                </Button>
-                              </>
-                            )}
+                        <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                          {isLockedBySuperAdmin ? (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                              Locked by Super Admin
+                            </span>
+                          ) : (
+                            <>
+                              {canReview && r.status === 'Pending' && (
+                                <>
+                                  <Button size="sm" variant="success" onClick={() => handleReview(r, 'Approved')}>
+                                    <CheckCircle2 size={12} /> Approve
+                                  </Button>
+                                  <Button size="sm" variant="danger" onClick={() => handleReview(r, 'Rejected')}>
+                                    <XCircle size={12} /> Reject
+                                  </Button>
+                                </>
+                              )}
+                              {isSuperAdmin && r.status !== 'Pending' && (
+                                <>
+                                  {r.status !== 'Approved' && (
+                                    <Button size="sm" variant="success" onClick={() => handleReview(r, 'Approved')}>
+                                      Override Approve
+                                    </Button>
+                                  )}
+                                  {r.status !== 'Rejected' && (
+                                    <Button size="sm" variant="danger" onClick={() => handleReview(r, 'Rejected')}>
+                                      Override Reject
+                                    </Button>
+                                  )}
+                                </>
+                              )}
+                            </>
+                          )}
                           {r.status === 'Approved' && (
                             <Button size="sm" variant="outline" onClick={() => setPreviewReq(r)}>
                               <Printer size={12} /> Letter
                             </Button>
                           )}
-                          <Button size="sm" variant="ghost" onClick={() => handleDelete(r.id)} className="text-rose-600 px-2">
-                            <Trash2 size={13} />
-                          </Button>
+                          {!isLockedBySuperAdmin && (
+                            <Button size="sm" variant="ghost" onClick={() => handleDelete(r.id)} className="text-rose-600 px-2">
+                              <Trash2 size={13} />
+                            </Button>
+                          )}
                         </div>
                       </td>
                     </tr>

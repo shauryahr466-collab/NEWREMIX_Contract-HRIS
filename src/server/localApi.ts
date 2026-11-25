@@ -34,6 +34,7 @@ import {
 import { zkPollingState } from './zkPoller.js';
 import { isEmployeeInUserScope } from '../lib/accessControl.js';
 import { isBootstrapSuperAdminEmail } from './userAccess.js';
+import { getNepaliDate } from '../utils/dateHelper.js';
 import type { ModuleKey, SystemUser } from '../types.js';
 
 export const localRouter = express.Router();
@@ -52,6 +53,7 @@ const SQL_TABLE_MAP: Record<string, string> = {
   force_attendance: 'force_attendance',
   payroll_runs: 'payroll_runs',
   audit_logs: 'audit_logs',
+  approval_audits: 'approval_audits',
   zk_devices: 'zk_devices',
   zk_user_mappings: 'zk_user_mappings',
   zk_sync_logs: 'zk_sync_logs',
@@ -254,15 +256,81 @@ function filterTableRowsForUser(
   return filtered;
 }
 
+const EMPLOYEE_READ_TABLES = new Set([
+  'employees',
+  'punches',
+  'overtime',
+  'sbl',
+  'leave_records',
+  'force_attendance',
+  'shift_assignments',
+  'settings',
+  'holidays',
+  'departments',
+  'sections',
+  'designations'
+]);
+
+const EMPLOYEE_REQUEST_TABLES = new Set([
+  'overtime',
+  'sbl',
+  'leave_records',
+  'force_attendance'
+]);
+
+const APPROVAL_TRACKED_TABLES = new Set([
+  'overtime',
+  'sbl',
+  'leave_records',
+  'force_attendance',
+  'payroll_runs',
+  'hr_document_requests',
+  'audit_decisions'
+]);
+
+const APPROVAL_DECISION_STATUSES = new Set([
+  'Approved',
+  'Rejected',
+  'Final Confirmed',
+  'Not Approved',
+  'Disbursed',
+  'Locked',
+  'Accepted'
+]);
+
+function getApprovalModuleLabel(table: string): string {
+  switch (table) {
+    case 'overtime':
+      return 'Overtime';
+    case 'sbl':
+    case 'leave_records':
+      return 'Leave & SBL';
+    case 'force_attendance':
+      return 'Attendance Request';
+    case 'payroll_runs':
+      return 'Payroll';
+    case 'hr_document_requests':
+      return 'Document Request';
+    case 'audit_decisions':
+      return 'Attendance Audit';
+    default:
+      return table;
+  }
+}
+
 function canReadTable(user: SystemUser | null, table: string): boolean {
   if (!user) return false;
   if (isSuperAdminUser(user)) return true;
+  if (table === 'approval_audits') return false; // Strictly Super Admin Only
+  if (user.role === 'Employee') {
+    return EMPLOYEE_READ_TABLES.has(table);
+  }
   if (table === 'audit_logs') return hasModulePerm(user, 'auditLogs');
   if (table === 'payroll_runs' || table === 'tax_rules' || table === 'deduction_rules' || table === 'salary_components' || table === 'payroll_config_audit') {
     return hasModulePerm(user, 'payroll', 'salaryAnalysis');
   }
   if (table === 'settings' || table === 'holidays' || table === 'departments' || table === 'sections' || table === 'designations') {
-    return true; // needed by authenticated workspace to resolve holiday/shift rules & org dropdowns
+    return true;
   }
   if (table === 'zk_devices' || table === 'zk_sync_logs' || table === 'zk_unmapped_punches') {
     return hasModulePerm(user, 'devices', 'import', 'attendance', 'auditor', 'dashboard');
@@ -270,9 +338,31 @@ function canReadTable(user: SystemUser | null, table: string): boolean {
   return true;
 }
 
-function canWriteTable(user: SystemUser | null, table: string, items: any[]): { allowed: boolean; reason?: string } {
+function canWriteTable(user: SystemUser | null, table: string, items: any[], isDelete = false): { allowed: boolean; reason?: string } {
   if (!user) return { allowed: false, reason: 'Authentication required' };
   if (isSuperAdminUser(user)) return { allowed: true };
+
+  if (table === 'approval_audits') {
+    return { allowed: false, reason: 'Approval audit trail is immutable and maintained automatically by the system.' };
+  }
+
+  // Strict Employee Self-Service Rules
+  if (user.role === 'Employee') {
+    if (isDelete) {
+      return { allowed: false, reason: 'Employees are not permitted to delete HRIS records.' };
+    }
+    if (!EMPLOYEE_REQUEST_TABLES.has(table)) {
+      return { allowed: false, reason: 'Employees may only submit OT, Leave, Substitute Leave, and Attendance Requests.' };
+    }
+    if (!user.linkedEmployeeId) {
+      return { allowed: false, reason: 'Your account is not linked to an active Employee ID.' };
+    }
+    const invalidStatus = items.some(it => String(it?.status || 'Pending').trim() !== 'Pending');
+    if (invalidStatus) {
+      return { allowed: false, reason: 'Employees can only submit Pending requests and cannot approve or reject requests.' };
+    }
+    return { allowed: true };
+  }
 
   if (table === 'settings' || table === 'holidays' || table === 'departments' || table === 'sections' || table === 'designations') {
     return hasModulePerm(user, 'settings')
@@ -290,22 +380,29 @@ function canWriteTable(user: SystemUser | null, table: string, items: any[]): { 
     }
     const wantsApproval = items.some(it => ['Approved', 'Rejected'].includes(String(it?.status || '')));
     if (wantsApproval && !user.permissions?.canApproveOt) {
-      return { allowed: false, reason: 'Your role cannot approve or reject Overtime claims.' };
+      return { allowed: false, reason: 'Your role does not have OT approval permission.' };
     }
     if (!user.permissions?.canSubmitSupervisorOt && !user.permissions?.canApproveOt) {
       return { allowed: false, reason: 'Your role cannot submit or edit Overtime claims.' };
     }
     return { allowed: true };
   }
-  if (table === 'sbl') {
-    return hasModulePerm(user, 'sbl') && (user.permissions?.canEditAttendance || user.permissions?.canApproveOt || user.permissions?.canSubmitSupervisorOt)
+  if (table === 'sbl' || table === 'leave_records') {
+    if (!hasModulePerm(user, 'sbl')) {
+      return { allowed: false, reason: 'Missing Leave & SBL Management access.' };
+    }
+    const wantsDecision = items.some(it => ['Approved', 'Rejected', 'Final Confirmed', 'Not Approved'].includes(String(it?.status || '')));
+    if (wantsDecision && !user.permissions?.canEditAttendance && !user.permissions?.canApproveOt) {
+      return { allowed: false, reason: 'Your role does not have Leave/SBL approval permission.' };
+    }
+    return user.permissions?.canEditAttendance || user.permissions?.canApproveOt || user.permissions?.canSubmitSupervisorOt
       ? { allowed: true }
-      : { allowed: false, reason: 'Missing SBL Management write permission.' };
+      : { allowed: false, reason: 'Missing Leave & SBL Management write permission.' };
   }
-  if (table === 'force_attendance' || table === 'exceptions' || table === 'leave_records' || table === 'field_attendance_audit' || table === 'audit_decisions') {
+  if (table === 'force_attendance' || table === 'exceptions' || table === 'field_attendance_audit' || table === 'audit_decisions') {
     return hasModulePerm(user, 'forceAttendance', 'auditor', 'attendance') && user.permissions?.canEditAttendance
       ? { allowed: true }
-      : { allowed: false, reason: 'Missing Attendance edit permission.' };
+      : { allowed: false, reason: 'Missing Attendance edit/approval permission.' };
   }
   if (table === 'shift_assignments' || table === 'roster_batches' || table === 'roster_assignments' || table === 'shift_audit_logs' || table === 'assignment_logs') {
     return user.permissions?.canManageShifts || hasModulePerm(user, 'employees', 'attendance', 'auditor')
@@ -333,7 +430,7 @@ function canWriteTable(user: SystemUser | null, table: string, items: any[]): { 
       : { allowed: false, reason: 'Missing Biometric Device / Import permission.' };
   }
   if (table === 'audit_logs') {
-    return { allowed: true }; // any authenticated action can append its own audit log entry
+    return { allowed: true };
   }
   if (
     table === 'hr_jobs' ||
@@ -355,12 +452,13 @@ function canWriteTable(user: SystemUser | null, table: string, items: any[]): { 
 function getSseEventForTable(table: string): RealtimeEventType | null {
   if (table === 'employees' || table === 'employee_movements' || table === 'documents') return 'EmployeeUpdated';
   if (table === 'overtime') return 'OvertimeUpdated';
-  if (table === 'sbl') return 'SblUpdated';
+  if (table === 'sbl' || table === 'leave_records') return 'SblUpdated';
   if (table === 'punches' || table === 'zk_devices' || table === 'zk_user_mappings' || table === 'zk_sync_logs' || table === 'zk_unmapped_punches') return 'PunchSnapshotUpdated';
-  if (table === 'force_attendance' || table === 'leave_records' || table === 'exceptions' || table === 'shift_assignments' || table === 'roster_batches' || table === 'roster_assignments' || table === 'shift_audit_logs' || table === 'assignment_logs' || table === 'field_attendance_audit' || table === 'audit_decisions') return 'AttendanceUpdated';
+  if (table === 'force_attendance' || table === 'exceptions' || table === 'shift_assignments' || table === 'roster_batches' || table === 'roster_assignments' || table === 'shift_audit_logs' || table === 'assignment_logs' || table === 'field_attendance_audit' || table === 'audit_decisions') return 'AttendanceUpdated';
   if (table === 'payroll_runs' || table === 'tax_rules' || table === 'deduction_rules' || table === 'salary_components' || table === 'payroll_config_audit') return 'PayrollUpdated';
   if (table === 'settings' || table === 'holidays' || table === 'departments' || table === 'sections' || table === 'designations') return 'SettingsUpdated';
   if (table === 'audit_logs') return 'AuditLogAppended';
+  if (table === 'approval_audits') return 'ApprovalAuditUpdated';
   return null;
 }
 
@@ -674,6 +772,7 @@ const BOOTSTRAP_TABLES = [
   'zk_sync_logs',
   'zk_unmapped_punches',
   'audit_logs',
+  'approval_audits',
   'assignment_logs',
   'exceptions',
   'sbl',
@@ -901,8 +1000,29 @@ localRouter.post('/data/:table', async (req, res) => {
         }
       }
 
-      // Optimistic concurrency & duplicate claim verification + version stamping
+      // Optimistic concurrency & duplicate claim verification + approval authority + version stamping
       const items: any[] = [];
+      const pendingApprovalAudits: any[] = [];
+      const actorRole = isSuperAdminUser(authUser) ? 'Super Admin' : (authUser?.role || 'Supervisor');
+      const actorDisplayName = authUser?.username || authUser?.email || 'System';
+      const empLookupMap = new Map<string, { name: string; department: string }>();
+      if (APPROVAL_TRACKED_TABLES.has(table)) {
+        try {
+          const eRes = db.exec('SELECT id, name, department FROM employees');
+          if (eRes.length > 0) {
+            for (const er of eRes[0].values) {
+              const eid = String(er[0] || '').trim();
+              if (eid) {
+                empLookupMap.set(eid, {
+                  name: String(er[1] || eid),
+                  department: String(er[2] || '')
+                });
+              }
+            }
+          }
+        } catch {}
+      }
+
       const selectExistingStmt = db.prepare(`SELECT data FROM ${sqlTable} WHERE id = ?`);
       try {
         for (const rawItem of rawItems) {
@@ -918,6 +1038,29 @@ localRouter.post('/data/:table', async (req, res) => {
               }
             }
             selectExistingStmt.reset();
+          }
+
+          // Strict Employee & Non-Super-Admin lock checks against existing record
+          if (authUser?.role === 'Employee') {
+            if (existingObj && String(existingObj.status || 'Pending') !== 'Pending') {
+              selectExistingStmt.free();
+              return res.status(403).json({
+                success: false,
+                error: 'Access Denied: Already processed requests cannot be modified by Employee.'
+              });
+            }
+          } else if (!isSuperAdminUser(authUser) && existingObj) {
+            const lockedBySuperAdmin =
+              Boolean(existingObj.superAdminOverride) ||
+              String(existingObj.approvedByRole || '') === 'Super Admin' ||
+              String(existingObj.reviewedByRole || '') === 'Super Admin';
+            if (lockedBySuperAdmin) {
+              selectExistingStmt.free();
+              return res.status(403).json({
+                success: false,
+                error: `Access Denied: This record was finalized or overridden by Super Admin and cannot be modified by ${actorRole}.`
+              });
+            }
           }
 
           if (CONFLICT_PROTECTED_TABLES.has(table) && existingObj && !rawItem._forceOverwrite) {
@@ -991,6 +1134,106 @@ localRouter.post('/data/:table', async (req, res) => {
               if (sKey in existingObj && !(sKey in clean)) {
                 clean[sKey] = existingObj[sKey];
               }
+            }
+          }
+
+          // Enforce Employee self-request metadata server-side
+          if (authUser?.role === 'Employee') {
+            clean.status = 'Pending';
+            clean.requestedBy = actorDisplayName;
+            clean.requestedByRole = 'Employee';
+            clean.approvedBy = '';
+            clean.approvedByRole = '';
+            clean.reviewedBy = '';
+            clean.reviewedByRole = '';
+          } else if (APPROVAL_TRACKED_TABLES.has(table)) {
+            const prevStatus = String(
+              existingObj?.status ||
+              existingObj?.decision ||
+              (existingObj ? 'Pending' : 'New')
+            ).trim();
+            const nextStatus = String(
+              clean.status ||
+              clean.decision ||
+              (table === 'force_attendance' && !clean.status ? 'Approved' : '')
+            ).trim();
+
+            const statusChanged = prevStatus !== nextStatus;
+            const isDecisionEvent =
+              APPROVAL_DECISION_STATUSES.has(nextStatus) &&
+              (statusChanged || !existingObj || Boolean(clean._overrideReason));
+            const isSuperOverride =
+              isSuperAdminUser(authUser) &&
+              Boolean(existingObj) &&
+              APPROVAL_DECISION_STATUSES.has(prevStatus) &&
+              (statusChanged || (existingObj?.approvedByRole && existingObj.approvedByRole !== 'Super Admin'));
+
+            if (isDecisionEvent || isSuperOverride) {
+              const priorApprover = String(
+                existingObj?.approvedBy || existingObj?.reviewedBy || ''
+              ).trim();
+              const priorApproverRole = String(
+                existingObj?.approvedByRole || existingObj?.reviewedByRole || ''
+              ).trim();
+
+              clean.reviewedBy = actorDisplayName;
+              clean.reviewedByRole = actorRole;
+              clean.reviewedDate = now;
+              clean.approvedBy = actorDisplayName;
+              clean.approvedByRole = actorRole;
+              clean.approvedAt = now;
+
+              if (isSuperOverride) {
+                clean.superAdminOverride = true;
+                clean.overriddenBy = actorDisplayName;
+                clean.overriddenAt = now;
+                clean.previousStatus = prevStatus;
+                clean.previousApprover = priorApprover;
+              }
+
+              const targetEmpId = String(
+                clean.employeeId ||
+                existingObj?.employeeId ||
+                (table === 'payroll_runs' ? 'PAYROLL' : '')
+              ).trim();
+              const empInfo = empLookupMap.get(targetEmpId);
+              const targetDate = String(
+                clean.date ||
+                clean.month ||
+                existingObj?.date ||
+                now.slice(0, 10)
+              ).trim();
+              const targetDatePart = /^\d{4}-\d{2}-\d{2}/.test(targetDate) ? targetDate.slice(0, 10) : now.slice(0, 10);
+              const bsDate = getNepaliDate(targetDatePart);
+              const remarksText = String(
+                clean.remarks || clean.reason || clean.overrideRemarks || existingObj?.reason || ''
+              ).trim();
+
+              pendingApprovalAudits.push({
+                id: `apaud_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+                module: getApprovalModuleLabel(table),
+                table,
+                recordId: recordId || clean.id || `${targetEmpId}_${targetDate}`,
+                employeeId: targetEmpId || 'SYSTEM',
+                employeeName:
+                  String(clean.employeeName || empInfo?.name || (table === 'payroll_runs' ? clean.monthName : targetEmpId) || 'Record'),
+                department: empInfo?.department || clean.department || '',
+                targetDate,
+                previousStatus: prevStatus,
+                newStatus: nextStatus || 'Approved',
+                previousApprover: priorApprover || undefined,
+                previousApproverRole: priorApproverRole || undefined,
+                approvedBy: actorEmail,
+                approvedByName: actorDisplayName,
+                approvedByRole: actorRole,
+                isOverride: Boolean(isSuperOverride),
+                actionSummary: isSuperOverride
+                  ? `Super Admin Overrode ${priorApprover ? `${priorApprover} (${priorApproverRole || 'Reviewer'})` : prevStatus}: ${prevStatus} → ${nextStatus}`
+                  : `${actorRole} marked ${nextStatus}`,
+                remarks: remarksText,
+                bsDate: bsDate !== '0000-00-00' ? bsDate : '',
+                timestamp: now
+              });
             }
           }
 
@@ -1471,6 +1714,38 @@ localRouter.post('/data/:table', async (req, res) => {
       stmt.free();
     }
 
+    if (pendingApprovalAudits.length > 0) {
+      const audStmt = db.prepare(`
+        INSERT INTO approval_audits (
+          id, module, record_id, employee_id, employee_name, target_date,
+          previous_status, new_status, previous_approver, previous_approver_role,
+          approved_by, approved_by_role, is_override, remarks, bs_date, timestamp, data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const aud of pendingApprovalAudits) {
+        audStmt.run([
+          aud.id,
+          aud.module,
+          aud.recordId,
+          aud.employeeId,
+          aud.employeeName || '',
+          aud.targetDate || '',
+          aud.previousStatus || '',
+          aud.newStatus || '',
+          aud.previousApprover || '',
+          aud.previousApproverRole || '',
+          aud.approvedByName || aud.approvedBy || '',
+          aud.approvedByRole || '',
+          aud.isOverride ? 1 : 0,
+          aud.remarks || '',
+          aud.bsDate || '',
+          aud.timestamp,
+          JSON.stringify(aud)
+        ]);
+      }
+      audStmt.free();
+    }
+
     db.run('COMMIT');
     saveSqliteDb();
 
@@ -1513,6 +1788,15 @@ localRouter.post('/data/:table', async (req, res) => {
           actorEmail,
           departmentHint: itemsToVerify[0]?.department || undefined,
           containsSalary: table === 'payroll_runs' || table === 'employees',
+          timestamp: now
+        });
+      }
+      if (pendingApprovalAudits.length > 0) {
+        broadcastSseEvent('ApprovalAuditUpdated', {
+          action: 'save',
+          table: 'approval_audits',
+          affectedCount: pendingApprovalAudits.length,
+          actorEmail,
           timestamp: now
         });
       }
@@ -1563,7 +1847,7 @@ localRouter.post('/data/:table/delete', async (req, res) => {
   if (!sqlTable) return res.status(400).json({ error: 'Invalid table' });
 
   const authUser = getAuthUser(req);
-  const permCheck = canWriteTable(authUser, table, []);
+  const permCheck = canWriteTable(authUser, table, [], true);
   if (!permCheck.allowed) {
     return res.status(403).json({
       success: false,
@@ -1578,14 +1862,14 @@ localRouter.post('/data/:table/delete', async (req, res) => {
     try {
       const db = await getSqliteDb();
 
-      // Enforce employee scope before deleting
-      if (!isSuperAdminUser(authUser) && EMPLOYEE_SCOPED_TABLES.has(table)) {
-        const allowedEmpIds = buildScopedEmployeeIdSet(db, authUser)!;
+      // Enforce employee scope & Super Admin lock before deleting
+      if (!isSuperAdminUser(authUser)) {
+        const allowedEmpIds = EMPLOYEE_SCOPED_TABLES.has(table) ? buildScopedEmployeeIdSet(db, authUser)! : null;
         const selStmt = db.prepare(`SELECT * FROM ${sqlTable} WHERE id = ?`);
         try {
           for (const targetId of idList) {
             if (!targetId) continue;
-            if (table === 'employees') {
+            if (table === 'employees' && allowedEmpIds) {
               if (!allowedEmpIds.has(String(targetId))) {
                 return res.status(403).json({ success: false, error: `Access Denied: Employee #${targetId} is outside your scope.` });
               }
@@ -1595,8 +1879,19 @@ localRouter.post('/data/:table/delete', async (req, res) => {
                 const rowObj = selStmt.getAsObject();
                 let parsed: any = {};
                 try { parsed = rowObj.data ? JSON.parse(String(rowObj.data)) : {}; } catch {}
+                if (
+                  Boolean(parsed.superAdminOverride) ||
+                  String(parsed.approvedByRole || '') === 'Super Admin' ||
+                  String(parsed.reviewedByRole || '') === 'Super Admin'
+                ) {
+                  selStmt.free();
+                  return res.status(403).json({
+                    success: false,
+                    error: 'Access Denied: Records finalized or overridden by Super Admin cannot be deleted.'
+                  });
+                }
                 const rowEmpId = String(parsed.employeeId || rowObj.employee_id || '').trim();
-                if (rowEmpId && !allowedEmpIds.has(rowEmpId)) {
+                if (allowedEmpIds && rowEmpId && !allowedEmpIds.has(rowEmpId)) {
                   selStmt.free();
                   return res.status(403).json({ success: false, error: `Access Denied: Record ${targetId} belongs to an employee outside your scope.` });
                 }

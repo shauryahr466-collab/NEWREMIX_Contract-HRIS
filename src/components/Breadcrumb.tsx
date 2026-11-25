@@ -28,10 +28,17 @@ export function Breadcrumb({ className }: { className?: string }) {
     [selectedEmployeeId, employees]
   );
 
+  const isEmployeeRole = effectiveUserProfile?.role === 'Employee';
+
   const crumbs = useMemo<CrumbItem[]>(() => {
     const visibleGroups = NAV_GROUPS.map((g) => ({
       ...g,
-      items: g.items.filter((item) => canAccessModule(item.moduleKey)),
+      items: g.items
+        .filter((item) => canAccessModule(item.moduleKey))
+        .map((item) => ({
+          ...item,
+          label: isEmployeeRole && item.employeeLabel ? item.employeeLabel : item.label,
+        })),
     })).filter((g) => g.items.length > 0);
 
     const activeGroup = visibleGroups.find((g) =>
@@ -110,7 +117,7 @@ export function Breadcrumb({ className }: { className?: string }) {
     }
 
     return items;
-  }, [location.pathname, location.search, canAccessModule, selectedEmployee]);
+  }, [location.pathname, location.search, canAccessModule, selectedEmployee, isEmployeeRole]);
 
   return (
     <nav

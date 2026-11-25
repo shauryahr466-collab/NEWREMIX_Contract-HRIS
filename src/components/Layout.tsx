@@ -131,12 +131,22 @@ export function Layout() {
 
   const selectedEmployee = employees.find((e) => e.id === selectedEmployeeId) || null;
 
+  const isEmployeeRole = effectiveUserProfile?.role === 'Employee';
+
   const visibleGroups = useMemo(() => {
     return NAV_GROUPS.map((group) => ({
       ...group,
-      items: group.items.filter((item) => canAccessModule(item.moduleKey)),
+      items: group.items
+        .filter((item) => canAccessModule(item.moduleKey))
+        .map((item) => ({
+          ...item,
+          label: isEmployeeRole && item.employeeLabel ? item.employeeLabel : item.label,
+          children: item.children
+            ? item.children.filter((sub) => !(isEmployeeRole && sub.tab === 'audit'))
+            : undefined,
+        })),
     })).filter((group) => group.items.length > 0);
-  }, [canAccessModule]);
+  }, [canAccessModule, isEmployeeRole]);
 
   const activeGroup = useMemo(() => {
     return visibleGroups.find((g) => g.items.some((item) => item.to === location.pathname));
@@ -452,31 +462,33 @@ export function Layout() {
 
             {isAdmin && <LocalModeIndicator />}
 
-            <div className="relative hidden md:block">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                placeholder="Find employee ID or name..."
-                value={globalSearchTerm}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setGlobalSearchTerm(val);
-                  if (val.length >= 2) {
-                    const searchNorm = val.trim().toLowerCase();
-                    const found = employees.find((emp) => {
-                      const empIdNorm = emp.id.trim().toLowerCase();
-                      const nameNorm = emp.name.trim().toLowerCase();
-                      return empIdNorm === searchNorm || nameNorm === searchNorm;
-                    });
-                    if (found) {
-                      openEmployeeProfile(found.id);
-                      setGlobalSearchTerm('');
+            {!isEmployeeRole && (
+              <div className="relative hidden md:block">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  placeholder="Find employee ID or name..."
+                  value={globalSearchTerm}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setGlobalSearchTerm(val);
+                    if (val.length >= 2) {
+                      const searchNorm = val.trim().toLowerCase();
+                      const found = employees.find((emp) => {
+                        const empIdNorm = emp.id.trim().toLowerCase();
+                        const nameNorm = emp.name.trim().toLowerCase();
+                        return empIdNorm === searchNorm || nameNorm === searchNorm;
+                      });
+                      if (found) {
+                        openEmployeeProfile(found.id);
+                        setGlobalSearchTerm('');
+                      }
                     }
-                  }
-                }}
-                className="w-52 pl-9 pr-3 h-9 bg-slate-50 dark:bg-slate-800 dark:text-white border border-slate-200 dark:border-slate-700 rounded-lg text-[13px] focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all outline-none"
-              />
-            </div>
+                  }}
+                  className="w-52 pl-9 pr-3 h-9 bg-slate-50 dark:bg-slate-800 dark:text-white border border-slate-200 dark:border-slate-700 rounded-lg text-[13px] focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all outline-none"
+                />
+              </div>
+            )}
 
             <div className="flex items-center gap-1.5">
               <HeaderButton

@@ -41,8 +41,13 @@ function AttendanceReconciliation() {
     addAssignmentLog, 
     isInitializing, 
     globalSearchTerm,
-    openEmployeeProfile
+    openEmployeeProfile,
+    effectiveUserProfile,
+    isSuperAdmin
   } = useAppStore();
+
+  const isEmployeeOnly = effectiveUserProfile?.role === 'Employee';
+  const canEditShifts = isSuperAdmin || !effectiveUserProfile || Boolean(effectiveUserProfile.permissions?.canManageShifts || effectiveUserProfile.permissions?.canEditAttendance);
 
   const { executeWithStatus } = useActionStatus();
   
@@ -796,8 +801,8 @@ function AttendanceReconciliation() {
   return (
     <div className="space-y-6">
       <PageHeader 
-        title="Attendance Reconciliation" 
-        description="Monitor daily workforce presence, shift compliance, and biometric synchronization"
+        title={isEmployeeOnly ? "My Attendance" : "Attendance Reconciliation"} 
+        description={isEmployeeOnly ? "Personal daily attendance logs, shift timings, and working hours (Read-Only)" : "Monitor daily workforce presence, shift compliance, and biometric synchronization"}
         icon={ListChecks}
         actions={
           <div className="flex flex-wrap items-center gap-2">
@@ -806,86 +811,94 @@ function AttendanceReconciliation() {
               disabled={isRefreshing}
             >
               <Calculator size={14} className={isRefreshing ? "animate-spin" : ""} />
-              {isRefreshing ? 'Calculating...' : 'Recalculate'}
+              {isRefreshing ? 'Refreshing...' : isEmployeeOnly ? 'Refresh Logs' : 'Recalculate'}
             </Button>
             
-            <Button
-              onClick={handleOpenHolidayValidation}
-              variant="outline"
-              size="sm"
-              className="gap-1.5 whitespace-nowrap shrink-0 border-sky-200 dark:border-sky-800 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-950/40"
-              title="Cross-reference attendance punches against Public Holiday master database and prevent punch overlaps"
-            >
-              <ShieldCheck size={14} /> Holiday Validation
-            </Button>
+            {!isEmployeeOnly && (
+              <>
+                <Button
+                  onClick={handleOpenHolidayValidation}
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 whitespace-nowrap shrink-0 border-sky-200 dark:border-sky-800 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-950/40"
+                  title="Cross-reference attendance punches against Public Holiday master database and prevent punch overlaps"
+                >
+                  <ShieldCheck size={14} /> Holiday Validation
+                </Button>
 
-            <Button
-              onClick={() => setIsManualImportOpen(true)}
-              size="sm"
-              className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs whitespace-nowrap shrink-0"
-              title="Import Excel attendance records to update Force Attendance and session punch logs, recalculating reconciliation, muster, and overtime"
-            >
-              <Upload size={14} /> Manual Attendance Import
-            </Button>
+                <Button
+                  onClick={() => setIsManualImportOpen(true)}
+                  size="sm"
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold gap-1.5 shadow-xs whitespace-nowrap shrink-0"
+                  title="Import Excel attendance records to update Force Attendance and session punch logs, recalculating reconciliation, muster, and overtime"
+                >
+                  <Upload size={14} /> Manual Attendance Import
+                </Button>
 
-            <Button 
-              onClick={() => {
-                if (selectedEmployees.length === 0) {
-                  setSelectedEmployees(uniqueEmployeesInFilter);
-                }
-                setBulkModal({
-                  isOpen: true,
-                  step: 1,
-                  shiftId: '',
-                  startDate: startDate,
-                  endDate: endDate
-                });
-              }}
-              variant="outline"
-              size="sm"
-              className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800 font-bold hover:bg-indigo-100"
-            >
-              <UserPlus size={14} className="mr-1" /> Bulk Shift Assign {selectedEmployees.length > 0 ? `(${selectedEmployees.length})` : `(${uniqueEmployeesInFilter.length})`}
-            </Button>
+                {canEditShifts && (
+                  <Button 
+                    onClick={() => {
+                      if (selectedEmployees.length === 0) {
+                        setSelectedEmployees(uniqueEmployeesInFilter);
+                      }
+                      setBulkModal({
+                        isOpen: true,
+                        step: 1,
+                        shiftId: '',
+                        startDate: startDate,
+                        endDate: endDate
+                      });
+                    }}
+                    variant="outline"
+                    size="sm"
+                    className="bg-indigo-50 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border-indigo-200 dark:border-indigo-800 font-bold hover:bg-indigo-100"
+                  >
+                    <UserPlus size={14} className="mr-1" /> Bulk Shift Assign {selectedEmployees.length > 0 ? `(${selectedEmployees.length})` : `(${uniqueEmployeesInFilter.length})`}
+                  </Button>
+                )}
 
-            {selectedEmployees.length > 0 && (
-              <Button 
-                onClick={handleDeleteSelectedRecords}
-                variant="danger"
-                size="sm"
-              >
-                <Trash2 size={14} /> Delete Records ({selectedEmployees.length})
-              </Button>
+                {selectedEmployees.length > 0 && canEditShifts && (
+                  <Button 
+                    onClick={handleDeleteSelectedRecords}
+                    variant="danger"
+                    size="sm"
+                  >
+                    <Trash2 size={14} /> Delete Records ({selectedEmployees.length})
+                  </Button>
+                )}
+              </>
             )}
             
             <div className="flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-lg">
               <Button variant="ghost" size="sm" onClick={handleExportExcel} className="h-8 px-2 text-[11px] font-bold">EXCEL</Button>
               <Button variant="ghost" size="sm" onClick={handleExportCSV} className="h-8 px-2 text-[11px] font-bold">CSV</Button>
               <Button variant="ghost" size="sm" onClick={handleExportPDF} className="h-8 px-2 text-[11px] font-bold">PDF</Button>
-              <Button 
-                variant="ghost" 
-                size="sm" 
-                onClick={() => {
-                  const rows = generateZkBioDataRows(
-                    punches,
-                    employees,
-                    filteredData,
-                    startDate,
-                    endDate,
-                    deptFilter,
-                    deferredSearchTerm
-                  );
-                  if (rows.length === 0) {
-                    toast.error("No ZKT biometric punch records found.");
-                    return;
-                  }
-                  exportZkBioDataExcel(rows, settings.companyName || 'ZKTeco');
-                  toast.success(`Exported ${rows.length} ZKT Bio Data records to Excel!`);
-                }} 
-                className="h-8 px-2 text-[11px] font-bold text-blue-600 dark:text-blue-400"
-              >
-                ZKT BIO DATA
-              </Button>
+              {!isEmployeeOnly && (
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  onClick={() => {
+                    const rows = generateZkBioDataRows(
+                      punches,
+                      employees,
+                      filteredData,
+                      startDate,
+                      endDate,
+                      deptFilter,
+                      deferredSearchTerm
+                    );
+                    if (rows.length === 0) {
+                      toast.error("No ZKT biometric punch records found.");
+                      return;
+                    }
+                    exportZkBioDataExcel(rows, settings.companyName || 'ZKTeco');
+                    toast.success(`Exported ${rows.length} ZKT Bio Data records to Excel!`);
+                  }} 
+                  className="h-8 px-2 text-[11px] font-bold text-blue-600 dark:text-blue-400"
+                >
+                  ZKT BIO DATA
+                </Button>
+              )}
             </div>
           </div>
         }
@@ -1063,15 +1076,17 @@ function AttendanceReconciliation() {
             <thead className="bg-slate-50 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-800">
               <tr className="text-[12px] font-semibold text-slate-500 dark:text-slate-400">
                 <th className="px-6 py-3 w-12 text-center">
-                  <input 
-                    type="checkbox" 
-                    onChange={(e) => {
-                      if (e.target.checked) setSelectedEmployees(uniqueEmployeesInFilter);
-                      else setSelectedEmployees([]);
-                    }}
-                    checked={selectedEmployees.length > 0 && selectedEmployees.length >= uniqueEmployeesInFilter.length}
-                    className="w-4 h-4 rounded border-slate-300 text-primary focus:ring-primary cursor-pointer"
-                  />
+                  {!isEmployeeOnly && (
+                    <input 
+                      type="checkbox" 
+                      onChange={(e) => {
+                        if (e.target.checked) setSelectedEmployees(uniqueEmployeesInFilter);
+                        else setSelectedEmployees([]);
+                      }}
+                      checked={selectedEmployees.length > 0 && selectedEmployees.length >= uniqueEmployeesInFilter.length}
+                      className="w-4 h-4 rounded border-slate-300 text-primary focus:ring-primary cursor-pointer"
+                    />
+                  )}
                 </th>
                 <th className="px-4 py-3 w-12 text-center">S.No</th>
                 <th className="px-6 py-3 w-[120px]">Date (A.D.)</th>
@@ -1087,7 +1102,7 @@ function AttendanceReconciliation() {
                 <th className="px-6 py-3 w-[100px] text-right">Dur</th>
                 <th className="px-4 py-3 w-[70px] text-right">OT</th>
                 <th className="px-6 py-3 w-[120px]">Status</th>
-                <th className="px-6 py-3 w-[80px] text-center">Actions</th>
+                {!isEmployeeOnly && <th className="px-6 py-3 w-[80px] text-center">Actions</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800 bg-white dark:bg-transparent text-[13px]">
@@ -1108,15 +1123,18 @@ function AttendanceReconciliation() {
                   )}>
                     <td className="px-6 py-2.5 text-center">
                       <div className="flex items-center gap-2 justify-center">
-                        <input 
-                          type="checkbox" 
-                          checked={selectedEmployees.includes(d.employeeId)}
-                          onChange={() => toggleEmployeeSelection(d.employeeId)}
-                          className="w-4 h-4 rounded border-slate-300 text-primary focus:ring-primary cursor-pointer"
-                        />
+                        {!isEmployeeOnly && (
+                          <input 
+                            type="checkbox" 
+                            checked={selectedEmployees.includes(d.employeeId)}
+                            onChange={() => toggleEmployeeSelection(d.employeeId)}
+                            className="w-4 h-4 rounded border-slate-300 text-primary focus:ring-primary cursor-pointer"
+                          />
+                        )}
                         <button 
                           onClick={() => toggleRowExpansion(d.id)}
                           className={cn("text-slate-400 transition-transform", isExpanded && "rotate-180")}
+                          title="Expand punch timeline"
                         >
                           <ChevronDown size={14} />
                         </button>
@@ -1132,37 +1150,43 @@ function AttendanceReconciliation() {
                     </td>
                     <td className="px-6 py-2.5 font-mono text-slate-500 group-hover:text-primary transition-colors">{d.employeeId}</td>
                     <td className="px-6 py-2.5">
-                      <span className="font-medium text-slate-900 dark:text-white cursor-pointer hover:text-primary transition-colors" onClick={() => openEmployeeProfile(d.employeeId)}>
+                      <span className="font-medium text-slate-900 dark:text-white cursor-pointer hover:text-primary transition-colors" onClick={() => !isEmployeeOnly && openEmployeeProfile(d.employeeId)}>
                         {emp?.name || '-'}
                       </span>
                     </td>
                     <td className="px-4 py-2.5 text-slate-500 truncate max-w-[120px]">{emp?.department || '-'}</td>
                     <td className="px-6 py-2.5">
-                      <div className="flex items-center gap-1.5">
-                        <select
-                          value={assignment?.shiftId || ''}
-                          onChange={(e) => handleDirectShiftChange(d.employeeId, d.date, e.target.value)}
-                          className={cn(
-                            "text-[11px] font-bold py-1 px-2.5 rounded-lg border transition-all cursor-pointer shadow-2xs focus:ring-2 focus:ring-indigo-500 focus:outline-hidden",
-                            assignment?.shiftId 
-                              ? "bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-300 dark:border-indigo-700 font-extrabold" 
-                              : "bg-slate-100/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400"
-                          )}
-                          title={`Current Shift: ${shift?.name || 'Default'}. Click to change shift for this date.`}
-                        >
-                          <option value="" className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200">
-                            {shift?.name ? `${shift.name} (Default)` : 'Default Shift'}
-                          </option>
-                          {settings.shifts?.map(s => (
-                            <option key={s.id} value={s.id} className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200">
-                              {s.name} ({s.startTime}-{s.endTime})
+                      {isEmployeeOnly || !canEditShifts ? (
+                        <span className="inline-flex items-center text-[11px] font-semibold py-1 px-2.5 rounded-lg bg-slate-100/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
+                          {shift?.name || 'Default Shift'}
+                        </span>
+                      ) : (
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            value={assignment?.shiftId || ''}
+                            onChange={(e) => handleDirectShiftChange(d.employeeId, d.date, e.target.value)}
+                            className={cn(
+                              "text-[11px] font-bold py-1 px-2.5 rounded-lg border transition-all cursor-pointer shadow-2xs focus:ring-2 focus:ring-indigo-500 focus:outline-hidden",
+                              assignment?.shiftId 
+                                ? "bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-300 dark:border-indigo-700 font-extrabold" 
+                                : "bg-slate-100/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:border-indigo-400"
+                            )}
+                            title={`Current Shift: ${shift?.name || 'Default'}. Click to change shift for this date.`}
+                          >
+                            <option value="" className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200">
+                              {shift?.name ? `${shift.name} (Default)` : 'Default Shift'}
                             </option>
-                          ))}
-                        </select>
-                        {assignment?.shiftId && (
-                          <span className="w-2 h-2 rounded-full bg-indigo-600 dark:bg-indigo-400 animate-pulse shrink-0" title="Custom shift override assigned for this date" />
-                        )}
-                      </div>
+                            {settings.shifts?.map(s => (
+                              <option key={s.id} value={s.id} className="bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-200">
+                                {s.name} ({s.startTime}-{s.endTime})
+                              </option>
+                            ))}
+                          </select>
+                          {assignment?.shiftId && (
+                            <span className="w-2 h-2 rounded-full bg-indigo-600 dark:bg-indigo-400 animate-pulse shrink-0" title="Custom shift override assigned for this date" />
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="px-6 py-2.5 font-mono text-[12px]">
                       {d.firstPunch ? (
@@ -1212,11 +1236,13 @@ function AttendanceReconciliation() {
                         )}
                       </div>
                     </td>
-                    <td className="px-6 py-2.5 text-center">
-                      <Button variant="ghost" size="sm" onClick={() => setAssignmentModal({ isOpen: true, employeeId: d.employeeId, date: d.date })} className="h-8 w-8 p-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <MoreVertical size={14} />
-                      </Button>
-                    </td>
+                    {!isEmployeeOnly && (
+                      <td className="px-6 py-2.5 text-center">
+                        <Button variant="ghost" size="sm" onClick={() => setAssignmentModal({ isOpen: true, employeeId: d.employeeId, date: d.date })} className="h-8 w-8 p-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <MoreVertical size={14} />
+                        </Button>
+                      </td>
+                    )}
                   </tr>
                   {isExpanded && (
                     <tr className="bg-slate-50 dark:bg-slate-900/50">
@@ -1766,15 +1792,18 @@ function AttendanceReconciliation() {
 }
 
 export function Attendance() {
+  const { effectiveUserProfile } = useAppStore();
   const [searchParams] = useSearchParams();
-  const currentTab = searchParams.get('tab') || 'reconciliation';
+  const isEmployeeOnly = effectiveUserProfile?.role === 'Employee';
+  const rawTab = searchParams.get('tab') || 'reconciliation';
+  const currentTab = isEmployeeOnly && rawTab === 'audit' ? 'reconciliation' : rawTab;
 
   return (
     <div className="space-y-6">
       {currentTab === 'reconciliation' && <AttendanceReconciliation />}
       {currentTab === 'muster' && <MonthlyMuster />}
       {currentTab === 'calendar' && <AttendanceCalendar />}
-      {currentTab === 'audit' && <FreshAttendanceAudit />}
+      {currentTab === 'audit' && !isEmployeeOnly && <FreshAttendanceAudit />}
     </div>
   );
 }

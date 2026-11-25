@@ -24,7 +24,9 @@ import {
   loadZkSchedulerConfigFromSqlite,
   saveZkSchedulerConfigToSqlite,
   detectExternalPunchChangesReadOnly,
-  setZkCollectorMode
+  setZkCollectorMode,
+  normalizeDefaultFleetNamesAndDirectionsInSqlite,
+  getAttendanceLogsForExportFromSqlite
 } from './src/server/zkPoller.js';
 import { registerSseClient, broadcastSseEvent } from './src/server/realtimeHub.js';
 import { discoverZkDevicesOnSubnet } from './src/server/zkProtocol.js';
@@ -427,10 +429,12 @@ async function startServer() {
   app.post(['/api/zk/auto-poll/run-now', '/api/zk/fetch-all'], requireAuth, requireDeviceAccess, async (req, res) => {
     try {
       const forceDirectPoll = Boolean(req.body?.forceDirectPoll);
+      const fullRead = Boolean(req.body?.fullRead);
       const pollRes = await pollAllZkDevicesToSqlite({
         dueOnly: false,
         forceDirectPoll,
-        mode: req.body?.mode || 'Manual Batch Poll'
+        fullRead,
+        mode: req.body?.mode || (fullRead ? 'Manual Full Read' : 'Manual Sync New')
       });
       if ('readOnlyMode' in pollRes && pollRes.readOnlyMode && pollRes.skippedDirectWrite) {
         return res.json({
@@ -454,7 +458,7 @@ async function startServer() {
 
   app.post('/api/zk/fetch-device', requireAuth, requireDeviceAccess, async (req, res) => {
     try {
-      const { deviceId, ip, mode, forceDirectPoll } = req.body || {};
+      const { deviceId, ip, mode, forceDirectPoll, fullRead } = req.body || {};
       const target = String(deviceId || ip || '').trim();
       if (!target) {
         return res.status(400).json({ success: false, error: 'deviceId or ip is required' });
@@ -473,7 +477,7 @@ async function startServer() {
           message: `Read-Only Collector Mode active: observed ${obs.punchCount} SQLite punches without overwriting raw punch tables.`
         });
       }
-      const result = await pollSingleZkDeviceToSqlite(target, mode || 'Single Device Sync');
+      const result = await pollSingleZkDeviceToSqlite(target, mode || 'Single Device Sync', { fullRead: Boolean(fullRead) });
       return res.json({
         ...result,
         database: 'SQLite',
@@ -484,12 +488,33 @@ async function startServer() {
     }
   });
 
+  // Export stored terminal & uploaded punch logs for BS/AD date range (excludes manual attendance corrections)
+  app.post('/api/zk/export-logs', requireAuth, requireDeviceAccess, async (req, res) => {
+    try {
+      const startDate = String(req.body?.startDate || '').trim().slice(0, 10);
+      const endDate = String(req.body?.endDate || '').trim().slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+        return res.status(400).json({ success: false, error: 'Valid startDate and endDate (YYYY-MM-DD) are required.' });
+      }
+      const onlyDatabaseEmployees = req.body?.onlyDatabaseEmployees !== false;
+      const result = await getAttendanceLogsForExportFromSqlite({
+        startDate: startDate <= endDate ? startDate : endDate,
+        endDate: startDate <= endDate ? endDate : startDate,
+        onlyDatabaseEmployees
+      });
+      return res.json(result);
+    } catch (e: any) {
+      return res.status(500).json({ success: false, error: e.message || 'Failed to export attendance logs' });
+    }
+  });
+
   // Direct LAN Link for fetching punches or observing SQLite punches
   app.get('/api/zk/fetch-punch', requireAuth, requireDeviceAccess, async (req, res) => {
     try {
       const target = String(req.query.deviceId || req.query.ip || '').trim();
       const mode = String(req.query.mode || 'Direct Fetch Punch Link').trim();
       const forceDirectPoll = String(req.query.forceDirectPoll || '') === 'true';
+      const fullRead = String(req.query.fullRead || '') === 'true';
       if (zkPollingState.readOnlyMode && !forceDirectPoll) {
         const obs = await detectExternalPunchChangesReadOnly();
         const stored = await readStoredPunchesFromSqlite({ deviceId: target || undefined, limit: 25 });
@@ -504,7 +529,7 @@ async function startServer() {
         });
       }
       if (target) {
-        const result = await pollSingleZkDeviceToSqlite(target, mode);
+        const result = await pollSingleZkDeviceToSqlite(target, mode, { fullRead });
         const stored = await readStoredPunchesFromSqlite({ deviceId: result.deviceId || target, limit: 25 });
         return res.json({
           ...result,
@@ -514,7 +539,7 @@ async function startServer() {
           latestStoredPunches: stored.punches
         });
       }
-      const pollRes = await pollAllZkDevicesToSqlite({ dueOnly: false, forceDirectPoll, mode });
+      const pollRes = await pollAllZkDevicesToSqlite({ dueOnly: false, forceDirectPoll, fullRead, mode });
       const stored = await readStoredPunchesFromSqlite({ limit: 25 });
       return res.json({
         ...pollRes,
@@ -803,7 +828,7 @@ async function startServer() {
     }
   });
 
-  // Background ZKT Loop: Read-Only External Collector Observer by default (zero raw punch writes)
+  // Background ZKT Loop: Polls enabled LAN biometric devices on schedule (read-only toward hardware terminals)
   setInterval(async () => {
     try {
       if (zkPollingState.readOnlyMode) {
@@ -887,6 +912,8 @@ async function startServer() {
       }
       if (needsFleetSync) {
         await replaceWithVerifiedZkFleetInSqlite();
+      } else {
+        await normalizeDefaultFleetNamesAndDirectionsInSqlite().catch(() => 0);
       }
     } catch (e) {
       console.warn('[ZKPoller] Initial fleet sync note:', e);

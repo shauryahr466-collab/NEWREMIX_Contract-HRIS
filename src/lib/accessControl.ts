@@ -179,21 +179,16 @@ export function getDefaultPermissionsForRole(role: SystemRole): UserPermissions 
     };
   }
 
-  // Employee self-service role (strictly own data only)
+  // Employee self-service role (strictly own attendance + apply OT, Leave/SBL, Attendance Request)
   return {
     modules: {
       ...allModules(false),
-      dashboard: true,
       attendance: true,
       overtime: true,
       sbl: true,
-      performance: true,
-      projects: true,
-      helpdesk: true,
-      documentRequests: true,
-      payroll: true
+      forceAttendance: true
     },
-    canViewSalary: true,
+    canViewSalary: false,
     canEditAttendance: false,
     canSubmitSupervisorOt: false,
     canApproveOt: false,
@@ -202,6 +197,13 @@ export function getDefaultPermissionsForRole(role: SystemRole): UserPermissions 
     canManageShifts: false
   };
 }
+
+export const EMPLOYEE_ALLOWED_MODULES: ReadonlySet<ModuleKey> = new Set<ModuleKey>([
+  'attendance',
+  'overtime',
+  'sbl',
+  'forceAttendance'
+]);
 
 export function normalizeRoleName(rawRole: unknown): SystemRole {
   const s = String(rawRole || '').trim().toLowerCase();
@@ -221,7 +223,13 @@ export function normalizeSystemUser(raw: any): SystemUser {
 
   const mergedModules = { ...defaults.modules };
   for (const def of ALL_MODULE_DEFINITIONS) {
-    if (typeof rawMods[def.key] === 'boolean') {
+    if (role === 'Employee') {
+      mergedModules[def.key] = EMPLOYEE_ALLOWED_MODULES.has(def.key)
+        ? typeof rawMods[def.key] === 'boolean'
+          ? rawMods[def.key]
+          : defaults.modules[def.key]
+        : false;
+    } else if (typeof rawMods[def.key] === 'boolean') {
       mergedModules[def.key] = rawMods[def.key];
     }
   }
@@ -229,15 +237,44 @@ export function normalizeSystemUser(raw: any): SystemUser {
     mergedModules.userAccess = true;
     mergedModules.admin = true;
   } else {
-    // Non-Super Admins never hold Super Admin management routes unless explicitly super admin
+    // Non-Super Admins never hold Super Admin management routes
     mergedModules.userAccess = false;
     mergedModules.admin = false;
+  }
+  if (role === 'Employee') {
+    mergedModules.dashboard = false;
+    mergedModules.employees = false;
+    mergedModules.auditLogs = false;
+    mergedModules.payroll = false;
+    mergedModules.salaryAnalysis = false;
   }
 
   const normalizeStrArray = (v: unknown): string[] => {
     if (!Array.isArray(v)) return [];
     return Array.from(new Set(v.map(x => String(x || '').trim()).filter(Boolean)));
   };
+
+  const permissions: UserPermissions = role === 'Employee'
+    ? {
+        modules: mergedModules,
+        canViewSalary: false,
+        canEditAttendance: false,
+        canSubmitSupervisorOt: false,
+        canApproveOt: false,
+        canApprovePayroll: false,
+        canExportReports: false,
+        canManageShifts: false
+      }
+    : {
+        modules: mergedModules,
+        canViewSalary: typeof rawPerms.canViewSalary === 'boolean' ? rawPerms.canViewSalary : defaults.canViewSalary,
+        canEditAttendance: typeof rawPerms.canEditAttendance === 'boolean' ? rawPerms.canEditAttendance : defaults.canEditAttendance,
+        canSubmitSupervisorOt: typeof rawPerms.canSubmitSupervisorOt === 'boolean' ? rawPerms.canSubmitSupervisorOt : defaults.canSubmitSupervisorOt,
+        canApproveOt: typeof rawPerms.canApproveOt === 'boolean' ? rawPerms.canApproveOt : defaults.canApproveOt,
+        canApprovePayroll: typeof rawPerms.canApprovePayroll === 'boolean' ? rawPerms.canApprovePayroll : defaults.canApprovePayroll,
+        canExportReports: typeof rawPerms.canExportReports === 'boolean' ? rawPerms.canExportReports : defaults.canExportReports,
+        canManageShifts: typeof rawPerms.canManageShifts === 'boolean' ? rawPerms.canManageShifts : defaults.canManageShifts
+      };
 
   return {
     id: String(raw?.id || `user_${Date.now()}`),
@@ -248,16 +285,7 @@ export function normalizeSystemUser(raw: any): SystemUser {
     assignedDepartments: normalizeStrArray(raw?.assignedDepartments),
     assignedSections: normalizeStrArray(raw?.assignedSections),
     linkedEmployeeId: raw?.linkedEmployeeId ? String(raw.linkedEmployeeId).trim() : undefined,
-    permissions: {
-      modules: mergedModules,
-      canViewSalary: typeof rawPerms.canViewSalary === 'boolean' ? rawPerms.canViewSalary : defaults.canViewSalary,
-      canEditAttendance: typeof rawPerms.canEditAttendance === 'boolean' ? rawPerms.canEditAttendance : defaults.canEditAttendance,
-      canSubmitSupervisorOt: typeof rawPerms.canSubmitSupervisorOt === 'boolean' ? rawPerms.canSubmitSupervisorOt : defaults.canSubmitSupervisorOt,
-      canApproveOt: typeof rawPerms.canApproveOt === 'boolean' ? rawPerms.canApproveOt : defaults.canApproveOt,
-      canApprovePayroll: typeof rawPerms.canApprovePayroll === 'boolean' ? rawPerms.canApprovePayroll : defaults.canApprovePayroll,
-      canExportReports: typeof rawPerms.canExportReports === 'boolean' ? rawPerms.canExportReports : defaults.canExportReports,
-      canManageShifts: typeof rawPerms.canManageShifts === 'boolean' ? rawPerms.canManageShifts : defaults.canManageShifts
-    },
+    permissions,
     notes: raw?.notes ? String(raw.notes) : '',
     createdBy: raw?.createdBy ? String(raw.createdBy) : undefined,
     createdAt: raw?.createdAt,

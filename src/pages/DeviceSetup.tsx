@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import * as XLSX from 'xlsx';
+import NepaliDate from 'nepali-date-converter';
+import { format } from 'date-fns';
 import { useAppStore } from '../store';
-import { ZkDevice, ZkProtocolMode } from '../types';
+import { ZkDevice, ZkProtocolMode, ZkReaderDirection } from '../types';
 import {
   Cpu,
   Wifi,
@@ -19,12 +22,61 @@ import {
   HardDrive,
   FileUp,
   Save,
-  Printer
+  Printer,
+  RotateCw
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { authFetch } from '../lib/authSession';
 
 const SCHEDULE_PRESETS = [5, 10, 15, 30, 60];
+const BS_MONTHS = [
+  'Baisakh',
+  'Jestha',
+  'Ashadh',
+  'Shrawan',
+  'Bhadra',
+  'Ashwin',
+  'Kartik',
+  'Mangsir',
+  'Poush',
+  'Magh',
+  'Falgun',
+  'Chaitra'
+];
+const BS_YEARS = Array.from({ length: 12 }, (_, idx) => 2077 + idx);
+
+function getDaysInBsMonth(bsYear: number, monthIndex: number): number {
+  for (let day = 32; day >= 28; day--) {
+    try {
+      const np = new NepaliDate(bsYear, monthIndex, day);
+      if (np.getYear() === bsYear && np.getMonth() === monthIndex && np.getDate() === day) {
+        return day;
+      }
+    } catch {
+      // try smaller day
+    }
+  }
+  return 30;
+}
+
+function bsToAdIsoDate(bsYear: number, monthIndex: number, day: number): string {
+  try {
+    const maxDay = getDaysInBsMonth(bsYear, monthIndex);
+    const clampedDay = Math.max(1, Math.min(day, maxDay));
+    const np = new NepaliDate(bsYear, monthIndex, clampedDay);
+    return format(np.toJsDate(), 'yyyy-MM-dd');
+  } catch {
+    return format(new Date(), 'yyyy-MM-dd');
+  }
+}
+
+function formatReaderSyncDateTime(value?: string): string {
+  if (!value) return 'Never';
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return String(value);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 
 export const DeviceSetup: React.FC = () => {
   const {
@@ -37,6 +89,7 @@ export const DeviceSetup: React.FC = () => {
     addZkDevice,
     updateZkDevice,
     deleteZkDevice,
+    syncZkDevice,
     syncAllZkDevices,
     fetchPunches,
     resolveUnmappedPunches,
@@ -45,13 +98,37 @@ export const DeviceSetup: React.FC = () => {
     isAdmin
   } = useAppStore();
 
+  const initialBs = useMemo(() => {
+    try {
+      const todayNp = new NepaliDate(new Date());
+      const y = todayNp.getYear();
+      const m = todayNp.getMonth();
+      const maxD = getDaysInBsMonth(y, m);
+      return { year: y, month: m, maxD };
+    } catch {
+      return { year: 2083, month: 7, maxD: 29 };
+    }
+  }, []);
+
   const [activeTab, setActiveTab] = useState<'devices' | 'mapping' | 'unmapped' | 'dat_import' | 'history'>('devices');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDatDeviceId, setSelectedDatDeviceId] = useState<string>('');
   const [pollSummary, setPollSummary] = useState<any>(null);
   const [customIntervalMinutes, setCustomIntervalMinutes] = useState<number>(15);
   const [isSavingSchedule, setIsSavingSchedule] = useState(false);
-  const [isDownloadingLogs, setIsDownloadingLogs] = useState(false);
+  const [isSyncingNew, setIsSyncingNew] = useState(false);
+  const [isFullReading, setIsFullReading] = useState(false);
+  const [syncingDeviceId, setSyncingDeviceId] = useState<string | null>(null);
+
+  // Download Attendance Logs (BS Date Range Export) State
+  const [bsFromYear, setBsFromYear] = useState<number>(initialBs.year);
+  const [bsFromMonth, setBsFromMonth] = useState<number>(initialBs.month);
+  const [bsFromDay, setBsFromDay] = useState<number>(1);
+  const [bsToYear, setBsToYear] = useState<number>(initialBs.year);
+  const [bsToMonth, setBsToMonth] = useState<number>(initialBs.month);
+  const [bsToDay, setBsToDay] = useState<number>(initialBs.maxD);
+  const [onlyDbEmployees, setOnlyDbEmployees] = useState<boolean>(true);
+  const [isExportingWorkbook, setIsExportingWorkbook] = useState<boolean>(false);
 
   // Modal & Diagnostic States
   const [isDeviceModalOpen, setIsDeviceModalOpen] = useState(false);
@@ -72,6 +149,7 @@ export const DeviceSetup: React.FC = () => {
     enabled: boolean;
     autoSyncMinutes: number;
     protocolMode: ZkProtocolMode;
+    direction: ZkReaderDirection;
     commKey: number;
   }>({
     name: '',
@@ -84,6 +162,7 @@ export const DeviceSetup: React.FC = () => {
     enabled: true,
     autoSyncMinutes: 15,
     protocolMode: 'Auto',
+    direction: 'AUTO',
     commKey: 0
   });
 
@@ -91,6 +170,17 @@ export const DeviceSetup: React.FC = () => {
   const [mapDeviceUserId, setMapDeviceUserId] = useState('');
   const [mapEmployeeId, setMapEmployeeId] = useState('');
   const [isProcessingDat, setIsProcessingDat] = useState(false);
+
+  const bsFromMaxDays = useMemo(() => getDaysInBsMonth(bsFromYear, bsFromMonth), [bsFromYear, bsFromMonth]);
+  const bsToMaxDays = useMemo(() => getDaysInBsMonth(bsToYear, bsToMonth), [bsToYear, bsToMonth]);
+
+  useEffect(() => {
+    if (bsFromDay > bsFromMaxDays) setBsFromDay(bsFromMaxDays);
+  }, [bsFromDay, bsFromMaxDays]);
+
+  useEffect(() => {
+    if (bsToDay > bsToMaxDays) setBsToDay(bsToMaxDays);
+  }, [bsToDay, bsToMaxDays]);
 
   const loadPollSummary = useCallback(async () => {
     try {
@@ -112,15 +202,85 @@ export const DeviceSetup: React.FC = () => {
     return () => clearInterval(timer);
   }, [loadPollSummary]);
 
-  // Single primary action: Download attendance logs from active biometric devices into SQLite
-  const handleDownloadLogs = async () => {
-    if (isDownloadingLogs) return;
-    setIsDownloadingLogs(true);
+  const handleSyncAll = async (fullRead = false) => {
+    if (isSyncingNew || isFullReading) return;
+    if (fullRead) setIsFullReading(true);
+    else setIsSyncingNew(true);
     try {
-      await syncAllZkDevices();
+      await syncAllZkDevices(fullRead);
       await loadPollSummary();
     } finally {
-      setIsDownloadingLogs(false);
+      setIsSyncingNew(false);
+      setIsFullReading(false);
+    }
+  };
+
+  const handleSyncSingleDevice = async (dev: ZkDevice, fullRead = false) => {
+    if (syncingDeviceId) return;
+    setSyncingDeviceId(dev.id);
+    try {
+      await syncZkDevice(dev.id, fullRead);
+      await loadPollSummary();
+    } finally {
+      setSyncingDeviceId(null);
+    }
+  };
+
+  const handleDirectionChange = async (dev: ZkDevice, direction: ZkReaderDirection) => {
+    try {
+      await updateZkDevice(dev.id, { direction });
+      await loadPollSummary();
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to update reader direction');
+    }
+  };
+
+  const handleExportBsAttendanceLogs = async () => {
+    if (isExportingWorkbook) return;
+    setIsExportingWorkbook(true);
+    const startAd = bsToAdIsoDate(bsFromYear, bsFromMonth, bsFromDay);
+    const endAd = bsToAdIsoDate(bsToYear, bsToMonth, bsToDay);
+    const bsFromTag = `${bsFromYear}-${String(bsFromMonth + 1).padStart(2, '0')}-${String(bsFromDay).padStart(2, '0')}`;
+    const bsToTag = `${bsToYear}-${String(bsToMonth + 1).padStart(2, '0')}-${String(bsToDay).padStart(2, '0')}`;
+
+    try {
+      const resp = await authFetch('/api/zk/export-logs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          startDate: startAd,
+          endDate: endAd,
+          onlyDatabaseEmployees: onlyDbEmployees
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data?.success) {
+        throw new Error(data?.error || 'Failed to query SQLite attendance logs');
+      }
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      if (rows.length === 0) {
+        toast.warning(`No terminal or uploaded punch logs found between BS ${bsFromTag} and ${bsToTag}.`);
+        return;
+      }
+
+      const mainSheet = XLSX.utils.json_to_sheet(rows, {
+        header: ['Department', 'Name', 'EmpCode', 'PunchDateTime']
+      });
+      const rawPasteSheet = XLSX.utils.json_to_sheet(rows, {
+        header: ['Department', 'Name', 'EmpCode', 'PunchDateTime']
+      });
+      mainSheet['!cols'] = [{ wch: 22 }, { wch: 26 }, { wch: 14 }, { wch: 22 }];
+      rawPasteSheet['!cols'] = [{ wch: 22 }, { wch: 26 }, { wch: 14 }, { wch: 22 }];
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, mainSheet, 'Attendance Logs');
+      XLSX.utils.book_append_sheet(wb, rawPasteSheet, 'Raw_Paste');
+      XLSX.writeFile(wb, `Attendance_Logs_BS_${bsFromTag}_to_${bsToTag}.xlsx`);
+      toast.success(`Exported ${rows.length.toLocaleString()} punch rows (BS ${bsFromTag} to ${bsToTag}).`);
+    } catch (err: any) {
+      toast.error(err?.message || 'Failed to download attendance log workbook');
+    } finally {
+      setIsExportingWorkbook(false);
     }
   };
 
@@ -346,6 +506,7 @@ export const DeviceSetup: React.FC = () => {
       enabled: true,
       autoSyncMinutes: Number(pollSummary?.intervalMinutes || 15),
       protocolMode: 'Auto',
+      direction: 'AUTO',
       commKey: 0
     });
     setIsDeviceModalOpen(true);
@@ -364,6 +525,7 @@ export const DeviceSetup: React.FC = () => {
       enabled: dev.enabled,
       autoSyncMinutes: dev.autoSyncMinutes ?? 15,
       protocolMode: dev.protocolMode || 'Auto',
+      direction: dev.direction || 'AUTO',
       commKey: Number(dev.commKey || 0)
     });
     setIsDeviceModalOpen(true);
@@ -546,7 +708,7 @@ export const DeviceSetup: React.FC = () => {
 
   return (
     <div className="space-y-5">
-      {/* Page Header — Single Primary Action: Download Logs */}
+      {/* Page Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white dark:bg-slate-900 p-5 rounded-xl border border-slate-200 dark:border-slate-800">
         <div className="flex items-center gap-3">
           <div className="p-2.5 bg-indigo-50 dark:bg-indigo-950/50 text-indigo-600 dark:text-indigo-400 rounded-lg border border-indigo-100 dark:border-indigo-900">
@@ -554,23 +716,35 @@ export const DeviceSetup: React.FC = () => {
           </div>
           <div>
             <h1 className="text-lg font-bold text-slate-900 dark:text-slate-100 tracking-tight">
-              ZKTeco Biometric Devices
+              ZKTeco Biometric Readers &amp; Log Export
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Download hardware punch logs into SQLite, configure auto-fetch schedule, and manage terminal mappings.
+              15-minute incremental LAN polling with count-check optimization, reader direction rules, and Nepali BS punch export.
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2.5 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
           <button
             type="button"
-            onClick={handleDownloadLogs}
-            disabled={isDownloadingLogs || zkDevices.length === 0}
-            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-xs flex items-center gap-2 transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={() => handleSyncAll(false)}
+            disabled={isSyncingNew || isFullReading || zkDevices.length === 0}
+            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+            title="Check device log counter and download only when changed"
           >
-            <Download className={`w-4 h-4 ${isDownloadingLogs ? 'animate-bounce' : ''}`} />
-            {isDownloadingLogs ? 'Downloading Logs...' : 'Download Logs'}
+            <RefreshCw className={`w-3.5 h-3.5 ${isSyncingNew ? 'animate-spin' : ''}`} />
+            {isSyncingNew ? 'Syncing New...' : 'Sync New'}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleSyncAll(true)}
+            disabled={isSyncingNew || isFullReading || zkDevices.length === 0}
+            className="px-3.5 py-2 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 rounded-lg font-semibold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+            title="Force full log download from every active terminal"
+          >
+            <RotateCw className={`w-3.5 h-3.5 ${isFullReading ? 'animate-spin' : ''}`} />
+            {isFullReading ? 'Reading Full...' : 'Full Read'}
           </button>
 
           {isAdmin && (
@@ -592,6 +766,124 @@ export const DeviceSetup: React.FC = () => {
           >
             <Printer className="w-3.5 h-3.5" />
             Print
+          </button>
+        </div>
+      </div>
+
+      {/* SECTION 1: DOWNLOAD ATTENDANCE LOGS (Nepali BS Range Export) */}
+      <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+        <div className="border-l-2 border-indigo-600 pl-3">
+          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-900 dark:text-slate-100">
+            Download Attendance Logs
+          </h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed max-w-5xl">
+            Export the stored punch log for a Nepali date range. The range opens on the current Nepali month. Keep{' '}
+            <strong className="text-slate-700 dark:text-slate-200">Only employees in the employee database</strong>{' '}
+            ticked to leave out unknown device codes; separated employees are included because their history is real.
+            The workbook uses the same <strong className="text-slate-700 dark:text-slate-200">Department / Name / EmpCode / PunchDateTime</strong>{' '}
+            layout and <strong className="text-slate-700 dark:text-slate-200">Raw_Paste</strong> sheet as the uploaded ZKTeco punchlog,
+            so it can be uploaded back unchanged. Manual attendance corrections are{' '}
+            <strong className="text-slate-700 dark:text-slate-200">not</strong> included; only terminal and uploaded punch rows are exported.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-end gap-4 pt-1">
+          <div>
+            <span className="block text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">
+              From (BS)
+            </span>
+            <div className="flex items-center gap-1.5">
+              <select
+                value={bsFromYear}
+                onChange={(e) => setBsFromYear(Number(e.target.value))}
+                className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-semibold text-slate-900 dark:text-slate-100 tabular-nums cursor-pointer"
+                aria-label="From BS Year"
+              >
+                {BS_YEARS.map(y => (
+                  <option key={y} value={y}>{y}</option>
+                ))}
+              </select>
+              <select
+                value={bsFromMonth}
+                onChange={(e) => setBsFromMonth(Number(e.target.value))}
+                className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-semibold text-slate-900 dark:text-slate-100 cursor-pointer"
+                aria-label="From BS Month"
+              >
+                {BS_MONTHS.map((mName, idx) => (
+                  <option key={mName} value={idx}>{mName}</option>
+                ))}
+              </select>
+              <select
+                value={bsFromDay}
+                onChange={(e) => setBsFromDay(Number(e.target.value))}
+                className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-semibold text-slate-900 dark:text-slate-100 tabular-nums cursor-pointer"
+                aria-label="From BS Day"
+              >
+                {Array.from({ length: bsFromMaxDays }, (_, i) => i + 1).map(d => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <span className="block text-[10px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">
+              To (BS)
+            </span>
+            <div className="flex items-center gap-1.5">
+              <select
+                value={bsToYear}
+                onChange={(e) => setBsToYear(Number(e.target.value))}
+                className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-semibold text-slate-900 dark:text-slate-100 tabular-nums cursor-pointer"
+                aria-label="To BS Year"
+              >
+                {BS_YEARS.map(y => (
+                  <option key={y} value={y}>{y}</option>
+                ))}
+              </select>
+              <select
+                value={bsToMonth}
+                onChange={(e) => setBsToMonth(Number(e.target.value))}
+                className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-semibold text-slate-900 dark:text-slate-100 cursor-pointer"
+                aria-label="To BS Month"
+              >
+                {BS_MONTHS.map((mName, idx) => (
+                  <option key={mName} value={idx}>{mName}</option>
+                ))}
+              </select>
+              <select
+                value={bsToDay}
+                onChange={(e) => setBsToDay(Number(e.target.value))}
+                className="px-2.5 py-1.5 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-xs font-semibold text-slate-900 dark:text-slate-100 tabular-nums cursor-pointer"
+                aria-label="To BS Day"
+              >
+                {Array.from({ length: bsToMaxDays }, (_, i) => i + 1).map(d => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <label className="flex items-center gap-2 pb-1.5 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={onlyDbEmployees}
+              onChange={(e) => setOnlyDbEmployees(e.target.checked)}
+              className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+            />
+            <span className="text-[11px] font-bold uppercase tracking-wide text-slate-700 dark:text-slate-300">
+              Only employees in the employee database
+            </span>
+          </label>
+
+          <button
+            type="button"
+            onClick={handleExportBsAttendanceLogs}
+            disabled={isExportingWorkbook}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Download className={`w-3.5 h-3.5 ${isExportingWorkbook ? 'animate-bounce' : ''}`} />
+            {isExportingWorkbook ? 'Preparing Workbook...' : 'Download Logs'}
           </button>
         </div>
       </div>
@@ -698,7 +990,7 @@ export const DeviceSetup: React.FC = () => {
       {/* Navigation Tabs */}
       <div className="flex flex-wrap gap-1 border-b border-slate-200 dark:border-slate-800">
         {[
-          { id: 'devices' as const, label: `Devices (${zkDevices.length})`, icon: HardDrive },
+          { id: 'devices' as const, label: `Biometric Readers (${zkDevices.length})`, icon: HardDrive },
           { id: 'mapping' as const, label: `User Mapping (${zkUserMappings.length})`, icon: UserCheck },
           { id: 'unmapped' as const, label: `Unmapped Punches (${unmappedGrouped.length})`, icon: AlertTriangle },
           { id: 'dat_import' as const, label: 'DAT / CSV Import', icon: FileUp },
@@ -720,26 +1012,41 @@ export const DeviceSetup: React.FC = () => {
         ))}
       </div>
 
-      {/* TAB 1: REGISTERED TERMINALS */}
+      {/* TAB 1: BIOMETRIC READERS */}
       {activeTab === 'devices' && (
         <div className="space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="relative max-w-md flex-1">
-              <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
-              <input
-                type="text"
-                placeholder="Search by device name, IP address, model, or serial..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-9 pr-4 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
-              />
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-3">
+            <div className="border-l-2 border-indigo-600 pl-3">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-900 dark:text-slate-100">
+                Biometric Readers
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
+                Read the terminals straight over the LAN — no export file and no separate service. Each reader remembers how many attendance records its terminal held when it was last read:{' '}
+                <strong className="text-slate-700 dark:text-slate-200">Sync new</strong> connects, asks for that count, and downloads the log{' '}
+                <strong className="text-slate-700 dark:text-slate-200">only when the number has changed</strong>. Punches already stored are never inserted twice, and repeated reads inside the dedupe window — or the same event already uploaded from a file — are collapsed to the first punch, so an overlapping read is harmless. Assign a reader{' '}
+                <strong className="text-slate-700 dark:text-slate-200">IN</strong> or <strong className="text-slate-700 dark:text-slate-200">OUT</strong> when its terminal does not send a direction of its own;{' '}
+                <strong className="text-slate-700 dark:text-slate-200">AUTO</strong> keeps the punch type the device reports. A full read happens once a day anyway, in case a terminal overwrote a full log without its counter moving. Syncing only reads: it never clears, edits or deletes the terminal&apos;s log, its users or its settings.
+              </p>
             </div>
 
-            <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              {filteredDevices.filter(d => d.status === 'online').length} / {filteredDevices.length} Connected
-              {pollSummary?.nextPollAt && isScheduleEnabled && (
-                <span> · Next scheduled fetch {new Date(pollSummary.nextPollAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-              )}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+              <div className="relative max-w-md flex-1">
+                <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Search by reader name, IP address, model, or serial..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="w-full pl-9 pr-4 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-900 dark:text-slate-100"
+                />
+              </div>
+
+              <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                {filteredDevices.filter(d => d.status === 'online').length} / {filteredDevices.length} Connected
+                {pollSummary?.nextPollAt && isScheduleEnabled && (
+                  <span> · Next auto-sync {new Date(pollSummary.nextPollAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                )}
+              </div>
             </div>
           </div>
 
@@ -749,14 +1056,9 @@ export const DeviceSetup: React.FC = () => {
                 <table className="w-full text-left border-collapse text-xs">
                   <thead>
                     <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 text-slate-500 dark:text-slate-400 font-semibold uppercase text-[11px] tracking-wider">
-                      <th className="py-3 px-4 whitespace-nowrap">Device &amp; Serial</th>
-                      <th className="py-3 px-3 whitespace-nowrap">Status</th>
-                      <th className="py-3 px-3 whitespace-nowrap">IP &amp; Port</th>
-                      <th className="py-3 px-3 whitespace-nowrap">Model / Mode</th>
-                      <th className="py-3 px-3 whitespace-nowrap text-right">Enrolled</th>
-                      <th className="py-3 px-3 whitespace-nowrap text-right">FP / Face</th>
-                      <th className="py-3 px-3 whitespace-nowrap text-right">Device Logs</th>
-                      <th className="py-3 px-3 whitespace-nowrap text-right">SQLite Logs</th>
+                      <th className="py-3 px-4 whitespace-nowrap">Reader</th>
+                      <th className="py-3 px-3 whitespace-nowrap">Connection</th>
+                      <th className="py-3 px-3 whitespace-nowrap">Direction</th>
                       <th className="py-3 px-3 whitespace-nowrap">Last Sync</th>
                       <th className="py-3 px-4 whitespace-nowrap text-right">Actions</th>
                     </tr>
@@ -764,56 +1066,89 @@ export const DeviceSetup: React.FC = () => {
                   <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                     {filteredDevices.map((dev) => {
                       const sqliteCount = Math.max(liveDeviceStatsMap.get(dev.id)?.logs || 0, dev.logCount || 0);
+                      const rawCount = dev.lastDeviceLogCount ?? dev.deviceCapacityLogs ?? 0;
                       const isOnline = dev.status === 'online';
+                      const directionVal: ZkReaderDirection = dev.direction || 'AUTO';
+                      const lastRead = dev.lastReadRecords ?? 0;
+                      const lastNew = dev.lastNewRecords ?? 0;
+                      const lastSyncTs = dev.lastSuccessfulSync || dev.lastSync;
+
                       return (
                         <tr key={dev.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/30 transition-colors">
-                          <td className="py-3 px-4 align-middle">
-                            <div className="font-semibold text-slate-900 dark:text-slate-100">
+                          <td className="py-3.5 px-4 align-middle">
+                            <div className="font-semibold text-slate-900 dark:text-slate-100 text-[13px]">
                               {dev.name}
-                              {!dev.enabled && (
-                                <span className="ml-1.5 text-[11px] font-normal text-slate-400">(Disabled)</span>
-                              )}
                             </div>
                             <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-0.5">
-                              #{dev.deviceNumber ?? 1} · SN: {dev.serialNumber || '—'}
+                              {dev.serialNumber || '—'} · {dev.model}
+                            </div>
+                            <div className="mt-1 flex items-center gap-2 text-[11px]">
+                              <span
+                                className={`font-semibold ${
+                                  !dev.enabled
+                                    ? 'text-slate-400'
+                                    : isOnline
+                                      ? 'text-emerald-600 dark:text-emerald-400'
+                                      : 'text-rose-600 dark:text-rose-400'
+                                }`}
+                              >
+                                {dev.enabled ? (isOnline ? 'Active · Connected' : 'Active · Offline') : 'Disabled'}
+                              </span>
+                              {dev.lastError && !isOnline && dev.enabled && (
+                                <span className="text-rose-500/80 truncate max-w-[200px]" title={dev.lastError}>
+                                  · {dev.lastError}
+                                </span>
+                              )}
                             </div>
                           </td>
-                          <td className="py-3 px-3 align-middle whitespace-nowrap">
-                            <span className={`font-semibold ${isOnline ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
-                              {isOnline ? 'Connected' : 'Offline'}
-                            </span>
-                            {dev.lastError && !isOnline && (
-                              <div className="text-[11px] text-rose-500/80 truncate max-w-[170px]" title={dev.lastError}>
-                                {dev.lastError}
-                              </div>
-                            )}
+
+                          <td className="py-3.5 px-3 align-middle whitespace-nowrap tabular-nums">
+                            <div className="font-mono font-semibold text-slate-800 dark:text-slate-200">
+                              {dev.ip}:{dev.port || 4370}
+                            </div>
+                            <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 font-mono">
+                              <span className="font-semibold text-slate-700 dark:text-slate-300">{rawCount.toLocaleString()}</span> raw
+                              {' · '}
+                              <span className="font-semibold text-slate-700 dark:text-slate-300">{sqliteCount.toLocaleString()}</span> punches
+                            </div>
                           </td>
-                          <td className="py-3 px-3 align-middle font-mono font-semibold text-slate-800 dark:text-slate-200 whitespace-nowrap tabular-nums">
-                            {dev.ip}:{dev.port || 4370}
+
+                          <td className="py-3.5 px-3 align-middle whitespace-nowrap">
+                            <select
+                              value={directionVal}
+                              onChange={(e) => handleDirectionChange(dev, e.target.value as ZkReaderDirection)}
+                              disabled={!isAdmin}
+                              className="px-2.5 py-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-xs font-semibold text-slate-800 dark:text-slate-200 cursor-pointer disabled:opacity-60"
+                              aria-label={`Punch direction for ${dev.name}`}
+                            >
+                              <option value="AUTO">AUTO</option>
+                              <option value="IN">IN</option>
+                              <option value="OUT">OUT</option>
+                            </select>
                           </td>
-                          <td className="py-3 px-3 align-middle whitespace-nowrap">
-                            <span className="font-mono text-slate-800 dark:text-slate-200">{dev.model}</span>
-                            <span className="block text-[11px] text-slate-500">
-                              {dev.commType || 'Ethernet'} · {dev.lastProtocolUsed || dev.protocolMode || 'Auto'}
-                            </span>
+
+                          <td className="py-3.5 px-3 align-middle whitespace-nowrap tabular-nums">
+                            <div className="font-mono font-semibold text-slate-800 dark:text-slate-200">
+                              {formatReaderSyncDateTime(lastSyncTs)}
+                            </div>
+                            <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 font-mono">
+                              {lastNew.toLocaleString()} new · {lastRead.toLocaleString()} read
+                            </div>
                           </td>
-                          <td className="py-3 px-3 align-middle text-right font-mono tabular-nums text-slate-800 dark:text-slate-200">
-                            {(dev.deviceCapacityUsers ?? dev.userCount ?? 0).toLocaleString()}
-                          </td>
-                          <td className="py-3 px-3 align-middle text-right font-mono tabular-nums text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                            {(dev.fpCount ?? 0).toLocaleString()} / {(dev.userFaceCount ?? dev.faceCount ?? 0).toLocaleString()}
-                          </td>
-                          <td className="py-3 px-3 align-middle text-right font-mono font-semibold tabular-nums text-indigo-600 dark:text-indigo-400">
-                            {(dev.deviceCapacityLogs ?? 0).toLocaleString()}
-                          </td>
-                          <td className="py-3 px-3 align-middle text-right font-mono font-semibold tabular-nums text-slate-900 dark:text-slate-100">
-                            {sqliteCount.toLocaleString()}
-                          </td>
-                          <td className="py-3 px-3 align-middle text-slate-500 dark:text-slate-400 font-mono tabular-nums whitespace-nowrap">
-                            {dev.lastSync ? new Date(dev.lastSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Never'}
-                          </td>
-                          <td className="py-3 px-4 align-middle text-right whitespace-nowrap">
+
+                          <td className="py-3.5 px-4 align-middle text-right whitespace-nowrap">
                             <div className="inline-flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleSyncSingleDevice(dev, false)}
+                                disabled={syncingDeviceId === dev.id}
+                                className="px-2.5 py-1.5 text-xs font-medium bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 rounded-lg inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                                title="Check counter and sync new logs from this terminal"
+                              >
+                                <RefreshCw className={`w-3.5 h-3.5 ${syncingDeviceId === dev.id ? 'animate-spin' : ''}`} />
+                                Sync
+                              </button>
+
                               <button
                                 type="button"
                                 onClick={() => handleTestConnection(dev)}
@@ -1253,7 +1588,7 @@ export const DeviceSetup: React.FC = () => {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">Protocol Mode</label>
                   <select
@@ -1266,6 +1601,19 @@ export const DeviceSetup: React.FC = () => {
                     <option value="UDP">UDP 4370</option>
                     <option value="ADMS">ADMS Push</option>
                     <option value="Web-HTTP">Web HTTP (Port 80)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">Direction</label>
+                  <select
+                    value={formData.direction}
+                    onChange={(e) => setFormData({ ...formData, direction: e.target.value as ZkReaderDirection })}
+                    className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs font-medium text-slate-900 dark:text-slate-100"
+                  >
+                    <option value="AUTO">AUTO (Device Default)</option>
+                    <option value="IN">IN (Entry Reader)</option>
+                    <option value="OUT">OUT (Exit Reader)</option>
                   </select>
                 </div>
 

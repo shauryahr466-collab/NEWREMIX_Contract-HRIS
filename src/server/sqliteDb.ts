@@ -677,6 +677,26 @@ export async function getSqliteDb(): Promise<Database> {
       updated_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS approval_audits (
+      id TEXT PRIMARY KEY,
+      module TEXT NOT NULL DEFAULT '',
+      record_id TEXT NOT NULL DEFAULT '',
+      employee_id TEXT DEFAULT '',
+      employee_name TEXT DEFAULT '',
+      target_date TEXT DEFAULT '',
+      previous_status TEXT DEFAULT '',
+      new_status TEXT NOT NULL DEFAULT '',
+      previous_approver TEXT DEFAULT '',
+      previous_approver_role TEXT DEFAULT '',
+      approved_by TEXT NOT NULL DEFAULT '',
+      approved_by_role TEXT NOT NULL DEFAULT '',
+      is_override INTEGER NOT NULL DEFAULT 0,
+      remarks TEXT DEFAULT '',
+      bs_date TEXT DEFAULT '',
+      timestamp TEXT NOT NULL DEFAULT '',
+      data TEXT NOT NULL DEFAULT '{}'
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_punch_dedup ON attendance_punches (employee_id, punch_datetime, device_id);
     CREATE INDEX IF NOT EXISTS idx_punch_emp_datetime ON attendance_punches (employee_id, punch_datetime);
     CREATE INDEX IF NOT EXISTS idx_emp_dept ON employees (department);
@@ -685,6 +705,8 @@ export async function getSqliteDb(): Promise<Database> {
     CREATE INDEX IF NOT EXISTS idx_emp_designation ON employees (designation);
     CREATE INDEX IF NOT EXISTS idx_movements_emp ON employee_movements (employee_id, effective_date);
     CREATE INDEX IF NOT EXISTS idx_audit_emp ON audit_logs (employee_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_approval_audits_ts ON approval_audits (timestamp);
+    CREATE INDEX IF NOT EXISTS idx_approval_audits_emp ON approval_audits (employee_id, module);
     CREATE INDEX IF NOT EXISTS idx_roster_assign_batch ON roster_assignments (roster_batch_id, employee_id, roster_date);
     CREATE INDEX IF NOT EXISTS idx_roster_assign_emp_date ON roster_assignments (employee_id, roster_date);
     CREATE INDEX IF NOT EXISTS idx_roster_batches_period ON roster_batches (period_start, period_end);

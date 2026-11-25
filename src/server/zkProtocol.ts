@@ -43,6 +43,7 @@ export interface ZkPollHardwareResult {
   freeSizes?: ZkDeviceFreeSizes;
   users: ZkDeviceUser[];
   punches: ZkRawPunch[];
+  skippedUnchangedCount?: boolean;
   attempts?: ZkProtocolAttempt[];
   error?: string;
 }
@@ -263,6 +264,7 @@ class ZkTcpSession {
   private buffer = Buffer.alloc(0);
   private sessionId = 0;
   private replyId = 0;
+  private packetQueue: Array<{ cmd: number; sessionId: number; replyId: number; data: Buffer }> = [];
   private waiters: Array<{ resolve: (pkt: { cmd: number; sessionId: number; replyId: number; data: Buffer }) => void; reject: (err: Error) => void }> = [];
 
   constructor(private ip: string, private port: number, private timeoutMs = 4000) {
@@ -294,16 +296,23 @@ class ZkTcpSession {
       const cmd = inner.readUInt16LE(0);
       const sessionId = inner.readUInt16LE(4);
       const replyId = inner.readUInt16LE(6);
-      const data = inner.subarray(8);
+      const data = Buffer.from(inner.subarray(8));
 
+      const pkt = { cmd, sessionId, replyId, data };
       const next = this.waiters.shift();
       if (next) {
-        next.resolve({ cmd, sessionId, replyId, data });
+        next.resolve(pkt);
+      } else {
+        this.packetQueue.push(pkt);
       }
     }
   }
 
   private nextPacket(timeoutMs = this.timeoutMs): Promise<{ cmd: number; sessionId: number; replyId: number; data: Buffer }> {
+    this.pumpFrames();
+    if (this.packetQueue.length > 0) {
+      return Promise.resolve(this.packetQueue.shift()!);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const i = this.waiters.findIndex(w => w.resolve === wrappedResolve);
@@ -378,63 +387,76 @@ class ZkTcpSession {
     return await waitPromise;
   }
 
+  private async consumePrepareDataStream(totalSize: number, packetTimeoutMs = 15000): Promise<Buffer> {
+    if (totalSize <= 0) return Buffer.alloc(0);
+    const chunks: Buffer[] = [];
+    let received = 0;
+    while (received < totalSize) {
+      const pkt = await this.nextPacket(packetTimeoutMs);
+      if (pkt.cmd === CMD_DATA || pkt.cmd === CMD_ACK_DATA) {
+        chunks.push(pkt.data);
+        received += pkt.data.length;
+      } else if (pkt.cmd === CMD_ACK_OK) {
+        break;
+      } else {
+        break;
+      }
+    }
+    // Consume optional trailing CMD_ACK_OK emitted at end of PREPARE_DATA stream so next command stays synced
+    if (received >= totalSize) {
+      const maybeAck = await this.nextPacket(120).catch(() => null);
+      if (maybeAck && maybeAck.cmd !== CMD_ACK_OK && maybeAck.data.length > 0 && (maybeAck.cmd === CMD_DATA || maybeAck.cmd === CMD_ACK_DATA)) {
+        chunks.push(maybeAck.data);
+      }
+    }
+    return Buffer.concat(chunks);
+  }
+
   async readLargeBuffer(cmd: number, reqPayload: Buffer = Buffer.alloc(0)): Promise<Buffer> {
-    const resp = await this.execute(cmd, reqPayload, Math.max(this.timeoutMs, 8000));
+    const bulkTimeout = Math.max(this.timeoutMs, 15000);
+    const resp = await this.execute(cmd, reqPayload, bulkTimeout);
     if (resp.cmd === CMD_ACK_DATA || resp.cmd === CMD_DATA) {
       return resp.data;
     }
 
-    if (resp.cmd === CMD_ACK_OK) {
-      // Check if device returns PREPARE_DATA size in resp.data or sends subsequent PREPARE_DATA
-      if (resp.data.length >= 4) {
-        const totalSize = resp.data.readUInt32LE(0);
-        if (totalSize === 0) return Buffer.alloc(0);
-        const chunks: Buffer[] = [];
-        let received = 0;
-        while (received < totalSize) {
-          const pkt = await this.nextPacket(8000);
-          if (pkt.cmd === CMD_DATA || pkt.cmd === CMD_ACK_DATA) {
-            chunks.push(pkt.data);
-            received += pkt.data.length;
-          } else if (pkt.cmd === CMD_ACK_OK) {
-            break;
-          } else {
-            break;
-          }
-        }
-        try { await this.execute(CMD_FREE_DATA); } catch {}
-        return Buffer.concat(chunks);
-      }
-      return Buffer.alloc(0);
-    }
-
     if (resp.cmd === CMD_PREPARE_DATA && resp.data.length >= 4) {
       const totalSize = resp.data.readUInt32LE(0);
-      const chunks: Buffer[] = [];
-      let received = 0;
-      while (received < totalSize) {
-        const pkt = await this.nextPacket(8000);
-        if (pkt.cmd === CMD_DATA || pkt.cmd === CMD_ACK_DATA) {
-          chunks.push(pkt.data);
-          received += pkt.data.length;
-        } else {
-          break;
-        }
-      }
+      const out = await this.consumePrepareDataStream(totalSize, bulkTimeout);
       try { await this.execute(CMD_FREE_DATA); } catch {}
-      return Buffer.concat(chunks);
+      return out;
+    }
+
+    if (resp.cmd === CMD_ACK_OK && resp.data.length >= 4) {
+      const totalSize = resp.data.readUInt32LE(0);
+      if (totalSize === 0) return Buffer.alloc(0);
+      const out = await this.consumePrepareDataStream(totalSize, bulkTimeout);
+      try { await this.execute(CMD_FREE_DATA); } catch {}
+      return out;
     }
 
     return Buffer.alloc(0);
   }
 
   async readWithDataWrrq(fct: number): Promise<Buffer> {
+    const bulkTimeout = Math.max(this.timeoutMs, 15000);
     // Standard ZKTeco TCP bulk read request (CMD_DATA_WRRQ 1503):
-    // 11-byte payload: [0x01, fct, 0x00*9] (fct: 13 = attlog, 9 = usertemp/user)
+    // 11-byte payload: [0x01, fct, 0x00*9] (fct: 13 = attlog, 5 = user)
     const req = Buffer.alloc(11);
     req[0] = 0x01;
     req[1] = fct;
-    const resp = await this.execute(CMD_DATA_WRRQ, req, 8000);
+    const resp = await this.execute(CMD_DATA_WRRQ, req, bulkTimeout);
+
+    if (resp.cmd === CMD_ACK_DATA || resp.cmd === CMD_DATA) {
+      return resp.data;
+    }
+
+    if (resp.cmd === CMD_PREPARE_DATA && resp.data.length >= 4) {
+      const totalSize = resp.data.readUInt32LE(0);
+      const out = await this.consumePrepareDataStream(totalSize, bulkTimeout);
+      try { await this.execute(CMD_FREE_DATA); } catch {}
+      return out;
+    }
+
     if (resp.cmd === CMD_ACK_OK && resp.data.length >= 5) {
       const size = resp.data.readUInt32LE(1);
       if (size === 0) return Buffer.alloc(0);
@@ -445,12 +467,15 @@ class ZkTcpSession {
         const chunkLen = Math.min(size - offset, 65536);
         readChunkReq.writeUInt32LE(offset, 0);
         readChunkReq.writeUInt32LE(chunkLen, 4);
-        const chunkResp = await this.execute(CMD_DATA_RDY, readChunkReq, 8000);
-        if (chunkResp.cmd === CMD_PREPARE_DATA) {
-          const dataPkt = await this.nextPacket(8000);
-          chunks.push(dataPkt.data);
-          offset += dataPkt.data.length;
+        const chunkResp = await this.execute(CMD_DATA_RDY, readChunkReq, bulkTimeout);
+        if (chunkResp.cmd === CMD_PREPARE_DATA && chunkResp.data.length >= 4) {
+          const prepSize = chunkResp.data.readUInt32LE(0);
+          const chunkBuf = await this.consumePrepareDataStream(prepSize, bulkTimeout);
+          if (chunkBuf.length === 0) break;
+          chunks.push(chunkBuf);
+          offset += chunkBuf.length;
         } else if (chunkResp.cmd === CMD_DATA || chunkResp.cmd === CMD_ACK_DATA) {
+          if (chunkResp.data.length === 0) break;
           chunks.push(chunkResp.data);
           offset += chunkResp.data.length;
         } else {
@@ -460,9 +485,7 @@ class ZkTcpSession {
       try { await this.execute(CMD_FREE_DATA); } catch {}
       return Buffer.concat(chunks);
     }
-    if (resp.cmd === CMD_ACK_DATA || resp.cmd === CMD_DATA) {
-      return resp.data;
-    }
+
     return Buffer.alloc(0);
   }
 
@@ -508,6 +531,7 @@ class ZkUdpSession {
   private sock: dgram.Socket;
   private sessionId = 0;
   private replyId = 0;
+  private packetQueue: Array<{ cmd: number; sessionId: number; replyId: number; data: Buffer }> = [];
   private waiters: Array<{ resolve: (pkt: { cmd: number; sessionId: number; replyId: number; data: Buffer }) => void; reject: (err: Error) => void }> = [];
 
   constructor(private ip: string, private port: number, private timeoutMs = 3000) {
@@ -515,6 +539,9 @@ class ZkUdpSession {
   }
 
   private nextPacket(timeoutMs = this.timeoutMs): Promise<{ cmd: number; sessionId: number; replyId: number; data: Buffer }> {
+    if (this.packetQueue.length > 0) {
+      return Promise.resolve(this.packetQueue.shift()!);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const idx = this.waiters.findIndex(w => w.resolve === wrappedResolve);
@@ -541,9 +568,14 @@ class ZkUdpSession {
         const cmd = msg.readUInt16LE(0);
         const sessionId = msg.readUInt16LE(4);
         const replyId = msg.readUInt16LE(6);
-        const data = msg.subarray(8);
+        const data = Buffer.from(msg.subarray(8));
+        const pkt = { cmd, sessionId, replyId, data };
         const next = this.waiters.shift();
-        if (next) next.resolve({ cmd, sessionId, replyId, data });
+        if (next) {
+          next.resolve(pkt);
+        } else {
+          this.packetQueue.push(pkt);
+        }
       });
       this.sock.once('error', (err) => {
         if (!settled) {
@@ -910,7 +942,8 @@ export async function fetchZkHardwareData(
   port = 4370,
   commKey = 0,
   timeoutMs = 3500,
-  protocolMode: ZkProtocolMode = 'Auto'
+  protocolMode: ZkProtocolMode = 'Auto',
+  options?: { knownLogCount?: number; forceFullRead?: boolean }
 ): Promise<ZkPollHardwareResult> {
   if (!ip || ip === 'ADMS Push' || ip === 'USB/File' || ip === 'Local Disk (E:)' || protocolMode === 'ADMS' || protocolMode === 'USB-Disk') {
     return {
@@ -932,13 +965,39 @@ export async function fetchZkHardwareData(
   if (tryTcp) {
     const t0 = Date.now();
     const session = new ZkTcpSession(ip, port, timeoutMs);
+    let disabled = false;
     try {
       await session.connect(commKey);
-      await session.disableDevice();
 
       const freeSizes = await session.getFreeSizes().catch(() => undefined);
       const serialNumber = await session.getOption('~SerialNumber').catch(() => '');
       const deviceName = await session.getOption('~DeviceName').catch(() => '');
+
+      if (
+        !options?.forceFullRead &&
+        typeof options?.knownLogCount === 'number' &&
+        options.knownLogCount >= 0 &&
+        freeSizes &&
+        freeSizes.logCount === options.knownLogCount
+      ) {
+        await session.disconnect();
+        attempts.push({ protocol: 'TCP-4370', reachable: true, latencyMs: Date.now() - t0 });
+        return {
+          reachable: true,
+          protocol: 'TCP',
+          latencyMs: Date.now() - t0,
+          serialNumber: serialNumber || undefined,
+          deviceName: deviceName || undefined,
+          freeSizes,
+          users: [],
+          punches: [],
+          skippedUnchangedCount: true,
+          attempts
+        };
+      }
+
+      await session.disableDevice();
+      disabled = true;
 
       let userBuf = await session.readWithDataWrrq(5).catch(() => Buffer.alloc(0));
       if (userBuf.length === 0) {
@@ -953,6 +1012,7 @@ export async function fetchZkHardwareData(
       const punches = parseAttendancePayload(attBuf);
 
       await session.enableDevice();
+      disabled = false;
       await session.disconnect();
       attempts.push({ protocol: 'TCP-4370', reachable: true, latencyMs: Date.now() - t0 });
 
@@ -968,7 +1028,7 @@ export async function fetchZkHardwareData(
         attempts
       };
     } catch (err: any) {
-      await session.enableDevice();
+      if (disabled) await session.enableDevice();
       await session.disconnect();
       attempts.push({ protocol: 'TCP-4370', reachable: false, latencyMs: Date.now() - t0, error: err?.message || 'TCP error' });
     }
@@ -977,13 +1037,39 @@ export async function fetchZkHardwareData(
   if (tryUdp) {
     const u0 = Date.now();
     const udpSession = new ZkUdpSession(ip, port, Math.min(timeoutMs, 2500));
+    let disabled = false;
     try {
       await udpSession.connect(commKey);
-      await udpSession.disableDevice();
 
       const freeSizes = await udpSession.getFreeSizes().catch(() => undefined);
       const serialNumber = await udpSession.getOption('~SerialNumber').catch(() => '');
       const deviceName = await udpSession.getOption('~DeviceName').catch(() => '');
+
+      if (
+        !options?.forceFullRead &&
+        typeof options?.knownLogCount === 'number' &&
+        options.knownLogCount >= 0 &&
+        freeSizes &&
+        freeSizes.logCount === options.knownLogCount
+      ) {
+        await udpSession.disconnect();
+        attempts.push({ protocol: 'UDP-4370', reachable: true, latencyMs: Date.now() - u0 });
+        return {
+          reachable: true,
+          protocol: 'UDP',
+          latencyMs: Date.now() - u0,
+          serialNumber: serialNumber || undefined,
+          deviceName: deviceName || undefined,
+          freeSizes,
+          users: [],
+          punches: [],
+          skippedUnchangedCount: true,
+          attempts
+        };
+      }
+
+      await udpSession.disableDevice();
+      disabled = true;
 
       const userBuf = await udpSession.readLargeBuffer(CMD_USERTEMP_RRQ, Buffer.from([0x05])).catch(() => Buffer.alloc(0));
       const users = parseUsersPayload(userBuf);
@@ -992,6 +1078,7 @@ export async function fetchZkHardwareData(
       const punches = parseAttendancePayload(attBuf);
 
       await udpSession.enableDevice();
+      disabled = false;
       await udpSession.disconnect();
       attempts.push({ protocol: 'UDP-4370', reachable: true, latencyMs: Date.now() - u0 });
 
@@ -1007,7 +1094,7 @@ export async function fetchZkHardwareData(
         attempts
       };
     } catch (err: any) {
-      await udpSession.enableDevice();
+      if (disabled) await udpSession.enableDevice();
       await udpSession.disconnect();
       attempts.push({ protocol: 'UDP-4370', reachable: false, latencyMs: Date.now() - u0, error: err?.message || 'UDP error' });
     }

@@ -24,8 +24,15 @@ export default function SBL() {
     deleteSBL, 
     setSBLBatch, 
     deleteSBLBatch, 
-    globalSearchTerm 
+    globalSearchTerm,
+    effectiveUserProfile,
+    isSuperAdmin,
+    user
   } = useAppStore();
+
+  const isEmployeeOnly = effectiveUserProfile?.role === 'Employee';
+  const linkedEmployeeId = effectiveUserProfile?.linkedEmployeeId || '';
+  const canApproveLeave = isSuperAdmin || (!isEmployeeOnly && Boolean(effectiveUserProfile?.permissions?.canEditAttendance || effectiveUserProfile?.permissions?.canApproveOt));
 
   const [searchTerm, setSearchTerm] = useState('');
   const activeSearch = searchTerm || globalSearchTerm;
@@ -50,9 +57,9 @@ export default function SBL() {
   const [pageSize, setPageSize] = useState<number>(50);
 
   const [formData, setFormData] = useState({
-    employeeId: '',
+    employeeId: isEmployeeOnly ? linkedEmployeeId : '',
     date: format(new Date(), 'yyyy-MM-dd'),
-    leaveType: 'SBL' as 'SBL' | 'Short Break' | 'PWO' | 'Comp Leave',
+    leaveType: (isEmployeeOnly ? 'Casual Leave' : 'SBL') as SBLRecord['leaveType'],
     duration: 'Full Day',
     reason: ''
   });
@@ -91,8 +98,8 @@ export default function SBL() {
       await deleteSBLBatch(selectedIds);
       setSelectedIds([]);
       toast.success(`Successfully deleted ${count} record(s)`, { id: tId });
-    } catch (e) {
-      toast.error('Bulk delete failed', { id: tId });
+    } catch (e: any) {
+      toast.error(e?.message || 'Bulk delete failed', { id: tId });
     }
   };
 
@@ -101,8 +108,8 @@ export default function SBL() {
     try {
       await deleteSBL(id);
       toast.success('Record deleted successfully', { id: tId });
-    } catch (e) {
-      toast.error('Delete failed', { id: tId });
+    } catch (e: any) {
+      toast.error(e?.message || 'Delete failed', { id: tId });
     }
   };
 
@@ -330,11 +337,22 @@ export default function SBL() {
   }, [filteredRecords, currentPage, pageSize]);
 
   const handleStatusChange = async (id: string, status: 'Approved' | 'Rejected' | 'Final Confirmed' | 'Not Approved') => {
+    if (!canApproveLeave) {
+      toast.error('Your role does not have Leave / Substitute Leave approval permission.');
+      return;
+    }
     try {
       const target = sblRecords.find(r => r.id === id);
+      const actorName = effectiveUserProfile?.username || user?.username || 'Admin';
+      const actorRole = isSuperAdmin ? 'Super Admin' : (effectiveUserProfile?.role || 'Supervisor');
+      const wasProcessed = target && target.status !== 'Pending';
+
       const updates: Partial<SBLRecord> = { 
         status, 
-        approvedBy: 'Admin' 
+        approvedBy: actorName,
+        approvedByRole: actorRole,
+        reviewedBy: actorName,
+        reviewedByRole: actorRole
       };
 
       // Key Workflow Logic: PWO is the initial stage of SBL.
@@ -348,24 +366,31 @@ export default function SBL() {
 
       await updateSBL(id, updates);
       if (status === 'Approved' || status === 'Final Confirmed') {
-        toast.success(`PWO Approved & Converted! Credited into SBL Balance Section.`);
+        toast.success(
+          wasProcessed && isSuperAdmin
+            ? `Super Admin Override → ${target?.leaveType || 'Leave'} marked ${status}`
+            : target?.leaveType === 'PWO'
+              ? `PWO Approved & Converted! Credited into SBL Balance Section.`
+              : `Request marked ${status} by ${actorName}.`
+        );
       } else {
-        toast.success(`Status updated to ${status}`);
+        toast.success(`${wasProcessed && isSuperAdmin ? 'Super Admin Override → ' : ''}Status updated to ${status}`);
       }
-    } catch (e) {
-      toast.error('Operation failed');
+    } catch (e: any) {
+      toast.error(e?.message || 'Operation failed');
     }
   };
 
   const handleAddSBL = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.employeeId || !formData.date || !formData.reason) {
+    const targetEmpId = isEmployeeOnly ? linkedEmployeeId : formData.employeeId;
+    if (!targetEmpId || !formData.date || !formData.reason) {
       toast.error('Please fill all required fields');
       return;
     }
 
     try {
-      const emp = empMap.get(formData.employeeId);
+      const emp = empMap.get(targetEmpId);
       let dayName = '';
       try {
         dayName = format(parseISO(formData.date), 'EEEE');
@@ -373,24 +398,36 @@ export default function SBL() {
         dayName = '';
       }
 
+      const actorName = effectiveUserProfile?.username || user?.username || targetEmpId;
+      const actorRole = effectiveUserProfile?.role || 'Supervisor';
+      const initialStatus: SBLRecord['status'] = isEmployeeOnly ? 'Pending' : 'Approved';
+
       await addSBL({
         ...formData,
-        status: 'Approved',
-        approvedBy: 'Admin',
+        employeeId: targetEmpId,
+        status: initialStatus,
+        requestedBy: actorName,
+        requestedByRole: actorRole,
+        approvedBy: isEmployeeOnly ? undefined : actorName,
+        approvedByRole: isEmployeeOnly ? undefined : (isSuperAdmin ? 'Super Admin' : actorRole),
         dayName,
         weeklyOffName: emp?.weeklyOff ? `Weekly Off (${emp.weeklyOff})` : 'Weekly Off'
       });
-      toast.success(`${formData.leaveType} record registered and credited to SBL Balance`);
+      toast.success(
+        isEmployeeOnly
+          ? `${formData.leaveType} request submitted and awaiting HOD / Supervisor / Super Admin approval`
+          : `${formData.leaveType} record registered and approved`
+      );
       setIsModalOpen(false);
       setFormData({
-        employeeId: '',
+        employeeId: isEmployeeOnly ? linkedEmployeeId : '',
         date: format(new Date(), 'yyyy-MM-dd'),
-        leaveType: 'SBL',
+        leaveType: isEmployeeOnly ? 'Casual Leave' : 'SBL',
         duration: 'Full Day',
         reason: ''
       });
-    } catch (e) {
-      toast.error('Failed to add record');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to add record');
     }
   };
 
@@ -476,40 +513,58 @@ export default function SBL() {
   return (
     <div className="space-y-6">
       <PageHeader 
-        title="SBL & PWO Management" 
-        description="PWO Initial Offday Entry → Approved SBL (Substitute Leave) Credit Section"
+        title={isEmployeeOnly ? "Leave & Substitute Leave" : "Leave, SBL & PWO Management"} 
+        description={isEmployeeOnly ? "Apply for Casual, Sick, Annual, or Substitute Leave (SBL) and track approval status" : "Leave Requests, PWO Initial Entry → Approved SBL Credits & Super Admin Override"}
         icon={CalendarRange}
         actions={
           <div className="flex flex-wrap gap-2">
-            <Button 
-              onClick={handleSyncPWOAttendance} 
-              disabled={isSyncing}
-              className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white border-none shadow-md shadow-indigo-500/20"
+            {!isEmployeeOnly && (
+              <Button 
+                onClick={handleSyncPWOAttendance} 
+                disabled={isSyncing}
+                className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white border-none shadow-md shadow-indigo-500/20"
+              >
+                <RefreshCw size={16} className={cn(isSyncing && "animate-spin")} />
+                {isSyncing ? 'Syncing PWO...' : 'Sync PWO Attendance'}
+              </Button>
+            )}
+            <Button
+              onClick={() => {
+                setFormData({
+                  employeeId: isEmployeeOnly ? linkedEmployeeId : '',
+                  date: format(new Date(), 'yyyy-MM-dd'),
+                  leaveType: isEmployeeOnly ? 'Casual Leave' : 'SBL',
+                  duration: 'Full Day',
+                  reason: ''
+                });
+                setIsModalOpen(true);
+              }}
+              className="gap-2"
             >
-              <RefreshCw size={16} className={cn(isSyncing && "animate-spin")} />
-              {isSyncing ? 'Syncing PWO...' : 'Sync PWO Attendance'}
-            </Button>
-            <Button onClick={() => setIsModalOpen(true)} className="gap-2">
               <Plus size={16} />
-              New Entry
+              {isEmployeeOnly ? 'Apply Leave / Substitute Leave' : 'New Entry'}
             </Button>
-            <Button 
-              variant="outline" 
-              onClick={() => setIsBalanceModalOpen(true)}
-              className="gap-2 border-indigo-200 text-indigo-700 bg-indigo-50/50 hover:bg-indigo-100 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-800"
-            >
-              <Wallet size={16} />
-              SBL Balances
-            </Button>
-            <Button variant="outline" onClick={handleExportConfirmed} className="gap-2 bg-success/10 text-success border-success/20 hover:bg-success hover:text-white">
-              <ShieldCheck size={16} />
-              Confirmed Summary
-            </Button>
+            {!isEmployeeOnly && (
+              <>
+                <Button 
+                  variant="outline" 
+                  onClick={() => setIsBalanceModalOpen(true)}
+                  className="gap-2 border-indigo-200 text-indigo-700 bg-indigo-50/50 hover:bg-indigo-100 dark:bg-indigo-950/40 dark:text-indigo-300 dark:border-indigo-800"
+                >
+                  <Wallet size={16} />
+                  SBL Balances
+                </Button>
+                <Button variant="outline" onClick={handleExportConfirmed} className="gap-2 bg-success/10 text-success border-success/20 hover:bg-success hover:text-white">
+                  <ShieldCheck size={16} />
+                  Confirmed Summary
+                </Button>
+              </>
+            )}
             <Button variant="outline" onClick={handleExport} className="gap-2">
               <Download size={16} />
-              Export CSV
+              Export
             </Button>
-            {selectedIds.length > 0 && (
+            {!isEmployeeOnly && selectedIds.length > 0 && (
               <Button variant="danger" onClick={handleBulkDelete} className="gap-2">
                 <Trash2 size={16} />
                 Delete Selected ({selectedIds.length})
@@ -519,7 +574,8 @@ export default function SBL() {
         }
       />
 
-      {/* PWO to SBL Workflow Banner */}
+      {/* PWO to SBL Workflow Banner (Admin/Supervisor Only) */}
+      {!isEmployeeOnly && (
       <Card className="p-5 border-l-4 border-l-indigo-600 bg-gradient-to-r from-indigo-50/50 via-white to-purple-50/30 dark:from-indigo-950/20 dark:via-slate-900 dark:to-purple-950/10">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
           <div className="flex items-start gap-3">
@@ -565,36 +621,39 @@ export default function SBL() {
           </div>
         </div>
       </Card>
+      )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+      <div className={cn("grid grid-cols-1 sm:grid-cols-2 gap-4", isEmployeeOnly ? "md:grid-cols-3" : "md:grid-cols-4")}>
         <KPICard 
-          label="Total Records" 
+          label="Total Requests" 
           value={stats.total} 
           icon={CalendarRange} 
           onClick={() => { setSectionTab('all'); setLeaveTypeFilter('All'); setStatusFilter('All'); }}
         />
         <KPICard 
-          label="Initial PWO (Pending)" 
+          label="Pending Approval" 
           value={stats.pending} 
           icon={Clock} 
           trend="down"
-          trendValue="Awaiting HR Approval"
+          trendValue="Awaiting Decision"
           onClick={() => { setSectionTab('pwo_pending'); setStatusFilter('Pending'); }}
         />
         <KPICard 
-          label="Approved SBL Section" 
+          label="Approved Leave / SBL" 
           value={stats.approved} 
           icon={ShieldCheck} 
           trend="up"
-          trendValue="In SBL Balance"
+          trendValue="Approved / Credited"
           onClick={() => { setSectionTab('sbl_approved'); setStatusFilter('Approved'); }}
         />
-        <KPICard 
-          label="Total Staff Balances" 
-          value={employeeSblBalances.length} 
-          icon={Wallet} 
-          onClick={() => setIsBalanceModalOpen(true)}
-        />
+        {!isEmployeeOnly && (
+          <KPICard 
+            label="Total Staff Balances" 
+            value={employeeSblBalances.length} 
+            icon={Wallet} 
+            onClick={() => setIsBalanceModalOpen(true)}
+          />
+        )}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -680,8 +739,12 @@ export default function SBL() {
                   className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
                 >
                   <option value="All">All Types</option>
+                  <option value="Casual Leave">Casual Leave</option>
+                  <option value="Sick Leave">Sick Leave</option>
+                  <option value="Annual Leave">Annual Leave</option>
+                  <option value="Unpaid Leave">Unpaid Leave</option>
+                  <option value="SBL">SBL (Substitute Leave)</option>
                   <option value="PWO">PWO (Initial)</option>
-                  <option value="SBL">SBL (Approved Substitute)</option>
                   <option value="Comp Leave">Comp Leave</option>
                   <option value="Short Break">Short Break</option>
                 </select>
@@ -698,16 +761,18 @@ export default function SBL() {
                   <option value="Final Confirmed">Final Confirmed</option>
                 </select>
 
-                <select 
-                  value={designationFilter}
-                  onChange={(e) => setDesignationFilter(e.target.value)}
-                  className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
-                >
-                  <option value="All">All Designations</option>
-                  {designations.map(d => (
-                    <option key={d} value={d}>{d}</option>
-                  ))}
-                </select>
+                {!isEmployeeOnly && (
+                  <select 
+                    value={designationFilter}
+                    onChange={(e) => setDesignationFilter(e.target.value)}
+                    className="px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-primary/20"
+                  >
+                    <option value="All">All Designations</option>
+                    {designations.map(d => (
+                      <option key={d} value={d}>{d}</option>
+                    ))}
+                  </select>
+                )}
               </div>
 
               <div className="text-xs text-slate-500 font-medium">
@@ -752,26 +817,35 @@ export default function SBL() {
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
-                    <th className="px-3 py-3 w-10 text-center">
-                      <input 
-                        type="checkbox"
-                        checked={paginatedRecords.length > 0 && selectedIds.length === paginatedRecords.length}
-                        onChange={(e) => setSelectedIds(e.target.checked ? paginatedRecords.map(r => r.id) : [])}
-                        className="rounded border-slate-300 text-primary focus:ring-primary"
-                      />
-                    </th>
+                    {!isEmployeeOnly && (
+                      <th className="px-3 py-3 w-10 text-center">
+                        <input 
+                          type="checkbox"
+                          checked={paginatedRecords.length > 0 && selectedIds.length === paginatedRecords.length}
+                          onChange={(e) => setSelectedIds(e.target.checked ? paginatedRecords.map(r => r.id) : [])}
+                          className="rounded border-slate-300 text-primary focus:ring-primary"
+                        />
+                      </th>
+                    )}
                     <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Employee</th>
                     <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Date & Day</th>
                     <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Weekly Off</th>
                     <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">In / Out Time</th>
                     <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Type & Credit</th>
-                    <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Status</th>
+                    <th className="px-3 py-3 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Status & Reviewer</th>
                     <th className="px-3 py-3 text-right text-[10px] font-bold text-slate-400 uppercase tracking-widest">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/50 text-xs">
                   {paginatedRecords.map((record) => {
                     const emp = empMap.get(record.employeeId);
+                    const isLockedBySuperAdmin =
+                      !isSuperAdmin &&
+                      Boolean(
+                        record.superAdminOverride ||
+                          record.approvedByRole === 'Super Admin' ||
+                          record.reviewedByRole === 'Super Admin'
+                      );
                     
                     let dayName = record.dayName;
                     if (!dayName && record.date) {
@@ -792,14 +866,17 @@ export default function SBL() {
                           selectedIds.includes(record.id) && "bg-primary/5 dark:bg-primary/10"
                         )}
                       >
-                        <td className="px-3 py-3 text-center">
-                          <input 
-                            type="checkbox"
-                            checked={selectedIds.includes(record.id)}
-                            onChange={() => handleSelect(record.id)}
-                            className="rounded border-slate-300 text-primary focus:ring-primary"
-                          />
-                        </td>
+                        {!isEmployeeOnly && (
+                          <td className="px-3 py-3 text-center">
+                            <input 
+                              type="checkbox"
+                              disabled={isLockedBySuperAdmin}
+                              checked={selectedIds.includes(record.id)}
+                              onChange={() => handleSelect(record.id)}
+                              className="rounded border-slate-300 text-primary focus:ring-primary disabled:opacity-40"
+                            />
+                          </td>
+                        )}
                         <td className="px-3 py-3">
                           <div>
                             <p className="font-bold text-slate-900 dark:text-white leading-none">{emp?.name || 'Unknown'}</p>
@@ -849,75 +926,123 @@ export default function SBL() {
                           </span>
                         </td>
                         <td className="px-3 py-3">
-                          <Badge 
-                            variant={
-                              record.status === 'Final Confirmed' ? 'info' :
-                              record.status === 'Approved' ? 'success' :
-                              record.status === 'Rejected' ? 'danger' :
-                              record.status === 'Not Approved' ? 'outline' : 'warning'
-                            }
-                            className="uppercase text-[9px] font-bold"
-                          >
-                            {record.status}
-                          </Badge>
+                          <div className="flex flex-col gap-0.5 items-start">
+                            <Badge 
+                              variant={
+                                record.status === 'Final Confirmed' ? 'info' :
+                                record.status === 'Approved' ? 'success' :
+                                record.status === 'Rejected' ? 'danger' :
+                                record.status === 'Not Approved' ? 'outline' : 'warning'
+                              }
+                              className="uppercase text-[9px] font-bold"
+                            >
+                              {record.status}
+                            </Badge>
+                            {(record.approvedBy || record.reviewedBy) && record.status !== 'Pending' && (
+                              <span className="text-[9px] text-slate-500 dark:text-slate-400 font-medium">
+                                By {record.reviewedBy || record.approvedBy}{(record.reviewedByRole || record.approvedByRole) ? ` (${record.reviewedByRole || record.approvedByRole})` : ''}
+                              </span>
+                            )}
+                            {record.superAdminOverride && (
+                              <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                                Super Admin Override
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="px-3 py-3 text-right">
-                          <div className="flex items-center justify-end gap-1 opacity-90 group-hover:opacity-100 transition-opacity">
-                            {record.status === 'Pending' && (
+                          <div className="flex items-center justify-end gap-1 opacity-90 group-hover:opacity-100 transition-opacity flex-wrap">
+                            {isEmployeeOnly ? (
+                              <span className="text-[10px] font-semibold text-slate-400">
+                                {record.status === 'Pending' ? 'Awaiting Review' : 'Finalized'}
+                              </span>
+                            ) : isLockedBySuperAdmin ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                                Locked by Super Admin
+                              </span>
+                            ) : (
                               <>
-                                <button 
-                                  onClick={() => handleStatusChange(record.id, 'Approved')}
-                                  className="flex items-center gap-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md text-[10px] font-bold shadow-sm transition-all"
-                                  title="Approve PWO -> Converts & Credits to SBL Section"
-                                >
-                                  <ShieldCheck size={14} />
-                                  Approve to SBL
-                                </button>
-                                <button 
-                                  onClick={() => handleStatusChange(record.id, 'Rejected')}
-                                  className="p-1 text-danger hover:bg-danger/10 rounded-lg transition-colors"
-                                  title="Reject"
-                                >
-                                  <ShieldAlert size={16} />
-                                </button>
+                                {canApproveLeave && record.status === 'Pending' && (
+                                  <>
+                                    <button 
+                                      onClick={() => handleStatusChange(record.id, 'Approved')}
+                                      className="flex items-center gap-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md text-[10px] font-bold shadow-sm transition-all"
+                                      title={record.leaveType === 'PWO' ? "Approve PWO -> Converts & Credits to SBL Section" : "Approve Request"}
+                                    >
+                                      <ShieldCheck size={14} />
+                                      {record.leaveType === 'PWO' ? 'Approve to SBL' : 'Approve'}
+                                    </button>
+                                    <button 
+                                      onClick={() => handleStatusChange(record.id, 'Rejected')}
+                                      className="p-1 text-danger hover:bg-danger/10 rounded-lg transition-colors"
+                                      title="Reject"
+                                    >
+                                      <ShieldAlert size={16} />
+                                    </button>
+                                  </>
+                                )}
+                                {(record.status === 'Approved' || record.status === 'Final Confirmed') && (
+                                  <div className="flex items-center gap-1">
+                                    <span className="text-[10px] text-emerald-700 dark:text-emerald-400 font-bold flex items-center gap-1 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 rounded">
+                                      <Check size={12} />
+                                      {record.leaveType === 'SBL' || record.leaveType === 'PWO' ? 'SBL Credited' : 'Approved'}
+                                    </span>
+                                    {canApproveLeave && record.status === 'Approved' && (
+                                      <Button 
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => handleStatusChange(record.id, 'Final Confirmed')}
+                                        className="h-6 text-[9px] uppercase px-2"
+                                      >
+                                        Confirm
+                                      </Button>
+                                    )}
+                                  </div>
+                                )}
+                                {isSuperAdmin && record.status !== 'Pending' && (
+                                  <>
+                                    {record.status !== 'Approved' && record.status !== 'Final Confirmed' && (
+                                      <button
+                                        onClick={() => handleStatusChange(record.id, 'Approved')}
+                                        className="px-2 py-1 text-[10px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-md transition-all"
+                                        title="Super Admin Override → Approve"
+                                      >
+                                        Override Approve
+                                      </button>
+                                    )}
+                                    {record.status !== 'Rejected' && (
+                                      <button
+                                        onClick={() => handleStatusChange(record.id, 'Rejected')}
+                                        className="px-2 py-1 text-[10px] font-bold bg-rose-600 hover:bg-rose-700 text-white rounded-md transition-all"
+                                        title="Super Admin Override → Reject"
+                                      >
+                                        Override Reject
+                                      </button>
+                                    )}
+                                  </>
+                                )}
+                                {canApproveLeave && (
+                                  <button 
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      const emp = empMap.get(record.employeeId);
+                                      setDeleteConfirmModal({
+                                        isOpen: true,
+                                        isBulk: false,
+                                        recordId: record.id,
+                                        recordName: `${emp?.name || record.employeeId} (${record.date})`
+                                      });
+                                    }}
+                                    className="p-1 text-slate-400 hover:text-danger hover:bg-danger/10 rounded-lg transition-colors ml-1"
+                                    title="Delete Record"
+                                  >
+                                    <Trash2 size={16} />
+                                  </button>
+                                )}
                               </>
                             )}
-                            {(record.status === 'Approved' || record.status === 'Final Confirmed') && (
-                              <div className="flex items-center gap-1">
-                                <span className="text-[10px] text-emerald-700 dark:text-emerald-400 font-bold flex items-center gap-1 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 px-2 py-0.5 rounded">
-                                  <Check size={12} />
-                                  SBL Credited
-                                </span>
-                                {record.status === 'Approved' && (
-                                  <Button 
-                                    size="sm"
-                                    variant="outline"
-                                    onClick={() => handleStatusChange(record.id, 'Final Confirmed')}
-                                    className="h-6 text-[9px] uppercase px-2"
-                                  >
-                                    Confirm
-                                  </Button>
-                                )}
-                              </div>
-                            )}
-                            <button 
-                              type="button"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                const emp = empMap.get(record.employeeId);
-                                setDeleteConfirmModal({
-                                  isOpen: true,
-                                  isBulk: false,
-                                  recordId: record.id,
-                                  recordName: `${emp?.name || record.employeeId} (${record.date})`
-                                });
-                              }}
-                              className="p-1 text-slate-400 hover:text-danger hover:bg-danger/10 rounded-lg transition-colors ml-1"
-                              title="Delete Record"
-                            >
-                              <Trash2 size={16} />
-                            </button>
                           </div>
                         </td>
                       </tr>
@@ -926,7 +1051,7 @@ export default function SBL() {
 
                   {paginatedRecords.length === 0 && (
                     <tr>
-                      <td colSpan={8} className="px-4 py-8 text-center text-slate-400 text-xs">
+                      <td colSpan={isEmployeeOnly ? 7 : 8} className="px-4 py-8 text-center text-slate-400 text-xs">
                         No records found for the selected view.
                       </td>
                     </tr>
@@ -1125,8 +1250,10 @@ export default function SBL() {
             >
               <div className="bg-slate-900 p-6 text-white flex items-center justify-between">
                 <div>
-                  <h3 className="text-xl font-bold">New SBL / PWO Entry</h3>
-                  <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest mt-1">Substitute Leave / PWO Credit</p>
+                  <h3 className="text-xl font-bold">{isEmployeeOnly ? 'Apply Leave / Substitute Leave' : 'New Leave / SBL Entry'}</h3>
+                  <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest mt-1">
+                    {isEmployeeOnly ? 'Self-Service Request (Pending Approval)' : 'Leave, Substitute Leave (SBL) & PWO Credit'}
+                  </p>
                 </div>
                 <button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-white transition-colors">
                   <X size={24} />
@@ -1139,21 +1266,24 @@ export default function SBL() {
                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Employee</label>
                     <select 
                       required
-                      value={formData.employeeId}
+                      disabled={isEmployeeOnly}
+                      value={isEmployeeOnly ? linkedEmployeeId : formData.employeeId}
                       onChange={e => setFormData({ ...formData, employeeId: e.target.value })}
-                      className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                      className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-75"
                     >
-                      <option value="">Staff Select...</option>
-                      {employees.map(emp => (
-                        <option key={emp.id} value={emp.id}>
-                          {emp.name} ({emp.id}) {emp.otEligible === false ? '- [Non-OT]' : ''}
-                        </option>
-                      ))}
+                      {!isEmployeeOnly && <option value="">Staff Select...</option>}
+                      {employees
+                        .filter(emp => !isEmployeeOnly || emp.id === linkedEmployeeId)
+                        .map(emp => (
+                          <option key={emp.id} value={emp.id}>
+                            {emp.name} ({emp.id}) {emp.otEligible === false ? '- [Non-OT]' : ''}
+                          </option>
+                        ))}
                     </select>
                   </div>
 
                   <div className="space-y-2 col-span-2 sm:col-span-1">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Credited Date</label>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Leave / Credit Date</label>
                     <Input 
                       type="date"
                       required
@@ -1163,12 +1293,16 @@ export default function SBL() {
                   </div>
 
                   <div className="space-y-2 col-span-2 sm:col-span-1">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Type</label>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Leave Type</label>
                     <select 
                       value={formData.leaveType}
                       onChange={e => setFormData({ ...formData, leaveType: e.target.value as any })}
                       className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
                     >
+                      <option value="Casual Leave">Casual Leave</option>
+                      <option value="Sick Leave">Sick Leave</option>
+                      <option value="Annual Leave">Annual Leave</option>
+                      <option value="Unpaid Leave">Unpaid Leave</option>
                       <option value="SBL">SBL (Substitute Leave)</option>
                       <option value="PWO">PWO (Present Worked Offday)</option>
                       <option value="Comp Leave">Compensatory Leave</option>
@@ -1198,13 +1332,13 @@ export default function SBL() {
                     value={formData.reason}
                     onChange={e => setFormData({ ...formData, reason: e.target.value })}
                     className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 min-h-[80px] dark:text-white"
-                    placeholder="E.g. Worked on Public Holiday / Weekly Off (SBL Credit)..."
+                    placeholder={isEmployeeOnly ? "State reason for Leave or Substitute Leave request..." : "E.g. Casual Leave / Worked on Public Holiday (SBL Credit)..."}
                   />
                 </div>
 
                 <Button type="submit" className="w-full h-12 uppercase tracking-widest text-[11px] font-bold">
                   <Save size={18} className="mr-2" />
-                  Register SBL / PWO Entry
+                  {isEmployeeOnly ? 'Submit Leave / SBL Request' : 'Register Leave / SBL Entry'}
                 </Button>
               </form>
             </motion.div>

@@ -221,11 +221,15 @@ export function DepartmentInsights() {
   };
 
   const handleShowPopup = (deptName: string, status: 'Present' | 'Absent' | 'Total' | 'WO' | string) => {
+    const isAllDepts = deptName === 'All';
     const isShift = shiftColumns.includes(status);
-    
-    const deptEmployees = employees.filter(e => e.department === deptName && e.status === 'Active');
-    const deptPData = distributionData.filter(d => {
-      const emp = employees.find(e => e.id === d.employeeId);
+
+    const deptEmployees = employees.filter(
+      (e) => e.status === 'Active' && (isAllDepts ? (selectedDept === 'All' || e.department === selectedDept) : e.department === deptName)
+    );
+    const deptPData = distributionData.filter((d) => {
+      if (isAllDepts) return true;
+      const emp = employees.find((e) => e.id === d.employeeId);
       return emp?.department === deptName;
     });
 
@@ -234,28 +238,30 @@ export function DepartmentInsights() {
       filtered = deptEmployees;
     } else if (isShift) {
       const presentIds = new Set<string>();
-      deptPData.forEach(d => {
+      deptPData.forEach((d) => {
         const isPresent = ['Present', 'Late', 'SPF', 'On Time', 'Early', 'PWO', 'PPH'].includes(d.status);
         if (!isPresent) return;
 
-        const emp = employees.find(e => e.id === d.employeeId);
+        const emp = employees.find((e) => e.id === d.employeeId);
         const recordShift = getRecordShift(d, emp);
         const sName = recordShift.name;
 
-        const matches = sName === status || 
-          sName.toLowerCase().includes(status.toLowerCase()) || 
-          status.toLowerCase().includes(sName.toLowerCase());
+        const matchesExact = sName === status;
+        const matchedCol = shiftColumns.find(
+          (col) => sName.toLowerCase().includes(col.toLowerCase()) || col.toLowerCase().includes(sName.toLowerCase())
+        );
+        const fallbackCol = !matchedCol && shiftColumns.length > 0 ? shiftColumns[0] : undefined;
 
-        if (matches) {
+        if (matchesExact || matchedCol === status || fallbackCol === status) {
           presentIds.add(d.employeeId);
         }
       });
 
-      filtered = deptEmployees.filter(e => presentIds.has(e.id));
+      filtered = deptEmployees.filter((e) => presentIds.has(e.id));
 
-      if (filtered.length === 0) {
-        filtered = deptEmployees.filter(e => {
-          const sObj = settings.shifts?.find(s => s.id === e.shiftId);
+      if (!isAllDepts && filtered.length === 0) {
+        filtered = deptEmployees.filter((e) => {
+          const sObj = settings.shifts?.find((s) => s.id === e.shiftId);
           const sName = sObj?.name || 'Day Shift';
           return sName === status || sName.toLowerCase().includes(status.toLowerCase()) || status.toLowerCase().includes(sName.toLowerCase());
         });
@@ -263,25 +269,31 @@ export function DepartmentInsights() {
     } else {
       const statusLower = status.toLowerCase();
       if (statusLower === 'present') {
-        const presentIds = new Set(deptPData.filter(d => ['present', 'late', 'spf', 'on time', 'early', 'pwo'].includes(d.status.toLowerCase())).map(d => d.employeeId));
-        filtered = deptEmployees.filter(e => presentIds.has(e.id));
+        const presentIds = new Set(
+          deptPData
+            .filter((d) => ['present', 'late', 'spf', 'on time', 'early', 'pwo', 'pph'].includes(d.status.toLowerCase()))
+            .map((d) => d.employeeId)
+        );
+        filtered = deptEmployees.filter((e) => presentIds.has(e.id));
       } else if (statusLower === 'absent') {
-        const absentIds = new Set(deptPData.filter(d => d.status.toLowerCase() === 'absent').map(d => d.employeeId));
-        filtered = deptEmployees.filter(e => absentIds.has(e.id));
+        const absentIds = new Set(deptPData.filter((d) => d.status.toLowerCase() === 'absent').map((d) => d.employeeId));
+        filtered = deptEmployees.filter((e) => absentIds.has(e.id));
       } else if (statusLower === 'wo') {
-        const woIds = new Set(deptPData.filter(d => d.status.toLowerCase() === 'weekly off').map(d => d.employeeId));
-        filtered = deptEmployees.filter(e => woIds.has(e.id));
+        const woIds = new Set(deptPData.filter((d) => d.status.toLowerCase() === 'weekly off').map((d) => d.employeeId));
+        filtered = deptEmployees.filter((e) => woIds.has(e.id));
       } else if (statusLower === 'pwo') {
-        const pwoIds = new Set(deptPData.filter(d => d.status.toLowerCase() === 'pwo').map(d => d.employeeId));
-        filtered = deptEmployees.filter(e => pwoIds.has(e.id));
+        const pwoIds = new Set(deptPData.filter((d) => d.status.toLowerCase() === 'pwo').map((d) => d.employeeId));
+        filtered = deptEmployees.filter((e) => pwoIds.has(e.id));
       } else if (statusLower === 'late') {
-        const lateIds = new Set(deptPData.filter(d => d.lateMinutes > 0).map(d => d.employeeId));
-        filtered = deptEmployees.filter(e => lateIds.has(e.id));
+        const lateIds = new Set(deptPData.filter((d) => d.lateMinutes > 0).map((d) => d.employeeId));
+        filtered = deptEmployees.filter((e) => lateIds.has(e.id));
       }
     }
 
-    setPopupTitle(`${status} Employees - ${deptName}`);
-    setPopupStatus(status);
+    const scopeLabel = isAllDepts ? (selectedDept === 'All' ? 'All Departments' : selectedDept) : deptName;
+    const displayStatus = status === 'Total' ? 'Active' : status;
+    setPopupTitle(`${displayStatus} Employees - ${scopeLabel}`);
+    setPopupStatus(displayStatus);
     setPopupEmployees(filtered);
     setIsPopupOpen(true);
   };
@@ -754,18 +766,73 @@ export function DepartmentInsights() {
                       </tr>
                     ))}
                   </tbody>
-                  <tfoot className="bg-slate-100/80 font-black border-t-2 border-slate-200">
+                  <tfoot className="bg-slate-100/80 font-bold border-t-2 border-slate-200">
                     <tr>
-                      <td className="px-4 py-3.5 text-xs text-slate-900 uppercase">Total Subtotal</td>
-                      <td className="px-4 py-3.5 text-center text-slate-900 text-xs">{deptStats.reduce((acc, d) => acc + d.active, 0)}</td>
-                      <td className="px-4 py-3.5 text-center text-emerald-600 text-xs">{deptStats.reduce((acc, d) => acc + d.present, 0)}</td>
-                      <td className="px-4 py-3.5 text-center text-indigo-600 text-xs">{deptStats.reduce((acc, d) => acc + d.late, 0)}</td>
-                      <td className="px-4 py-3.5 text-center text-rose-600 text-xs">{deptStats.reduce((acc, d) => acc + d.absent, 0)}</td>
-                      <td className="px-4 py-3.5 text-center text-amber-600 text-xs">{deptStats.reduce((acc, d) => acc + d.wo, 0)}</td>
-                      <td className="px-4 py-3.5 text-center text-indigo-600 text-xs">{deptStats.reduce((acc, d) => acc + d.pwo, 0)}</td>
+                      <td className="px-4 py-3.5 text-xs font-black text-slate-900 uppercase">Total Subtotal</td>
+                      <td
+                        onClick={() => handleShowPopup('All', 'Total')}
+                        title="Click to view all active employees"
+                        className="px-4 py-3.5 text-center font-black text-slate-900 text-xs cursor-pointer hover:bg-slate-200/70 transition-colors"
+                      >
+                        <span className="underline decoration-dotted underline-offset-4 hover:text-indigo-700">
+                          {deptStats.reduce((acc, d) => acc + d.active, 0)}
+                        </span>
+                      </td>
+                      <td
+                        onClick={() => handleShowPopup('All', 'Present')}
+                        title="Click to view present employees"
+                        className="px-4 py-3.5 text-center font-black text-emerald-700 text-xs cursor-pointer hover:bg-emerald-50 transition-colors"
+                      >
+                        <span className="px-2.5 py-1 bg-emerald-100/80 hover:bg-emerald-200 rounded-full font-black underline decoration-dotted underline-offset-2">
+                          {deptStats.reduce((acc, d) => acc + d.present, 0)}
+                        </span>
+                      </td>
+                      <td
+                        onClick={() => handleShowPopup('All', 'Late')}
+                        title="Click to view late employees"
+                        className="px-4 py-3.5 text-center font-black text-indigo-700 text-xs cursor-pointer hover:bg-indigo-50 transition-colors"
+                      >
+                        <span className="px-2.5 py-1 bg-indigo-100/80 hover:bg-indigo-200 rounded-full font-black underline decoration-dotted underline-offset-2">
+                          {deptStats.reduce((acc, d) => acc + d.late, 0)}
+                        </span>
+                      </td>
+                      <td
+                        onClick={() => handleShowPopup('All', 'Absent')}
+                        title="Click to view absent employees"
+                        className="px-4 py-3.5 text-center font-black text-rose-700 text-xs cursor-pointer hover:bg-rose-50 transition-colors"
+                      >
+                        <span className="px-2.5 py-1 bg-rose-100/80 hover:bg-rose-200 rounded-full font-black underline decoration-dotted underline-offset-2">
+                          {deptStats.reduce((acc, d) => acc + d.absent, 0)}
+                        </span>
+                      </td>
+                      <td
+                        onClick={() => handleShowPopup('All', 'WO')}
+                        title="Click to view weekly off employees"
+                        className="px-4 py-3.5 text-center font-black text-amber-700 text-xs cursor-pointer hover:bg-amber-50 transition-colors"
+                      >
+                        <span className="px-2.5 py-1 bg-amber-100/80 hover:bg-amber-200 rounded-full font-black underline decoration-dotted underline-offset-2">
+                          {deptStats.reduce((acc, d) => acc + d.wo, 0)}
+                        </span>
+                      </td>
+                      <td
+                        onClick={() => handleShowPopup('All', 'PWO')}
+                        title="Click to view PWO employees"
+                        className="px-4 py-3.5 text-center font-black text-indigo-700 text-xs cursor-pointer hover:bg-indigo-50 transition-colors"
+                      >
+                        <span className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full font-black underline decoration-dotted underline-offset-2">
+                          {deptStats.reduce((acc, d) => acc + d.pwo, 0)}
+                        </span>
+                      </td>
                       {shiftColumns.map(s => (
-                        <td key={s} className="px-4 py-3.5 text-center text-indigo-600 text-xs">
-                          {deptStats.reduce((acc, d) => acc + (d.shiftCounts[s] || 0), 0)}
+                        <td
+                          key={s}
+                          onClick={() => handleShowPopup('All', s)}
+                          title={`Click to view ${s} employees`}
+                          className="px-4 py-3.5 text-center font-black text-indigo-700 text-xs cursor-pointer hover:bg-indigo-50 transition-colors"
+                        >
+                          <span className="underline decoration-dotted underline-offset-4 hover:text-indigo-900">
+                            {deptStats.reduce((acc, d) => acc + (d.shiftCounts[s] || 0), 0)}
+                          </span>
                         </td>
                       ))}
                       <td></td>

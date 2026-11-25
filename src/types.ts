@@ -350,11 +350,14 @@ export interface RawPunch {
   deviceName?: string;
   deviceIP?: string;
   deviceUserId?: string;
+  inOutMode?: number;
+  direction?: 'AUTO' | 'IN' | 'OUT';
   syncTime?: string;
   transactionId?: string;
 }
 
 export type ZkProtocolMode = 'Auto' | 'TCP' | 'UDP' | 'ADMS' | 'Web-HTTP' | 'USB-Disk';
+export type ZkReaderDirection = 'AUTO' | 'IN' | 'OUT';
 
 export interface ZkDevice {
   id: string;
@@ -368,11 +371,17 @@ export interface ZkDevice {
   enabled: boolean;
   status: 'online' | 'offline';
   protocolMode?: ZkProtocolMode;
+  direction?: ZkReaderDirection;
   commKey?: number;
   lastProtocolUsed?: string;
   lastConnection?: string;
   lastSync?: string;
   lastSuccessfulSync?: string;
+  lastFullReadAt?: string;
+  lastPollAttemptAt?: string;
+  lastDeviceLogCount?: number;
+  lastReadRecords?: number;
+  lastNewRecords?: number;
   lastLatencyMs?: number;
   lastProbeAt?: string;
   userCount?: number;
@@ -646,9 +655,18 @@ export interface OvertimeRecord {
   status: 'Pending' | 'Approved' | 'Rejected';
   auditStatus?: 'PASS' | 'WARNING' | 'MISMATCH' | 'ERROR';
   auditReason?: string;
+  requestedBy?: string;
+  requestedByRole?: SystemRole | string;
   approvedBy?: string;
+  approvedByRole?: string;
   reviewedBy?: string;
+  reviewedByRole?: string;
   reviewedDate?: string;
+  superAdminOverride?: boolean;
+  overriddenBy?: string;
+  overriddenAt?: string;
+  previousStatus?: string;
+  previousApprover?: string;
   remarks: string;
   shiftId?: string;
   otBasis?: 'basic' | 'gross';
@@ -660,11 +678,31 @@ export interface SBLRecord {
   id: string;
   employeeId: string;
   date: string;
-  leaveType: 'SBL' | 'Short Break' | 'PWO' | 'Comp Leave';
+  leaveType:
+    | 'SBL'
+    | 'Short Break'
+    | 'PWO'
+    | 'Comp Leave'
+    | 'Casual Leave'
+    | 'Sick Leave'
+    | 'Annual Leave'
+    | 'Unpaid Leave'
+    | 'Leave';
   duration: string; // e.g., "Full Day" | "Half Day" | "2 hours"
   reason: string;
   status: 'Pending' | 'Approved' | 'Rejected' | 'Final Confirmed' | 'Not Approved';
+  requestedBy?: string;
+  requestedByRole?: SystemRole | string;
   approvedBy?: string;
+  approvedByRole?: string;
+  approvedAt?: string;
+  reviewedBy?: string;
+  reviewedByRole?: string;
+  superAdminOverride?: boolean;
+  overriddenBy?: string;
+  overriddenAt?: string;
+  previousStatus?: string;
+  previousApprover?: string;
   workingHours?: number;
   source?: string;
   inTime?: string;
@@ -677,12 +715,53 @@ export interface ForceAttendanceRecord {
   id: string;
   employeeId: string;
   date: string;
-  status?: string;
+  status?: 'Pending' | 'Approved' | 'Rejected' | string;
   inTime: string; // HH:mm
   outTime: string; // HH:mm
   reason: string;
+  requestedBy?: string;
+  requestedByRole?: SystemRole | string;
   approvedBy: string;
+  approvedByRole?: string;
+  approvedAt?: string;
+  reviewedBy?: string;
+  reviewedByRole?: string;
+  superAdminOverride?: boolean;
+  overriddenBy?: string;
+  overriddenAt?: string;
+  previousStatus?: string;
+  previousApprover?: string;
   remarks: string;
+  timestamp: string;
+}
+
+export interface ApprovalAuditRecord {
+  id: string;
+  module:
+    | 'Overtime'
+    | 'Leave & SBL'
+    | 'Attendance Request'
+    | 'Payroll'
+    | 'Document Request'
+    | 'Attendance Audit'
+    | string;
+  table?: string;
+  recordId: string;
+  employeeId: string;
+  employeeName?: string;
+  department?: string;
+  targetDate?: string;
+  previousStatus: string;
+  newStatus: string;
+  previousApprover?: string;
+  previousApproverRole?: string;
+  approvedBy: string;
+  approvedByName?: string;
+  approvedByRole: string;
+  isOverride: boolean;
+  actionSummary?: string;
+  remarks?: string;
+  bsDate?: string;
   timestamp: string;
 }
 

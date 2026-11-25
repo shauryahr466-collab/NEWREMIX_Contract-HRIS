@@ -46,6 +46,10 @@ interface OTCrossCheckPanelProps {
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
   onClose: () => void;
+  isSuperAdmin?: boolean;
+  canApproveOt?: boolean;
+  canEditOt?: boolean;
+  isEmployeeOnly?: boolean;
 }
 
 export const OTCrossCheckPanel: React.FC<OTCrossCheckPanelProps> = ({
@@ -56,9 +60,20 @@ export const OTCrossCheckPanel: React.FC<OTCrossCheckPanelProps> = ({
   onEdit,
   onApprove,
   onReject,
-  onClose
+  onClose,
+  isSuperAdmin = false,
+  canApproveOt = true,
+  canEditOt = true,
+  isEmployeeOnly = false
 }) => {
   if (!selectedRecord || !audit) return null;
+  const lockedBySuperAdmin =
+    !isSuperAdmin &&
+    Boolean(
+      selectedRecord.superAdminOverride ||
+        selectedRecord.approvedByRole === 'Super Admin' ||
+        selectedRecord.reviewedByRole === 'Super Admin'
+    );
 
   const formatDateSafely = (dateStr?: string) => {
     if (!dateStr) return '-';
@@ -241,24 +256,65 @@ export const OTCrossCheckPanel: React.FC<OTCrossCheckPanelProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => onEdit(selectedRecord)}
-              className="text-xs font-bold px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-100 text-slate-800 dark:text-slate-200 transition shadow-xs flex items-center gap-1.5"
-            >
-              <Edit2 size={13} />
-              Adjust Supervisor OT
-            </button>
-            {selectedRecord.status === 'Pending' && (
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
+            {!isEmployeeOnly && canEditOt && !lockedBySuperAdmin && (
               <button
                 type="button"
-                onClick={() => onApprove(selectedRecord.id)}
-                className="text-xs font-bold px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition shadow-xs flex items-center gap-1.5"
+                onClick={() => onEdit(selectedRecord)}
+                className="text-xs font-bold px-3 py-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg hover:bg-slate-100 text-slate-800 dark:text-slate-200 transition shadow-xs flex items-center gap-1.5"
               >
-                <CheckCircle size={13} />
-                Approve Settlement
+                <Edit2 size={13} />
+                Adjust Supervisor OT
               </button>
+            )}
+            {lockedBySuperAdmin && (
+              <span className="text-[11px] font-bold px-2.5 py-1 rounded-lg bg-indigo-100 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800">
+                Locked by Super Admin
+              </span>
+            )}
+            {!isEmployeeOnly && canApproveOt && !lockedBySuperAdmin && selectedRecord.status === 'Pending' && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onApprove(selectedRecord.id)}
+                  className="text-xs font-bold px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition shadow-xs flex items-center gap-1.5"
+                >
+                  <CheckCircle size={13} />
+                  Approve Settlement
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onReject(selectedRecord.id)}
+                  className="text-xs font-bold px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg transition shadow-xs flex items-center gap-1.5"
+                >
+                  <XCircle size={13} />
+                  Reject
+                </button>
+              </>
+            )}
+            {isSuperAdmin && selectedRecord.status !== 'Pending' && (
+              <>
+                {selectedRecord.status !== 'Approved' && (
+                  <button
+                    type="button"
+                    onClick={() => onApprove(selectedRecord.id)}
+                    className="text-xs font-bold px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition shadow-xs flex items-center gap-1.5"
+                  >
+                    <CheckCircle size={13} />
+                    Override → Approve
+                  </button>
+                )}
+                {selectedRecord.status !== 'Rejected' && (
+                  <button
+                    type="button"
+                    onClick={() => onReject(selectedRecord.id)}
+                    className="text-xs font-bold px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg transition shadow-xs flex items-center gap-1.5"
+                  >
+                    <XCircle size={13} />
+                    Override → Reject
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>

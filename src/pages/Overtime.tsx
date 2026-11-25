@@ -20,10 +20,12 @@ export default function Overtime() {
   const { 
     overtimeRecords, employees, processedData, settings, punches, setSettings,
     updateOvertime, addOvertime, deleteOvertime, setOvertimeBatch, deleteOvertimeBatch, user, openEmployeeProfile, globalSearchTerm,
-    effectiveUserProfile
+    effectiveUserProfile, isSuperAdmin
   } = useAppStore();
-  const canApproveOt = !effectiveUserProfile || effectiveUserProfile.role === 'Super Admin' || Boolean(effectiveUserProfile.permissions?.canApproveOt);
-  const canSubmitOt = !effectiveUserProfile || effectiveUserProfile.role === 'Super Admin' || Boolean(effectiveUserProfile.permissions?.canSubmitSupervisorOt);
+  const isEmployeeOnly = effectiveUserProfile?.role === 'Employee';
+  const linkedEmployeeId = effectiveUserProfile?.linkedEmployeeId || '';
+  const canApproveOt = isSuperAdmin || (!isEmployeeOnly && Boolean(effectiveUserProfile?.permissions?.canApproveOt));
+  const canSubmitOt = isSuperAdmin || (!isEmployeeOnly && Boolean(effectiveUserProfile?.permissions?.canSubmitSupervisorOt));
   
   const [searchTerm, setSearchTerm] = useState('');
   const activeSearch = searchTerm || globalSearchTerm;
@@ -80,8 +82,8 @@ export default function Overtime() {
       setSelectedIds([]);
       setIsDeleteModalOpen(false);
       toast.success(`Successfully deleted ${count} record(s)`, { id: tId });
-    } catch (e) {
-      toast.error('Bulk delete failed', { id: tId });
+    } catch (e: any) {
+      toast.error(e?.message || 'Bulk delete failed', { id: tId });
     }
   };
 
@@ -308,10 +310,13 @@ export default function Overtime() {
       const rec = overtimeRecords.find(r => r.id === id);
       const emp = rec ? (empMap.get(normalizeEmployeeId(rec.employeeId)) || empMap.get(rec.employeeId)) : undefined;
       const otDetails = rec ? calculateOtDetails(emp, Number(rec.hours) || 0, Number(rec.standardDutyHours) || 8, rec.otBasis) : null;
+      const actorRole = isSuperAdmin ? 'Super Admin' : (effectiveUserProfile?.role || 'Supervisor');
+      const wasProcessed = rec && rec.status !== 'Pending';
 
       await updateOvertime(id, { 
         status, 
         reviewedBy: effectiveUserProfile?.username || user?.username || 'Admin',
+        reviewedByRole: actorRole,
         reviewedDate: new Date().toISOString(),
         ...(status === 'Approved' && otDetails ? {
           otBasis: otDetails.basis,
@@ -320,11 +325,11 @@ export default function Overtime() {
         } : {})
       });
       toast.success(status === 'Approved' && otDetails
-        ? `OT Approved: Rs. ${otDetails.otAmount.toLocaleString()} calculated pay (${otDetails.basis.toUpperCase()} basis, ${rec?.hours}h @ Rs.${otDetails.hourlyRate}/h) -> Linked to Payroll`
-        : `OT ${status.toLowerCase()} successfully`
+        ? `${wasProcessed && isSuperAdmin ? 'Super Admin Override → ' : ''}OT Approved: Rs. ${otDetails.otAmount.toLocaleString()} (${otDetails.basis.toUpperCase()} basis, ${rec?.hours}h @ Rs.${otDetails.hourlyRate}/h)`
+        : `${wasProcessed && isSuperAdmin ? 'Super Admin Override → ' : ''}OT ${status.toLowerCase()} successfully`
       );
-    } catch (e) {
-      toast.error('Operation failed');
+    } catch (e: any) {
+      toast.error(e?.message || 'Operation failed');
     }
   };
 
@@ -336,6 +341,8 @@ export default function Overtime() {
     if (selectedIds.length === 0) return;
     try {
       let totalAmount = 0;
+      const actorName = effectiveUserProfile?.username || user?.username || 'Admin';
+      const actorRole = isSuperAdmin ? 'Super Admin' : (effectiveUserProfile?.role || 'Supervisor');
       const updates = selectedIds.map(id => {
         const rec = overtimeRecords.find(r => r.id === id);
         const emp = rec ? (empMap.get(normalizeEmployeeId(rec.employeeId)) || empMap.get(rec.employeeId)) : undefined;
@@ -344,7 +351,8 @@ export default function Overtime() {
         return {
           id,
           status: 'Approved' as const,
-          reviewedBy: user?.username || 'Admin',
+          reviewedBy: actorName,
+          reviewedByRole: actorRole,
           reviewedDate: new Date().toISOString(),
           ...(otDetails ? {
             otBasis: otDetails.basis,
@@ -360,8 +368,8 @@ export default function Overtime() {
 
       toast.success(`Approved ${selectedIds.length} OT records (Total: Rs. ${totalAmount.toLocaleString()}) -> Linked to Payroll!`);
       setSelectedIds([]);
-    } catch (e) {
-      toast.error('Bulk approval failed');
+    } catch (e: any) {
+      toast.error(e?.message || 'Bulk approval failed');
     }
   };
 
@@ -396,45 +404,53 @@ export default function Overtime() {
 
       toast.success('Supervisor OT saved successfully');
       setIsEditModalOpen(false);
-    } catch (e) {
-      toast.error('Failed to save record');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to save record');
     }
   };
 
   const handleManualAdd = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.employeeId || !formData.date) return;
+    const targetEmpId = isEmployeeOnly ? linkedEmployeeId : formData.employeeId;
+    if (!targetEmpId || !formData.date) {
+      toast.error('Please select an employee and date.');
+      return;
+    }
 
     try {
-      const bioOt = 0; 
+      const emp = empMap.get(normalizeEmployeeId(targetEmpId)) || empMap.get(targetEmpId);
+      const attMatch = processedData.find(p => normalizeEmployeeId(p.employeeId) === normalizeEmployeeId(targetEmpId) && p.date === formData.date);
+      const stdDuty = Number(emp?.targetWorkingHours) || Number(attMatch?.expectedHours) || 8;
+      const bioOt = attMatch ? Math.max(0, Number(attMatch.workingHours || 0) - stdDuty) : 0;
       const supOt = Number(formData.supervisorOtHours) || 0;
-      const finalOt = supOt;
-      const hrSaving = 0;
-      const emp = empMap.get(normalizeEmployeeId(formData.employeeId)) || empMap.get(formData.employeeId);
-      const otDetails = calculateOtDetails(emp, finalOt, 8);
+      const finalOt = attMatch ? Math.min(bioOt, supOt) : supOt;
+      const hrSaving = attMatch ? Math.max(0, bioOt - finalOt) : 0;
+      const otDetails = calculateOtDetails(emp, finalOt, stdDuty);
 
       await addOvertime({
-        employeeId: formData.employeeId,
+        employeeId: targetEmpId,
         date: formData.date,
         type: formData.type,
         remarks: formData.remarks,
         otStartTime: formData.otStartTime,
         otEndTime: formData.otEndTime,
-        bioOtHours: bioOt,
+        bioOtHours: Number(bioOt.toFixed(2)),
         supervisorOtHours: supOt,
-        standardDutyHours: 8, 
-        hours: finalOt,
-        hrSaving: hrSaving,
+        standardDutyHours: stdDuty, 
+        hours: Number(finalOt.toFixed(2)),
+        hrSaving: Number(hrSaving.toFixed(2)),
         status: 'Pending',
-        shiftId: null,
+        requestedBy: effectiveUserProfile?.username || user?.username || targetEmpId,
+        requestedByRole: effectiveUserProfile?.role || 'Supervisor',
+        shiftId: attMatch?.shiftId || undefined,
         otBasis: otDetails.basis,
         otRate: otDetails.hourlyRate,
         otAmount: otDetails.otAmount
       });
-      toast.success('OT record added successfully');
+      toast.success(isEmployeeOnly ? 'OT request submitted for approval' : 'OT record added successfully');
       setIsModalOpen(false);
-    } catch (e) {
-      toast.error('Failed to add record');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to add record');
     }
   };
 
@@ -547,16 +563,16 @@ export default function Overtime() {
     try {
       await deleteOvertime(id);
       toast.success('Record deleted successfully');
-    } catch (e) {
-      toast.error('Failed to delete record');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to delete record');
     }
   };
 
   return (
     <div className="space-y-6">
       <PageHeader 
-        title="OT Audit Log" 
-        description="Biometric vs Supervisor Verification"
+        title={isEmployeeOnly ? "OT Request" : "OT Audit Log"} 
+        description={isEmployeeOnly ? "Apply for overtime and track HOD / Supervisor / Super Admin approval status" : "Biometric vs Supervisor Verification & Super Admin Override"}
         icon={Clock}
         actions={
           <div className="flex flex-wrap gap-2">
@@ -575,33 +591,56 @@ export default function Overtime() {
                 className="w-[140px] h-9 text-[11px] pl-9 px-2"
               />
             </div>
-            <Button variant="outline" onClick={handleSyncAttendance} disabled={isSyncing} className="gap-2">
-              <RefreshCw size={16} className={cn(isSyncing && "animate-spin")} />
-              {isSyncing ? 'Syncing...' : 'Sync'}
-            </Button>
-            {canSubmitOt && (
+            {isEmployeeOnly ? (
+              <Button
+                onClick={() => {
+                  setFormData({
+                    employeeId: linkedEmployeeId,
+                    date: format(new Date(), 'yyyy-MM-dd'),
+                    supervisorOtHours: 1,
+                    otStartTime: '',
+                    otEndTime: '',
+                    type: 'Regular',
+                    remarks: ''
+                  });
+                  setIsModalOpen(true);
+                }}
+                className="gap-2"
+              >
+                <Plus size={16} />
+                Apply for OT
+              </Button>
+            ) : (
               <>
-                <Button onClick={() => setIsModalOpen(true)} className="gap-2">
-                  <Plus size={16} />
-                  Manual Entry
+                <Button variant="outline" onClick={handleSyncAttendance} disabled={isSyncing} className="gap-2">
+                  <RefreshCw size={16} className={cn(isSyncing && "animate-spin")} />
+                  {isSyncing ? 'Syncing...' : 'Sync'}
                 </Button>
-                <Button 
-                  variant="outline" 
-                  onClick={() => generateSupervisorOTTemplate(employees)} 
-                  className="gap-2 border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
-                  title="Download official Excel template with instructions and sample rows"
-                >
-                  <FileSpreadsheet size={16} />
-                  Export Template
-                </Button>
-                <Button 
-                  onClick={() => setIsImportModalOpen(true)} 
-                  className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm"
-                  title="Import Supervisor OT and Remarks from Excel"
-                >
-                  <Upload size={16} />
-                  Import Supervisor OT & Remarks
-                </Button>
+                {canSubmitOt && (
+                  <>
+                    <Button onClick={() => setIsModalOpen(true)} className="gap-2">
+                      <Plus size={16} />
+                      Manual Entry
+                    </Button>
+                    <Button 
+                      variant="outline" 
+                      onClick={() => generateSupervisorOTTemplate(employees)} 
+                      className="gap-2 border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
+                      title="Download official Excel template with instructions and sample rows"
+                    >
+                      <FileSpreadsheet size={16} />
+                      Export Template
+                    </Button>
+                    <Button 
+                      onClick={() => setIsImportModalOpen(true)} 
+                      className="gap-2 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm"
+                      title="Import Supervisor OT and Remarks from Excel"
+                    >
+                      <Upload size={16} />
+                      Import Supervisor OT & Remarks
+                    </Button>
+                  </>
+                )}
               </>
             )}
             <Button variant="outline" onClick={handleExportCSV} className="gap-2">
@@ -628,7 +667,7 @@ export default function Overtime() {
         }
       />
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+      <div className={cn("grid grid-cols-1 sm:grid-cols-2 gap-4", isEmployeeOnly ? "lg:grid-cols-4" : "lg:grid-cols-5")}>
         <KPICard 
           label="Total Records" 
           value={stats.total} 
@@ -658,16 +697,19 @@ export default function Overtime() {
           trend="up"
           trendValue="Total Cumulative"
         />
-        <KPICard 
-          label="Approved OT Payout" 
-          value={`Rs. ${stats.totalApprovedPayout.toLocaleString()}`} 
-          icon={DollarSign} 
-          trend="up"
-          trendValue={`${otCalculationBasis === 'gross' ? 'Gross' : 'Basic'} Salary Basis`}
-        />
+        {!isEmployeeOnly && (
+          <KPICard 
+            label="Approved OT Payout" 
+            value={`Rs. ${stats.totalApprovedPayout.toLocaleString()}`} 
+            icon={DollarSign} 
+            trend="up"
+            trendValue={`${otCalculationBasis === 'gross' ? 'Gross' : 'Basic'} Salary Basis`}
+          />
+        )}
       </div>
 
-      {/* Interactive OT Calculation Wage Basis Switcher (Basic Salary vs Gross Salary) */}
+      {/* Interactive OT Calculation Wage Basis Switcher (Admin/Supervisor Only) */}
+      {!isEmployeeOnly && (
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-xs">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div className="space-y-1">
@@ -737,6 +779,7 @@ export default function Overtime() {
           </div>
         </div>
       </div>
+      )}
 
       <Card className="p-4">
         <div className="flex flex-wrap items-center gap-4 mb-6">
@@ -762,27 +805,31 @@ export default function Overtime() {
               <option value="Rejected">Rejected</option>
             </select>
 
-            <select 
-              value={designationFilter}
-              onChange={(e) => setDesignationFilter(e.target.value)}
-              className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
-            >
-              <option value="All">All Designations</option>
-              {designations.map(d => (
-                <option key={d} value={d}>{d}</option>
-              ))}
-            </select>
+            {!isEmployeeOnly && (
+              <>
+                <select 
+                  value={designationFilter}
+                  onChange={(e) => setDesignationFilter(e.target.value)}
+                  className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                >
+                  <option value="All">All Designations</option>
+                  {designations.map(d => (
+                    <option key={d} value={d}>{d}</option>
+                  ))}
+                </select>
 
-            <select 
-              value={contractorFilter}
-              onChange={(e) => setContractorFilter(e.target.value)}
-              className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
-            >
-              <option value="All">All Contractors</option>
-              {contractors.map(c => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
+                <select 
+                  value={contractorFilter}
+                  onChange={(e) => setContractorFilter(e.target.value)}
+                  className="px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                >
+                  <option value="All">All Contractors</option>
+                  {contractors.map(c => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              </>
+            )}
           </div>
         </div>
 
@@ -802,6 +849,10 @@ export default function Overtime() {
           selectedIds={selectedIds}
           onSelect={handleSelect}
           onSelectAll={setSelectedIds}
+          isSuperAdmin={isSuperAdmin}
+          canApproveOt={canApproveOt}
+          canEditOt={canSubmitOt || canApproveOt}
+          isEmployeeOnly={isEmployeeOnly}
         />
       </Card>
       
@@ -930,8 +981,10 @@ export default function Overtime() {
             >
               <div className="bg-slate-900 p-6 text-white flex items-center justify-between">
                 <div>
-                  <h3 className="text-xl font-bold">Add Manual OT</h3>
-                  <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest mt-1">Special Exception Entry</p>
+                  <h3 className="text-xl font-bold">{isEmployeeOnly ? 'Apply for Overtime (OT)' : 'Add Manual OT'}</h3>
+                  <p className="text-[11px] font-bold text-slate-400 uppercase tracking-widest mt-1">
+                    {isEmployeeOnly ? 'Self-Service OT Request (Pending Approval)' : 'Special Exception Entry'}
+                  </p>
                 </div>
                 <button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-white transition-colors">
                   <X size={24} />
@@ -943,14 +996,17 @@ export default function Overtime() {
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">Staff Member</label>
                   <select 
                     required
-                    value={formData.employeeId}
+                    disabled={isEmployeeOnly}
+                    value={isEmployeeOnly ? linkedEmployeeId : formData.employeeId}
                     onChange={e => setFormData({ ...formData, employeeId: e.target.value })}
-                    className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20"
+                    className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-75"
                   >
-                    <option value="">Choose Staff...</option>
-                    {employees.map(emp => (
-                      <option key={emp.id} value={emp.id}>{emp.name} ({emp.id})</option>
-                    ))}
+                    {!isEmployeeOnly && <option value="">Choose Staff...</option>}
+                    {employees
+                      .filter(emp => !isEmployeeOnly || emp.id === linkedEmployeeId)
+                      .map(emp => (
+                        <option key={emp.id} value={emp.id}>{emp.name} ({emp.id})</option>
+                      ))}
                   </select>
                 </div>
 
@@ -969,6 +1025,7 @@ export default function Overtime() {
                     <Input 
                       type="number"
                       step="0.5"
+                      min="0.5"
                       required
                       value={formData.supervisorOtHours}
                       onChange={e => setFormData({ ...formData, supervisorOtHours: parseFloat(e.target.value) })}
@@ -982,13 +1039,13 @@ export default function Overtime() {
                     value={formData.remarks}
                     onChange={e => setFormData({ ...formData, remarks: e.target.value })}
                     className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 min-h-[100px] dark:text-white"
-                    placeholder="Reason for manual entry..."
+                    placeholder={isEmployeeOnly ? "Task / reason for overtime request..." : "Reason for manual entry..."}
                   />
                 </div>
 
                 <Button type="submit" className="w-full h-12 uppercase tracking-widest text-[11px] font-bold">
                   <Save size={18} className="mr-2" />
-                  Save Manual OT
+                  {isEmployeeOnly ? 'Submit OT Request' : 'Save Manual OT'}
                 </Button>
               </form>
             </motion.div>

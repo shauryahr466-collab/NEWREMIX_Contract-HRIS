@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
-import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch, EmployeeMovement, SystemUser, ModuleKey } from '../types';
+import type { Employee, RawPunch, ProcessedAttendance, Settings, ShiftAssignment, AssignmentLog, AttendanceException, AuditLog, OvertimeRecord, SBLRecord, ForceAttendanceRecord, ApprovalAuditRecord, PayrollRun, PayrollRecord, DisbursementMethod, ZkDevice, ZkUserMapping, ZkSyncLog, ZkUnmappedPunch, EmployeeMovement, SystemUser, ModuleKey } from '../types';
 import type { FieldAttendanceRecord } from '../types/attendanceAudit';
 import { processPunches, detectExceptions } from '../lib/engine';
 import { generatePayrollRun, calculateTaxAndDeductions, DEFAULT_PAYROLL_CONFIG } from '../lib/payrollEngine';
@@ -22,6 +22,7 @@ interface StoreState {
   overtimeRecords: OvertimeRecord[];
   sblRecords: SBLRecord[];
   forceAttendanceRecords: ForceAttendanceRecord[];
+  approvalAudits: ApprovalAuditRecord[];
   payrollRuns: PayrollRun[];
   movements: EmployeeMovement[];
   zkDevices: ZkDevice[];
@@ -89,6 +90,10 @@ interface StoreState {
   deleteOvertime: (id: string) => Promise<void>;
   deleteSBL: (id: string) => Promise<void>;
   addForceAttendance: (data: Omit<ForceAttendanceRecord, 'id' | 'timestamp'>) => Promise<void>;
+  updateForceAttendance: (id: string, data: Partial<ForceAttendanceRecord>) => Promise<void>;
+  deleteForceAttendance: (id: string) => Promise<void>;
+  refreshApprovalAudits: () => Promise<ApprovalAuditRecord[]>;
+  refreshWorkflowTables: (tables?: string[]) => Promise<void>;
 
   // Payroll Actions
   createPayrollRun: (month: string, bsMonthDetails?: { bsYear: number; monthObj: any }, customDateRange?: { startDate?: string; endDate?: string }) => Promise<PayrollRun>;
@@ -141,8 +146,8 @@ interface StoreState {
   deleteZkDevice: (id: string) => Promise<void>;
   mapZkUser: (mapping: Omit<ZkUserMapping, 'id' | 'mappedAt'>) => Promise<void>;
   unmapZkUser: (id: string) => Promise<void>;
-  syncZkDevice: (deviceId: string) => Promise<{ success: boolean; recordsRead: number; newRecords: number; duplicates: number }>;
-  syncAllZkDevices: () => Promise<{ success: boolean; devicesPolled: number; totalNew: number; totalRead: number; reachableDevices: number }>;
+  syncZkDevice: (deviceId: string, fullRead?: boolean) => Promise<{ success: boolean; recordsRead: number; newRecords: number; duplicates: number }>;
+  syncAllZkDevices: (fullRead?: boolean) => Promise<{ success: boolean; devicesPolled: number; totalNew: number; totalRead: number; reachableDevices: number }>;
   reconcileSystemZkData: () => Promise<{ success: boolean; mappingsCreated: number; unmappedResolved: number; punchesAdded: number }>;
   resolveUnmappedPunches: (deviceUserId: string, employeeId: string) => Promise<void>;
   clearZkSyncLogs: () => Promise<void>;
@@ -233,6 +238,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [overtimeRecords, setOvertimeRecordsState] = useState<OvertimeRecord[]>(() => loadCache('overtime', []));
   const [sblRecords, setSblRecordsState] = useState<SBLRecord[]>(() => loadCache('sbl', []));
   const [forceAttendanceRecords, setForceAttendanceRecordsState] = useState<ForceAttendanceRecord[]>(() => loadCache('force_attendance', []));
+  const [approvalAudits, setApprovalAuditsState] = useState<ApprovalAuditRecord[]>(() => loadCache('approval_audits', []));
   const [payrollRuns, setPayrollRunsState] = useState<PayrollRun[]>(() => loadCache('payroll_runs', []));
   const [movements, setMovementsState] = useState<EmployeeMovement[]>(() => loadCache('movements', []));
   const [zkDevices, setZkDevicesState] = useState<ZkDevice[]>(() => loadCache('zk_devices', []));
@@ -392,8 +398,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const holidayMasterMap = buildHolidayMasterMap([], settings.holidays || []);
     const holidayPolicy = settings.holidayPunchPolicy || 'prevent_overlaps';
 
-    // Apply forced attendance records (Admin Reconciliation)
+    // Apply approved forced attendance records (skip Pending/Rejected requests)
     (forceAttendanceRecords || []).forEach(f => {
+      if (f.status === 'Pending' || f.status === 'Rejected') return;
       const key = `${f.employeeId}_${f.date}`;
       const existing = recordMap.get(key);
       const holidayRec = holidayMasterMap.get(String(f.date || '').trim().slice(0, 10));
@@ -629,6 +636,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           if (Array.isArray(t.force_attendance)) {
             setForceAttendanceRecordsState(t.force_attendance);
             saveCache('force_attendance', t.force_attendance);
+          }
+
+          if (Array.isArray(t.approval_audits)) {
+            setApprovalAuditsState(t.approval_audits);
+            saveCache('approval_audits', t.approval_audits);
           }
 
           if (Array.isArray(t.payroll_runs)) {
@@ -950,20 +962,85 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     await saveLocalTable('exceptions', data);
   }, []);
 
+  const refreshApprovalAudits = useCallback(async (): Promise<ApprovalAuditRecord[]> => {
+    if (!isSuperAdmin) return [];
+    try {
+      const fresh = await fetchLocalTable<ApprovalAuditRecord>('approval_audits');
+      const sorted = (Array.isArray(fresh) ? fresh : []).sort((a, b) =>
+        String(b.timestamp || '').localeCompare(String(a.timestamp || ''))
+      );
+      setApprovalAuditsState(sorted);
+      saveCache('approval_audits', sorted);
+      return sorted;
+    } catch {
+      return [];
+    }
+  }, [isSuperAdmin]);
+
+  const refreshWorkflowTables = useCallback(async (tables?: string[]) => {
+    const targetSet = new Set(tables && tables.length > 0 ? tables : ['overtime', 'sbl', 'force_attendance', 'approval_audits']);
+    try {
+      const jobs: Promise<void>[] = [];
+      if (targetSet.has('overtime')) {
+        jobs.push(
+          fetchLocalTable<OvertimeRecord>('overtime').then((rows) => {
+            const safe = Array.isArray(rows) ? rows : [];
+            setOvertimeRecordsState(safe);
+            saveCache('overtime', safe);
+          })
+        );
+      }
+      if (targetSet.has('sbl')) {
+        jobs.push(
+          fetchLocalTable<SBLRecord>('sbl').then((rows) => {
+            const safe = Array.isArray(rows) ? rows : [];
+            setSblRecordsState(safe);
+            saveCache('sbl', safe);
+          })
+        );
+      }
+      if (targetSet.has('force_attendance')) {
+        jobs.push(
+          fetchLocalTable<ForceAttendanceRecord>('force_attendance').then((rows) => {
+            const safe = Array.isArray(rows) ? rows : [];
+            setForceAttendanceRecordsState(safe);
+            saveCache('force_attendance', safe);
+          })
+        );
+      }
+      if (targetSet.has('approval_audits') && isSuperAdmin) {
+        jobs.push(refreshApprovalAudits().then(() => undefined));
+      }
+      await Promise.all(jobs);
+    } catch {
+      // ignore silent sync error
+    }
+  }, [isSuperAdmin, refreshApprovalAudits]);
+
   const updateOvertime = useCallback(async (id: string, data: Partial<OvertimeRecord>) => {
-    setOvertimeRecordsState(prev => {
-      const updated = prev.map(r => r.id === id ? { ...r, ...data } : r);
-      const target = updated.find(r => r.id === id);
-      if (target) saveLocalTable('overtime', [target]);
-      return updated;
-    });
-  }, []);
+    const existing = overtimeRecords.find(r => r.id === id);
+    if (!existing) return;
+    const target: OvertimeRecord = { ...existing, ...data };
+    const res = await saveLocalTableDetailed('overtime', [target]);
+    if (!res.success) {
+      await refreshWorkflowTables(['overtime']);
+      throw new Error(res.error || 'Failed to update overtime record');
+    }
+    await refreshWorkflowTables(['overtime', ...(isSuperAdmin ? ['approval_audits'] : [])]);
+  }, [overtimeRecords, refreshWorkflowTables, isSuperAdmin]);
 
   const addOvertime = useCallback(async (data: Omit<OvertimeRecord, 'id'>) => {
     const id = `ot_${Math.random().toString(36).substr(2, 9)}`;
-    const newRecord = { ...data, id };
-    setOvertimeRecordsState(prev => [newRecord, ...prev]);
-    await saveLocalTable('overtime', [newRecord]);
+    const newRecord: OvertimeRecord = { ...data, id };
+    const res = await saveLocalTableDetailed('overtime', [newRecord]);
+    if (!res.success) {
+      throw new Error(res.error || 'Failed to save overtime record');
+    }
+    setOvertimeRecordsState(prev => {
+      const next = [newRecord, ...prev.filter(r => r.id !== id)];
+      saveCache('overtime', next);
+      return next;
+    });
   }, []);
 
   const setOvertimeBatch = useCallback(async (records: OvertimeRecord[]) => {
@@ -977,36 +1054,48 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return updated;
     });
 
-    saveLocalTable('overtime', records).catch(err => console.warn('SQLite overtime batch save note:', err));
-  }, []);
+    const res = await saveLocalTableDetailed('overtime', records);
+    if (!res.success) {
+      await refreshWorkflowTables(['overtime']);
+      toast.error(res.error || 'Some overtime records could not be saved.');
+    }
+  }, [refreshWorkflowTables]);
 
   const deleteOvertimeBatch = useCallback(async (ids: string[]) => {
     if (ids.length === 0) return;
-
+    const res = await deleteLocalTableDetailed('overtime', ids);
+    if (!res.success) {
+      await refreshWorkflowTables(['overtime']);
+      throw new Error(res.error || 'Failed to delete overtime records');
+    }
     setOvertimeRecordsState(prev => {
       const filtered = prev.filter(r => !ids.includes(r.id));
       saveCache('overtime', filtered);
       return filtered;
     });
-
-    deleteLocalTableRecords('overtime', ids).catch(err => console.warn('SQLite overtime delete note:', err));
-  }, []);
+  }, [refreshWorkflowTables]);
 
   const updateSBL = useCallback(async (id: string, data: Partial<SBLRecord>) => {
-    setSblRecordsState(prev => {
-      const updated = prev.map(r => r.id === id ? { ...r, ...data } : r);
-      const target = updated.find(r => r.id === id);
-      if (target) saveLocalTable('sbl', [target]);
-      return updated;
-    });
-  }, []);
+    const existing = sblRecords.find(r => r.id === id);
+    if (!existing) return;
+    const target: SBLRecord = { ...existing, ...data };
+    const res = await saveLocalTableDetailed('sbl', [target]);
+    if (!res.success) {
+      await refreshWorkflowTables(['sbl']);
+      throw new Error(res.error || 'Failed to update leave/SBL record');
+    }
+    await refreshWorkflowTables(['sbl', ...(isSuperAdmin ? ['approval_audits'] : [])]);
+  }, [sblRecords, refreshWorkflowTables, isSuperAdmin]);
 
   const addSBL = useCallback(async (data: Omit<SBLRecord, 'id'>) => {
     const id = `sbl_${Math.random().toString(36).substr(2, 9)}`;
-    const newRecord = { ...data, id };
-    setSblRecordsState(prev => [newRecord, ...prev]);
-    await saveLocalTable('sbl', [newRecord]);
-  }, []);
+    const newRecord: SBLRecord = { ...data, id };
+    const res = await saveLocalTableDetailed('sbl', [newRecord]);
+    if (!res.success) {
+      throw new Error(res.error || 'Failed to save leave/SBL record');
+    }
+    await refreshWorkflowTables(['sbl', ...(isSuperAdmin ? ['approval_audits'] : [])]);
+  }, [refreshWorkflowTables, isSuperAdmin]);
 
   const setSBLBatch = useCallback(async (records: SBLRecord[]) => {
     if (records.length === 0) return;
@@ -1019,38 +1108,52 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return updated;
     });
 
-    saveLocalTable('sbl', records).catch(err => console.warn('SQLite sbl batch save note:', err));
-  }, []);
+    const res = await saveLocalTableDetailed('sbl', records);
+    if (!res.success) {
+      await refreshWorkflowTables(['sbl']);
+      toast.error(res.error || 'Failed to save SBL batch');
+    }
+  }, [refreshWorkflowTables]);
 
   const deleteSBLBatch = useCallback(async (ids: string[]) => {
     if (ids.length === 0) return;
-
+    const res = await deleteLocalTableDetailed('sbl', ids);
+    if (!res.success) {
+      await refreshWorkflowTables(['sbl']);
+      throw new Error(res.error || 'Failed to delete leave/SBL records');
+    }
     setSblRecordsState(prev => {
       const filtered = prev.filter(r => !ids.includes(r.id));
       saveCache('sbl', filtered);
       return filtered;
     });
-
-    deleteLocalTableRecords('sbl', ids).catch(err => console.warn('SQLite sbl delete note:', err));
-  }, []);
+  }, [refreshWorkflowTables]);
 
   const deleteOvertime = useCallback(async (id: string) => {
+    const res = await deleteLocalTableDetailed('overtime', [id]);
+    if (!res.success) {
+      await refreshWorkflowTables(['overtime']);
+      throw new Error(res.error || 'Failed to delete overtime record');
+    }
     setOvertimeRecordsState(prev => {
       const filtered = prev.filter(r => r.id !== id);
       saveCache('overtime', filtered);
       return filtered;
     });
-    await deleteLocalTableRecords('overtime', [id]);
-  }, []);
+  }, [refreshWorkflowTables]);
 
   const deleteSBL = useCallback(async (id: string) => {
+    const res = await deleteLocalTableDetailed('sbl', [id]);
+    if (!res.success) {
+      await refreshWorkflowTables(['sbl']);
+      throw new Error(res.error || 'Failed to delete leave/SBL record');
+    }
     setSblRecordsState(prev => {
       const filtered = prev.filter(r => r.id !== id);
       saveCache('sbl', filtered);
       return filtered;
     });
-    await deleteLocalTableRecords('sbl', [id]);
-  }, []);
+  }, [refreshWorkflowTables]);
 
   // Movement Handlers
   const recordSeparation = useCallback(async (data: {
@@ -1387,39 +1490,69 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
 
     if (!valCheck.allowed) {
-      toast.error(valCheck.warning || 'Force Attendance entry conflicts with Public Holiday validation policy.');
-      return;
+      const msg = valCheck.warning || 'Force Attendance entry conflicts with Public Holiday validation policy.';
+      toast.error(msg);
+      throw new Error(msg);
     }
 
     const id = `force_${data.employeeId}_${data.date.replace(/-/g, '')}`;
     const timestamp = new Date().toISOString();
-    const newRecord = { ...data, id, timestamp };
+    const newRecord: ForceAttendanceRecord = { ...data, id, timestamp };
     const saveRes = await saveLocalTableDetailed('force_attendance', [newRecord]);
     if (!saveRes.success) {
-      toast.error(saveRes.error || 'Force Attendance blocked by SQLite Public Holiday validation.');
-      return;
+      const msg = saveRes.error || 'Force Attendance blocked by validation.';
+      toast.error(msg);
+      throw new Error(msg);
     }
-    setForceAttendanceRecordsState(prev => [newRecord, ...prev.filter(r => r.id !== id)]);
+    await refreshWorkflowTables(['force_attendance', ...(isSuperAdmin ? ['approval_audits'] : [])]);
 
     const emp = employees.find(e => e.id === data.employeeId);
+    const isEmployeeSelfRequest = effectiveUserProfile?.role === 'Employee' || data.status === 'Pending';
 
-    addAuditLog({
-      employeeId: data.employeeId,
-      employeeName: emp?.name || 'Unknown',
-      date: data.date,
-      field: 'Attendance Override',
-      oldValue: 'Calculated',
-      newValue: `${data.inTime} - ${data.outTime}`,
-      changedBy: data.approvedBy || user?.email?.split('@')[0] || 'Admin',
-      remarks: data.remarks || data.reason
+    if (!isEmployeeSelfRequest) {
+      addAuditLog({
+        employeeId: data.employeeId,
+        employeeName: emp?.name || 'Unknown',
+        date: data.date,
+        field: 'Attendance Override',
+        oldValue: 'Calculated',
+        newValue: `${data.inTime} - ${data.outTime}`,
+        changedBy: data.approvedBy || effectiveUserProfile?.username || user?.email?.split('@')[0] || 'Admin',
+        remarks: data.remarks || data.reason
+      });
+
+      await logAdminOverride(
+        effectiveUserProfile?.username || user?.email || 'Admin',
+        { status: 'Calculated' },
+        { status: 'Forced', inTime: data.inTime, outTime: data.outTime, reason: data.reason }
+      );
+    }
+  }, [user, effectiveUserProfile, employees, addAuditLog, settings.holidays, settings.holidayPunchPolicy, punches, refreshWorkflowTables, isSuperAdmin]);
+
+  const updateForceAttendance = useCallback(async (id: string, data: Partial<ForceAttendanceRecord>) => {
+    const existing = forceAttendanceRecords.find(r => r.id === id);
+    if (!existing) return;
+    const target: ForceAttendanceRecord = { ...existing, ...data };
+    const saveRes = await saveLocalTableDetailed('force_attendance', [target]);
+    if (!saveRes.success) {
+      await refreshWorkflowTables(['force_attendance']);
+      throw new Error(saveRes.error || 'Failed to update attendance request');
+    }
+    await refreshWorkflowTables(['force_attendance', ...(isSuperAdmin ? ['approval_audits'] : [])]);
+  }, [forceAttendanceRecords, refreshWorkflowTables, isSuperAdmin]);
+
+  const deleteForceAttendance = useCallback(async (id: string) => {
+    const res = await deleteLocalTableDetailed('force_attendance', [id]);
+    if (!res.success) {
+      await refreshWorkflowTables(['force_attendance']);
+      throw new Error(res.error || 'Failed to delete attendance request');
+    }
+    setForceAttendanceRecordsState(prev => {
+      const filtered = prev.filter(r => r.id !== id);
+      saveCache('force_attendance', filtered);
+      return filtered;
     });
-
-    await logAdminOverride(
-      user?.email || 'Admin',
-      { status: 'Calculated' },
-      { status: 'Forced', inTime: data.inTime, outTime: data.outTime, reason: data.reason }
-    );
-  }, [user, employees, addAuditLog, settings.holidays, settings.holidayPunchPolicy, punches]);
+  }, [refreshWorkflowTables]);
 
   const createPayrollRun = useCallback(async (
     month: string, 
@@ -1791,11 +1924,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
   }, [computePunchesDigest]);
 
-  const syncZkDevice = useCallback(async (deviceId: string) => {
+  const syncZkDevice = useCallback(async (deviceId: string, fullRead = false) => {
     const targetDev = zkDevices.find(d => d.id === deviceId);
     if (!targetDev) return { success: false, recordsRead: 0, newRecords: 0, duplicates: 0 };
 
-    const tId = toast.loading(`Polling ZKTeco device "${targetDev.name}" (${targetDev.ip}) & syncing to SQLite...`);
+    const tId = toast.loading(
+      fullRead
+        ? `Running full read on "${targetDev.name}" (${targetDev.ip})...`
+        : `Checking "${targetDev.name}" (${targetDev.ip}) & syncing new punches to SQLite...`
+    );
     try {
       const response = await authFetch('/api/zk/fetch-device', {
         method: 'POST',
@@ -1803,7 +1940,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         body: JSON.stringify({
           deviceId: targetDev.id,
           ip: targetDev.ip,
-          mode: 'Manual Device Poll'
+          fullRead,
+          mode: fullRead ? 'Manual Full Read' : 'Manual Sync New'
         })
       });
       const resData = await response.json();
@@ -1837,13 +1975,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [zkDevices, refreshZkTablesFromSqlite]);
 
-  const syncAllZkDevices = useCallback(async () => {
-    const tId = toast.loading('Downloading attendance logs from ZKTeco terminals to SQLite...');
+  const syncAllZkDevices = useCallback(async (fullRead = false) => {
+    const tId = toast.loading(
+      fullRead
+        ? 'Running full log download across all active ZKTeco terminals...'
+        : 'Checking ZKTeco terminals for new punches & syncing to SQLite...'
+    );
     try {
       const response = await authFetch('/api/zk/fetch-all', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'Manual Log Download' })
+        body: JSON.stringify({
+          fullRead,
+          mode: fullRead ? 'Manual Full Read' : 'Manual Sync New'
+        })
       });
       const resData = await response.json();
       await refreshZkTablesFromSqlite();
@@ -2387,6 +2532,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     overtimeRecords: scopedOvertimeRecords,
     sblRecords: scopedSblRecords,
     forceAttendanceRecords: scopedForceAttendanceRecords,
+    approvalAudits: isSuperAdmin ? approvalAudits : [],
     payrollRuns: scopedPayrollRuns,
     zkDevices,
     zkUserMappings,
@@ -2424,6 +2570,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     deleteSBL,
     deleteSBLBatch,
     addForceAttendance,
+    updateForceAttendance,
+    deleteForceAttendance,
+    refreshApprovalAudits,
+    refreshWorkflowTables,
     createPayrollRun,
     recalculatePayrollRun,
     updatePayrollRecord,

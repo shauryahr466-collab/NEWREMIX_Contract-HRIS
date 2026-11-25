@@ -14,10 +14,12 @@ import {
 import { Link, useNavigate } from 'react-router-dom';
 import { DepartmentInsights } from '../components/DepartmentInsights';
 import { BiometricHealth } from '../components/BiometricHealth';
+import { DashboardSummary } from '../components/DashboardSummary';
 import { PageHeader, Card, KPICard, Button, Badge } from '../components/ui';
 import { getNepaliDate } from '../utils/dateHelper';
 
 type WidgetKey =
+  | 'dashboardSummary'
   | 'kpiStrip'
   | 'attendanceTrend'
   | 'staffDistribution'
@@ -27,6 +29,7 @@ type WidgetKey =
   | 'auditFlags';
 
 const WIDGET_LABELS: Array<{ key: WidgetKey; label: string; description: string }> = [
+  { key: 'dashboardSummary', label: 'Executive Workforce Summary', description: "Today's Present, Pending Leave Requests, Late Arrivals, and approval queues" },
   { key: 'kpiStrip', label: 'Manpower KPI Cards', description: 'Total staff, present, absent, and approved OT summary' },
   { key: 'attendanceTrend', label: '30-Day Attendance & OT Chart', description: 'Rolling 30-day attendance headcount and overtime hours' },
   { key: 'staffDistribution', label: 'Daily Staff Distribution', description: 'Present vs Absent vs Approved Leave donut chart' },
@@ -37,6 +40,7 @@ const WIDGET_LABELS: Array<{ key: WidgetKey; label: string; description: string 
 ];
 
 const DEFAULT_WIDGET_VISIBILITY: Record<WidgetKey, boolean> = {
+  dashboardSummary: true,
   kpiStrip: true,
   attendanceTrend: true,
   staffDistribution: true,
@@ -319,6 +323,8 @@ export function Dashboard() {
 
       {activeTab === 'overview' ? (
         <>
+          {widgets.dashboardSummary && <DashboardSummary date={dashboardDate} />}
+
           {widgets.kpiStrip && (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
               <KPICard

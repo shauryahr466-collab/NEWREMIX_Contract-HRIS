@@ -22,6 +22,7 @@ export type SseEventType =
   | 'PunchSnapshotUpdated'
   | 'UserPermissionsUpdated'
   | 'AuditLogAppended'
+  | 'ApprovalAuditUpdated'
   | 'SystemHealthUpdated';
 
 export type RealtimeEventType = SseEventType;

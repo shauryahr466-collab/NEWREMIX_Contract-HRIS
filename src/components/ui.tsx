@@ -1,6 +1,13 @@
-import React from 'react';
-import { X, Printer } from 'lucide-react';
+import React, { useState } from 'react';
+import { X, Printer, FileDown, FileText } from 'lucide-react';
 import { cn } from '../lib/utils';
+import {
+  PrintableSnapshot,
+  captureModulePrintSnapshot,
+  downloadPrintableHtmlSheet,
+  exportPrintablePdf,
+  tryNativePrint,
+} from '../lib/printHelper';
 
 export function Modal({ isOpen, onClose, title, children }: { isOpen: boolean, onClose: () => void, title: string, children: React.ReactNode }) {
   if (!isOpen) return null;
@@ -171,35 +178,195 @@ export function Badge({ children, className, variant = 'info' }: { children: Rea
 }
 
 export function PageHeader({ title, description, actions, icon: Icon, hidePrint = false }: { title: string, description?: string, actions?: React.ReactNode, icon?: any, hidePrint?: boolean }) {
+  const [printSnapshot, setPrintSnapshot] = useState<PrintableSnapshot | null>(null);
+
+  const handlePrintClick = () => {
+    const nativeFired = tryNativePrint();
+    if (!nativeFired) {
+      setPrintSnapshot(captureModulePrintSnapshot(title, description));
+    }
+  };
+
   return (
-    <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-200/80 dark:border-slate-800 print:mb-3 print:pb-2">
-      <div className="flex items-start sm:items-center gap-3.5 min-w-[240px] flex-1">
-        {Icon && (
-          <div className="w-10 h-10 rounded-xl bg-primary/10 border border-primary/15 flex items-center justify-center text-primary shrink-0 print:hidden">
-            <Icon size={20} />
+    <>
+      <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 mb-6 pb-4 border-b border-slate-200/80 dark:border-slate-800 print:mb-3 print:pb-2">
+        <div className="flex items-start sm:items-center gap-3.5 min-w-[240px] flex-1">
+          {Icon && (
+            <div className="w-10 h-10 rounded-xl bg-primary/10 border border-primary/15 flex items-center justify-center text-primary shrink-0 print:hidden">
+              <Icon size={20} />
+            </div>
+          )}
+          <div className="min-w-0">
+            <h1 className="text-[22px] font-bold text-slate-900 dark:text-white leading-tight">{title}</h1>
+            {description && <p className="text-[13px] text-slate-500 dark:text-slate-400 mt-0.5">{description}</p>}
           </div>
-        )}
-        <div className="min-w-0">
-          <h1 className="text-[22px] font-bold text-slate-900 dark:text-white leading-tight">{title}</h1>
-          {description && <p className="text-[13px] text-slate-500 dark:text-slate-400 mt-0.5">{description}</p>}
+        </div>
+        <div className="flex items-center gap-2 flex-wrap xl:justify-end shrink-0 print:hidden">
+          {actions}
+          {!hidePrint && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handlePrintClick}
+              title="Print current module view or export formatted PDF sheet"
+              className="gap-1.5"
+            >
+              <Printer size={14} /> Print
+            </Button>
+          )}
         </div>
       </div>
-      <div className="flex items-center gap-2 flex-wrap xl:justify-end shrink-0 print:hidden">
-        {actions}
-        {!hidePrint && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => window.print()}
-            title="Print current module view"
-            className="gap-1.5"
-          >
-            <Printer size={14} /> Print
-          </Button>
-        )}
-      </div>
-    </div>
+
+      {printSnapshot && (
+        <div className="fixed inset-0 bg-slate-900/65 backdrop-blur-xs z-[120] flex items-center justify-center p-4 print:hidden">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl w-full max-w-5xl max-h-[90vh] overflow-hidden border border-slate-200 dark:border-slate-800 flex flex-col">
+            <div className="px-6 py-4 bg-slate-900 text-white flex items-center justify-between gap-4 shrink-0">
+              <div className="min-w-0">
+                <h3 className="font-bold text-sm text-white truncate">
+                  Print Preview · {printSnapshot.title}
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Embedded preview restricts browser print dialogs — download a formatted PDF or printable HTML sheet below, or use Ctrl+P in a full browser tab.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPrintSnapshot(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition shrink-0"
+                aria-label="Close Print Preview"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="px-6 py-3 bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0">
+              <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums">
+                Captured {printSnapshot.tables.length} {printSnapshot.tables.length === 1 ? 'table' : 'tables'}
+                {printSnapshot.metrics.length > 0 ? ` · ${printSnapshot.metrics.length} summary metrics` : ''} · {printSnapshot.generatedAt}
+                {printSnapshot.bsDate ? ` (${printSnapshot.bsDate})` : ''}
+              </p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => exportPrintablePdf(printSnapshot)}
+                >
+                  <FileDown size={14} /> Save as PDF
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => downloadPrintableHtmlSheet(printSnapshot)}
+                >
+                  <FileText size={14} /> Save Printable Sheet (.html)
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    try {
+                      window.print();
+                    } catch {
+                      // ignore in sandbox
+                    }
+                  }}
+                >
+                  <Printer size={14} /> Try System Print
+                </Button>
+              </div>
+            </div>
+
+            <div className="p-6 overflow-y-auto bg-slate-100 dark:bg-slate-950 flex-1">
+              <div className="bg-white text-slate-900 rounded-lg border border-slate-200 p-6 shadow-xs space-y-5">
+                <div className="border-b border-slate-200 pb-3">
+                  <h4 className="text-lg font-bold text-slate-900">{printSnapshot.title}</h4>
+                  {printSnapshot.subtitle && (
+                    <p className="text-xs text-slate-500 mt-0.5">{printSnapshot.subtitle}</p>
+                  )}
+                  <p className="text-[11px] text-slate-400 mt-1 tabular-nums">
+                    Generated {printSnapshot.generatedAt} {printSnapshot.bsDate ? `· ${printSnapshot.bsDate}` : ''}
+                  </p>
+                </div>
+
+                {printSnapshot.metrics.length > 0 && (
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {printSnapshot.metrics.map((m, idx) => (
+                      <div key={idx} className="p-3 rounded-lg border border-slate-200 bg-slate-50">
+                        <p className="text-[11px] font-semibold text-slate-500 truncate">{m.label}</p>
+                        <p className="text-base font-bold text-slate-900 mt-0.5 tabular-nums truncate">{m.value}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {printSnapshot.tables.length > 0 ? (
+                  printSnapshot.tables.map((tbl, tIdx) => (
+                    <div key={tIdx} className="space-y-2">
+                      {tbl.title && (
+                        <h5 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                          {tbl.title}
+                        </h5>
+                      )}
+                      <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                        <table className="w-full text-left border-collapse text-xs">
+                          {tbl.headers.length > 0 && (
+                            <thead>
+                              <tr className="bg-slate-100 border-b border-slate-200">
+                                {tbl.headers.map((h, hIdx) => (
+                                  <th key={hIdx} className="px-2.5 py-2 font-bold text-slate-800 whitespace-nowrap border-r last:border-r-0 border-slate-200">
+                                    {h}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                          )}
+                          <tbody className="divide-y divide-slate-200">
+                            {tbl.rows.slice(0, 100).map((row, rIdx) => (
+                              <tr key={rIdx}>
+                                {row.map((cell, cIdx) => (
+                                  <td key={cIdx} className="px-2.5 py-1.5 text-slate-700 border-r last:border-r-0 border-slate-200">
+                                    {cell}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                            {tbl.rows.length > 100 && (
+                              <tr>
+                                <td colSpan={Math.max(1, tbl.headers.length)} className="px-3 py-2 text-center text-slate-500 bg-slate-50 font-medium">
+                                  Showing first 100 of {tbl.rows.length} rows in preview — click Save as PDF or Save Printable Sheet for all {tbl.rows.length} rows.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                          {tbl.footer && tbl.footer.length > 0 && (
+                            <tfoot>
+                              <tr className="bg-slate-50 border-t border-slate-300 font-bold">
+                                {tbl.footer.map((f, fIdx) => (
+                                  <td key={fIdx} className="px-2.5 py-2 text-slate-900 border-r last:border-r-0 border-slate-200">
+                                    {f}
+                                  </td>
+                                ))}
+                              </tr>
+                            </tfoot>
+                          )}
+                        </table>
+                      </div>
+                    </div>
+                  ))
+                ) : printSnapshot.metrics.length === 0 ? (
+                  <p className="text-xs text-slate-500 py-6 text-center">
+                    No data table found on this view. Click Save as PDF to export the page header or switch to a report/table tab first.
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

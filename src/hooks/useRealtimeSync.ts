@@ -8,6 +8,8 @@ export type ConnectionStatus = 'Connected' | 'Reconnecting' | 'Disconnected';
 export function useRealtimeSync() {
   const { 
     refreshPunchesFromSqlite, 
+    refreshWorkflowTables,
+    refreshApprovalAudits,
     user, 
     recalculate, 
     refreshCurrentUserProfile 
@@ -24,12 +26,12 @@ export function useRealtimeSync() {
     try {
       await Promise.all([
         refreshPunchesFromSqlite(false),
-        recalculate()
+        refreshWorkflowTables()
       ]);
     } catch {
       // ignore
     }
-  }, [refreshPunchesFromSqlite, recalculate]);
+  }, [refreshPunchesFromSqlite, refreshWorkflowTables]);
 
   useEffect(() => {
     const token = getInMemorySessionToken();
@@ -77,9 +79,20 @@ export function useRealtimeSync() {
 
           if (e.type === 'EmployeeUpdated' || e.type === 'EmployeeCreated' || e.type === 'EmployeeDeactivated') {
             await recalculate();
-          } else if (e.type === 'PunchSnapshotUpdated' || e.type === 'AttendanceUpdated') {
+          } else if (e.type === 'PunchSnapshotUpdated') {
             await refreshPunchesFromSqlite(false);
-          } else if (e.type === 'PayrollUpdated' || e.type === 'OvertimeUpdated' || e.type === 'SblUpdated' || e.type === 'SettingsUpdated' || e.type === 'HolidaysUpdated') {
+          } else if (e.type === 'AttendanceUpdated') {
+            await Promise.all([
+              refreshPunchesFromSqlite(false),
+              refreshWorkflowTables(['force_attendance', 'approval_audits'])
+            ]);
+          } else if (e.type === 'OvertimeUpdated' || e.type === 'SupervisorOTUpdated') {
+            await refreshWorkflowTables(['overtime', 'approval_audits']);
+          } else if (e.type === 'SblUpdated' || e.type === 'LeaveUpdated') {
+            await refreshWorkflowTables(['sbl', 'approval_audits']);
+          } else if (e.type === 'ApprovalAuditUpdated') {
+            await refreshApprovalAudits();
+          } else if (e.type === 'PayrollUpdated' || e.type === 'SettingsUpdated' || e.type === 'HolidaysUpdated') {
             await recalculate();
           } else if (e.type === 'UserPermissionsUpdated') {
             if (!data.email || data.email.toLowerCase() === String(user?.email || '').toLowerCase()) {
@@ -108,6 +121,7 @@ export function useRealtimeSync() {
       es.addEventListener('HolidaysUpdated', (e: any) => handleGlobalEvent(e));
       es.addEventListener('AttendanceUpdated', (e: any) => handleGlobalEvent(e));
       es.addEventListener('PunchSnapshotUpdated', (e: any) => handleGlobalEvent(e));
+      es.addEventListener('ApprovalAuditUpdated', (e: any) => handleGlobalEvent(e));
       es.addEventListener('UserPermissionsUpdated', (e: any) => handleGlobalEvent(e));
 
       es.onerror = () => {
